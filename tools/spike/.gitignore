@@ -1,0 +1,7 @@
+# Regenerable binaries and spike run state — not source, do not commit.
+*.jpg
+*.jpeg
+*.webp
+*.png
+*.spz
+state.json

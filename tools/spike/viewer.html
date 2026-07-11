@@ -1,0 +1,105 @@
+<!doctype html>
+<!--
+  VirtSpace Phase 0 spike fixture: Spark-in-WebView proof.
+
+  Proves a World Labs SPZ Gaussian-splat world loads and renders with Spark +
+  three.js inside a WebView-class browser, with drag-to-look + joystick move.
+
+  Expects a `world.spz` file sitting ALONGSIDE this HTML (produced by the
+  `fetch` stage of spike.py).
+
+  MUST be served over http -- browsers block fetch() on file:// URLs, so
+  opening this file directly will fail to load world.spz. Serve it, e.g.:
+      cd tools/spike && python3 -m http.server
+  then open http://localhost:8000/viewer.html
+-->
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+<title>VirtSpace Spike — Spark SPZ viewer</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:-apple-system,system-ui,sans-serif}
+  #hud{position:fixed;top:10px;left:10px;color:#fff;font-size:12px;background:rgba(0,0,0,.5);padding:6px 10px;border-radius:8px;z-index:10}
+  #err{position:fixed;top:40%;left:0;right:0;text-align:center;color:#f66;font-size:14px;z-index:10;white-space:pre-wrap}
+  #stick{position:fixed;bottom:28px;left:50%;transform:translateX(-50%);width:120px;height:120px;border-radius:60px;background:rgba(255,255,255,.12);border:2px solid rgba(255,255,255,.4);z-index:10;touch-action:none}
+  #nub{position:absolute;top:35px;left:35px;width:50px;height:50px;border-radius:25px;background:rgba(255,255,255,.85)}
+</style>
+</head>
+<body>
+<div id="hud">loading…</div>
+<div id="err"></div>
+<div id="stick"><div id="nub"></div></div>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/",
+  "@sparkjsdev/spark": "https://sparkjs.dev/releases/spark/2.1.0/spark.module.js"
+} }
+</script>
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { SparkRenderer, SplatMesh } from "@sparkjsdev/spark";
+
+const hud = document.getElementById("hud");
+const errEl = document.getElementById("err");
+window.addEventListener("error", e => { errEl.textContent = "ERROR: " + (e.message||e); });
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(70, innerWidth/innerHeight, 0.01, 1000);
+camera.position.set(0, 0, 0.1);
+const renderer = new THREE.WebGLRenderer({ antialias:true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+document.body.appendChild(renderer.domElement);
+
+const spark = new SparkRenderer({ renderer });
+scene.add(spark);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.target.set(0, 0, -1);
+
+const splats = new SplatMesh({
+  url: "./world.spz",
+  onProgress: (p) => { hud.textContent = "loading splats… " + Math.round((p||0)*100) + "%"; },
+  onLoad: () => { hud.textContent = "loaded ✓  drag to look · joystick to move"; window.__loaded = true; },
+});
+// World Labs splats are Y-down relative to three.js — flip 180° about X so it's upright.
+splats.quaternion.setFromEuler(new THREE.Euler(Math.PI, 0, 0));
+scene.add(splats);
+
+// simple joystick -> move camera in its local frame
+let mv = {x:0, y:0};
+const stick = document.getElementById("stick"), nub = document.getElementById("nub");
+function setNub(dx,dy){ nub.style.left=(35+dx)+"px"; nub.style.top=(35+dy)+"px"; }
+stick.addEventListener("pointerdown", e => stick.setPointerCapture(e.pointerId));
+stick.addEventListener("pointermove", e => {
+  if(!e.buttons && e.pointerType==="mouse") return;
+  const r = stick.getBoundingClientRect();
+  let dx = e.clientX - (r.left+60), dy = e.clientY - (r.top+60);
+  const d = Math.hypot(dx,dy), max=35; if(d>max){ dx*=max/d; dy*=max/d; }
+  setNub(dx,dy); mv.x = dx/max; mv.y = dy/max;
+});
+const reset = () => { setNub(0,0); mv.x=0; mv.y=0; };
+stick.addEventListener("pointerup", reset); stick.addEventListener("pointercancel", reset);
+
+const fwd = new THREE.Vector3(), right = new THREE.Vector3();
+renderer.setAnimationLoop(() => {
+  const speed = 0.02;
+  camera.getWorldDirection(fwd); fwd.y = 0; fwd.normalize();
+  right.crossVectors(fwd, camera.up).normalize();
+  camera.position.addScaledVector(fwd, -mv.y*speed);
+  camera.position.addScaledVector(right, mv.x*speed);
+  controls.target.copy(camera.position).add(fwd);
+  controls.update();
+  renderer.render(scene, camera);
+});
+addEventListener("resize", () => {
+  camera.aspect = innerWidth/innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+</script>
+</body>
+</html>
