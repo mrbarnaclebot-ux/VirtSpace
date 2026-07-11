@@ -307,8 +307,10 @@ Everything else scales cheaply: Neon scale-to-zero, serverless workers (jobs are
 - Load `world.spz` in a WKWebView Spark page **on-device** (verify render, axis orientation, memory, fps).
 - **Gate decision:** own-stitch (which toolchain) vs multi-image for v1.
 
-**Phase 1 — Backend skeleton**
-- Railway: API + worker; Neon schema (§7); R2 buckets + presigned upload flow; durable job queue with idempotent, credit-safe `worlds:generate` (port the spike code); daily credit budget guard; **mock-provider mode** so app development never burns credits; Sign in with Apple token verification.
+**Phase 1 — Backend skeleton** ✅ **DONE 2026-07-12**
+- Deployed & E2E-verified on production infra: Railway api+worker, Neon schema (8 tables incl. credit_events), R2 (`virtspace-assets`) presigned uploads, credit-safe SKIP LOCKED queue (idempotent resume via persisted operation_id), daily budget guard, mock-provider mode, SIWA verification implemented (dev-auth mode active until the iOS app lands). Live smoke: world reached `draft_ready` in ~12 s with all assets re-hosted on R2.
+- QA cycles caught & fixed: Drizzle array-tuple claim SQL, snake_case row mapping silently defeating the §14 resume check, stuck-job lease expiry, Neon pooler quirks. Real-Postgres integration suite added (opt-in via TEST_DATABASE_URL).
+- **Known follow-ups:** (1) mock generations currently write real `credit_events` (150/run against the 500/day budget — dev throttles itself; make mock reserve 0); (2) one live-provider draft run (~$0.12) through the deployed pipeline still pending — the provider port is contract-tested against the spike, so low risk.
 
 **Phase 2 — Capture pipeline (iOS)**
 - ARKit + AVFoundation guided 16-shot capture (locked AE/AF/AWB, world-locked dots, steadiness auto-fire, parallax coaching, preflight checks, crash-proof local persistence). Direct-to-R2 uploads. Server stitch integration. Fast on-device low-res preview.
