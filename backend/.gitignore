@@ -1,0 +1,6 @@
+# Local storage driver output (dev object store)
+/data/
+
+# Build output / deps (also covered by repo-root .gitignore)
+dist/
+node_modules/
