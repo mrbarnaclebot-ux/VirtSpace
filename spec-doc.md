@@ -86,11 +86,14 @@ Ran the full World Labs pipeline against the real API with the provided key, usi
 | Auth | **Sign in with Apple** | App Store expectation; low friction. |
 
 ### 3.2 Backend
+
+> **Locked at Phase 1 kickoff (2026-07-12):** TypeScript (Node 24) for both API and worker — one ecosystem shared with the future web share-viewer (Spark is JS). **Fastify + zod** (API), **Drizzle ORM** (Neon Postgres, migrations via drizzle-kit). Storage behind an **S3-compatible driver**: Cloudflare R2 in production, local-disk driver for dev.
+
 | Concern | Choice | Why |
 |---|---|---|
 | API + workers | **Railway** — API service + always-on worker service in one project | First-class long-running background workers (no request timeout on the multi-minute poll loop), simple secret management, great DX. |
 | Database | **Neon Postgres** (already provisioned) | Users, worlds, job state, gallery/social graph. Scale-to-zero. |
-| Job queue / orchestration | **Durable queue** — SQS or Trigger.dev/Inngest/QStash | World-gen is a long, retryable "submit → poll external API until done" job. Needs retries + DLQ so a crash mid-poll resumes. |
+| Job queue / orchestration | **Postgres-backed queue** in Neon (`FOR UPDATE SKIP LOCKED` on the `jobs` table) for v1; SQS/Trigger.dev is the documented swap point at scale | Jobs are low-volume and the table already exists — one less external service. Retries via `attempts` + backoff columns; permanent failures parked as `failed_*` (DLQ-equivalent). *(Locked 2026-07-12 at Phase 1 kickoff.)* |
 | Object storage + CDN | **Cloudflare R2 (zero egress)** for splats/panos; signed URLs | Egress is the silent cost killer — a viral 300 MB world downloaded repeatedly is real money on S3/CloudFront. R2 has no egress fees. |
 | Push | **APNs** (optionally via SNS) | "Your world is ready" when the async job completes. |
 | Panorama stitching | **Server-side worker** (OpenCV/Hugin `nona`+`enblend`), with an optional on-device low-res preview | See §5. Server-side = best quality, iterate without app updates, no phone heat/battery. |
