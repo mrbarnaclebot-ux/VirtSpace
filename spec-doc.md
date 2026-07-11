@@ -313,6 +313,10 @@ Everything else scales cheaply: Neon scale-to-zero, serverless workers (jobs are
 - ~~Known follow-ups~~ **both closed same day:** (1) mock generations now cost 0 (ledger path still exercised); (2) **live-provider validation ✅** — a real pano went through the deployed pipeline with `PROVIDER_MODE=live`: Marble draft world in ~40 s end-to-end, real caption, SPZ re-hosted to R2 and byte-validated (gzip+NGSP magic, 6.1 MB). Worker returned to mock mode for dev. Total live spend to date: 300 credits (2 draft worlds).
 - **API contract note for clients:** `GET /v1/worlds/:id` returns `{ world, assets }` — presigned URLs live in the top-level `assets` object, not on `world`.
 
+**Phase 2/3 head-start — iOS Stage A foundation** ✅ **DONE 2026-07-12**
+- SwiftUI app shell (Capture · Library, dark-first), API client on the real `{world, assets}` contract, Library cards w/ presigned thumbnails + 3 s active polling, WorldDetail with honest §6.2 status timeline + Enhance/Delete, DEBUG test-scan harness.
+- **Simulator E2E PASS against production**: app-driven scan → `draft_ready` in ~9 s, timeline/caption verified on-screen and via API. Follow-ups: mock provider serves text stubs (thumbnails show placeholder in dev — swap to real fixture bytes), relative timestamps don't live-tick (design pass item).
+
 **Phase 2 — Capture pipeline (iOS)**
 - ARKit + AVFoundation guided 16-shot capture (locked AE/AF/AWB, world-locked dots, steadiness auto-fire, parallax coaching, preflight checks, crash-proof local persistence). Direct-to-R2 uploads. Server stitch integration. Fast on-device low-res preview.
 
