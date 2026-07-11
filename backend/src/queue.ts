@@ -64,6 +64,42 @@ export async function enqueue(
 }
 
 /**
+ * Raw `db.execute` rows come back with snake_case column names (drizzle only
+ * remaps to camelCase for query-builder calls). Casting them straight to Job
+ * left worldId/providerOperationId undefined at runtime — which would have
+ * silently defeated the §14 resume check. Map explicitly instead.
+ */
+/**
+ * Coerce a driver timestamp value to Date. Through drizzle's raw db.execute
+ * path timestamptz columns can arrive as strings (observed against real Neon),
+ * while node-postgres usually parses them to Date — the Job type promises
+ * Date, so the mapper must make that true on every driver path.
+ */
+function toDate(v: unknown): Date | null {
+  if (v == null) return null;
+  return v instanceof Date ? v : new Date(v as string);
+}
+
+export function mapJobRow(raw: Record<string, unknown>): Job {
+  return {
+    id: raw['id'] as string,
+    worldId: raw['world_id'] as string,
+    kind: raw['kind'] as string,
+    phase: raw['phase'] as string,
+    attempts: raw['attempts'] as number,
+    lastError: (raw['last_error'] as string | null) ?? null,
+    payload: raw['payload'] ?? null,
+    providerOperationId: (raw['provider_operation_id'] as string | null) ?? null,
+    // NOT NULL columns in the schema — coerced, never null in practice.
+    runAfter: toDate(raw['run_after'])!,
+    lockedAt: toDate(raw['locked_at']),
+    lockedBy: (raw['locked_by'] as string | null) ?? null,
+    createdAt: toDate(raw['created_at'])!,
+    updatedAt: toDate(raw['updated_at'])!,
+  };
+}
+
+/**
  * Atomically claim the next runnable job of one of `kinds`. Uses
  * `UPDATE ... WHERE id = (SELECT ... FOR UPDATE SKIP LOCKED) RETURNING`,
  * increments attempts, and takes a lease (locked_at/locked_by). Returns the
@@ -75,7 +111,16 @@ export async function claimNextJob(
   workerId: string,
 ): Promise<Job | null> {
   if (kinds.length === 0) return null;
-  const result = await db.execute<Job>(sql`
+  // NOTE: do NOT write `kind = ANY(${kinds})` — Drizzle expands a JS array in a
+  // sql template into a parenthesized tuple `($1, $2, ...)`, so Postgres gets
+  // `ANY(($1,$2,...))`, which is invalid (ANY needs an array expression, not a
+  // row). Build a parameter-bound IN list instead — every kind is still a bound
+  // parameter, never string-interpolated.
+  const kindsIn = sql.join(
+    kinds.map((k) => sql`${k}`),
+    sql`, `,
+  );
+  const result = await db.execute<Record<string, unknown>>(sql`
     UPDATE jobs
     SET locked_at = now(),
         locked_by = ${workerId},
@@ -84,7 +129,7 @@ export async function claimNextJob(
         updated_at = now()
     WHERE id = (
       SELECT id FROM jobs
-      WHERE kind = ANY(${kinds})
+      WHERE kind IN (${kindsIn})
         AND phase IN ('queued', 'running')
         -- Lease expiry (mirrors isJobClaimable): claimable when unlocked OR the
         -- lease is older than LEASE_SECONDS, so a crashed worker's job resumes.
@@ -96,8 +141,8 @@ export async function claimNextJob(
     )
     RETURNING *
   `);
-  const rows = (result as unknown as { rows: Job[] }).rows;
-  return rows[0] ?? null;
+  const rows = (result as unknown as { rows: Record<string, unknown>[] }).rows;
+  return rows[0] ? mapJobRow(rows[0]) : null;
 }
 
 /** Mark a job done and release its lease. */
