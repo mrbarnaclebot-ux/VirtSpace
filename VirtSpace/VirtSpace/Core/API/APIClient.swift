@@ -34,39 +34,28 @@ final class APIClient {
     func createWorld(title: String, frameCount: Int, lat: Double? = nil, lng: Double? = nil) async throws -> (World, [FrameUpload]) {
         let body = try encoder.encode(CreateWorldRequest(title: title, frameCount: frameCount, lat: lat, lng: lng))
         let data = try await send(request("POST", "v1/worlds", body: body))
-        // Primary contract: { "world": {...}, "uploads": [...] }.
-        if let resp = try? decoder.decode(CreateWorldResponse.self, from: data) {
-            return (resp.world, resp.uploads)
-        }
-        // Fallback: world fields at top level alongside `uploads`.
-        do {
-            let world = try decoder.decode(World.self, from: data)
-            let uploads = (try? decoder.decode(UploadsEnvelope.self, from: data))?.uploads ?? []
-            return (world, uploads)
-        } catch {
-            throw APIError.decoding(error)
-        }
+        let resp: CreateWorldResponse = try decode(data)
+        return (resp.world, resp.uploads)
     }
 
     func framesDone(worldId: String) async throws {
+        // Response is { world: {metadata}, job_id } — not needed by callers.
         _ = try await send(request("POST", "v1/worlds/\(worldId)/frames:done"))
     }
 
-    func getWorld(id: String) async throws -> World {
+    /// `GET /v1/worlds/:id` → `{ world: {metadata}, assets: {...} }`. Presigned
+    /// asset URLs live only in the top-level `assets` object, never on `world`.
+    func getWorld(id: String) async throws -> WorldEnvelope {
         let data = try await send(request("GET", "v1/worlds/\(id)"))
-        return try decodeWorld(from: data)
+        return try decode(data)
     }
 
+    /// `GET /v1/worlds` → `{ worlds: [...], has_more }`; each list item carries
+    /// a thumbnail-only `assets` object.
     func listWorlds() async throws -> [World] {
         let data = try await send(request("GET", "v1/worlds"))
-        if let envelope = try? decoder.decode(WorldsEnvelope.self, from: data) {
-            return envelope.worlds
-        }
-        do {
-            return try decoder.decode([World].self, from: data)
-        } catch {
-            throw APIError.decoding(error)
-        }
+        let resp: WorldsListResponse = try decode(data)
+        return resp.worlds
     }
 
     func enhance(worldId: String) async throws {
@@ -116,11 +105,9 @@ final class APIClient {
         }
     }
 
-    private func decodeWorld(from data: Data) throws -> World {
-        if let world = try? decoder.decode(World.self, from: data) { return world }
-        if let envelope = try? decoder.decode(WorldEnvelope.self, from: data) { return envelope.world }
+    private func decode<T: Decodable>(_ data: Data) throws -> T {
         do {
-            return try decoder.decode(World.self, from: data)
+            return try decoder.decode(T.self, from: data)
         } catch {
             throw APIError.decoding(error)
         }
@@ -138,20 +125,21 @@ final class APIClient {
         return String(data: data, encoding: .utf8)
     }
 
-    private static let isoWithFractional: ISO8601DateFormatter = {
+    // ISO8601DateFormatter is thread-safe; nonisolated(unsafe) is sound here.
+    private nonisolated(unsafe) static let isoWithFractional: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return f
     }()
 
-    private static let isoPlain: ISO8601DateFormatter = {
+    private nonisolated(unsafe) static let isoPlain: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime]
         return f
     }()
 
     /// Lenient date decoding: ISO8601 (with/without fractional seconds) or epoch.
-    private static func decodeDate(_ decoder: Decoder) throws -> Date {
+    private nonisolated static func decodeDate(_ decoder: Decoder) throws -> Date {
         let container = try decoder.singleValueContainer()
         if let string = try? container.decode(String.self) {
             if let date = isoWithFractional.date(from: string) { return date }
@@ -164,9 +152,4 @@ final class APIClient {
         }
         throw DecodingError.dataCorruptedError(in: container, debugDescription: "Unrecognized date value")
     }
-}
-
-/// Small envelope used only for the createWorld fallback path.
-private struct UploadsEnvelope: Decodable {
-    let uploads: [FrameUpload]
 }

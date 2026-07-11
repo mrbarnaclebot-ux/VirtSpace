@@ -118,69 +118,74 @@ enum WorldStatus: Hashable, Codable {
 
 // MARK: - World
 
+/// World metadata as serialized by the backend. Presigned asset URLs are NOT
+/// part of this object — they arrive in a separate top-level `assets` object
+/// (see `WorldAssets`); list items carry a thumbnail-only `assets`.
 struct World: Identifiable, Decodable, Hashable {
     let id: String
     var title: String
     var status: WorldStatus
 
-    var ownerId: String?
     var caption: String?
     var placeName: String?
     var lat: Double?
     var lng: Double?
     var isPublic: Bool?
+    var phase: String?
+    var assetVersion: Int?
+    var provider: String?
+    var creditsSpent: Int?
     var createdAt: Date?
 
-    // Asset columns — always point at our R2, never the provider CDN.
+    /// Present on `GET /v1/worlds` list items (thumbnail-only assets object).
+    var assets: WorldAssets?
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case title
+        case status
+        case caption
+        case placeName = "place_name"
+        case lat
+        case lng
+        case isPublic = "is_public"
+        case phase
+        case assetVersion = "asset_version"
+        case provider
+        case creditsSpent = "credits_spent"
+        case createdAt = "created_at"
+        case assets
+    }
+
+    var canEnhance: Bool { status == .draftReady }
+}
+
+// MARK: - WorldAssets
+
+/// Presigned asset URLs (our R2, never provider CDN). Returned as a top-level
+/// `assets` object on world detail; list items only populate `thumbnail_url`.
+struct WorldAssets: Decodable, Hashable {
     var panoURL: String?
     var thumbnailURL: String?
     var spz100kURL: String?
     var spz500kURL: String?
     var spzFullURL: String?
     var colliderGLBURL: String?
-    var assetVersion: Int?
-
-    // Provider columns (draft-first: two provider worlds per VirtSpace world).
-    var provider: String?
-    var draftWorldId: String?
-    var hqWorldId: String?
-    var draftModel: String?
-    var hqModel: String?
-    var creditsSpent: Int?
 
     enum CodingKeys: String, CodingKey {
-        case id
-        case title
-        case status
-        case ownerId = "owner_id"
-        case caption
-        case placeName = "place_name"
-        case lat
-        case lng
-        case isPublic = "is_public"
-        case createdAt = "created_at"
         case panoURL = "pano_url"
         case thumbnailURL = "thumbnail_url"
         case spz100kURL = "spz_100k_url"
         case spz500kURL = "spz_500k_url"
         case spzFullURL = "spz_full_url"
         case colliderGLBURL = "collider_glb_url"
-        case assetVersion = "asset_version"
-        case provider
-        case draftWorldId = "draft_world_id"
-        case hqWorldId = "hq_world_id"
-        case draftModel = "draft_model"
-        case hqModel = "hq_model"
-        case creditsSpent = "credits_spent"
     }
 
-    /// Best available thumbnail as a URL, when the signed URL is present.
+    /// Thumbnail as a URL, when the signed URL is present.
     var thumbnailAsURL: URL? {
         guard let thumbnailURL, !thumbnailURL.isEmpty else { return nil }
         return URL(string: thumbnailURL)
     }
-
-    var canEnhance: Bool { status == .draftReady }
 }
 
 // MARK: - FrameUpload
@@ -234,10 +239,30 @@ struct CreateWorldResponse: Decodable {
     let uploads: [FrameUpload]
 }
 
-struct WorldsEnvelope: Decodable {
+/// `GET /v1/worlds` → `{ worlds: [...], has_more }`.
+struct WorldsListResponse: Decodable {
     let worlds: [World]
+    let hasMore: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case worlds
+        case hasMore = "has_more"
+    }
 }
 
+/// `GET /v1/worlds/:id` → `{ world: {metadata}, assets: {...} }`.
 struct WorldEnvelope: Decodable {
     let world: World
+    let assets: WorldAssets?
+}
+
+/// `POST /v1/worlds/:id/frames:done` → `{ world: {metadata}, job_id }`.
+struct FramesDoneResponse: Decodable {
+    let world: World
+    let jobId: String?
+
+    enum CodingKeys: String, CodingKey {
+        case world
+        case jobId = "job_id"
+    }
 }

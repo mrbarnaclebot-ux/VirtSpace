@@ -16,6 +16,9 @@ struct WorldDetailView: View {
 
     let worldId: String
     @State var world: World?
+    /// Presigned asset URLs — arrive in the detail response's top-level
+    /// `assets` object; seeded from the list item's thumbnail-only assets.
+    @State var assets: WorldAssets?
 
     @State private var toast: Toast?
     @State private var showDeleteConfirm = false
@@ -25,6 +28,7 @@ struct WorldDetailView: View {
     init(worldId: String, initialWorld: World? = nil) {
         self.worldId = worldId
         _world = State(initialValue: initialWorld)
+        _assets = State(initialValue: initialWorld?.assets)
     }
 
     var body: some View {
@@ -83,7 +87,7 @@ struct WorldDetailView: View {
                         startPoint: .top, endPoint: .bottom
                     )
                 )
-            if let url = world?.thumbnailAsURL {
+            if let url = assets?.thumbnailAsURL {
                 AsyncImage(url: url) { phase in
                     switch phase {
                     case .success(let image):
@@ -160,7 +164,9 @@ struct WorldDetailView: View {
 
     private func actions(_ world: World) -> some View {
         VStack(spacing: 12) {
-            // 3D explorer — Stage C placeholder.
+            // 3D explorer — Stage C placeholder. Future wiring: load
+            // `assets?.spz500kURL` into the Spark WKWebView (500k tier is the
+            // phone default per spec §3.1).
             Button {} label: {
                 Label("Explorer coming in Stage C", systemImage: "move.3d")
                     .frame(maxWidth: .infinity)
@@ -198,7 +204,9 @@ struct WorldDetailView: View {
 
     private func refresh(showErrors: Bool) async {
         do {
-            world = try await api.getWorld(id: worldId)
+            let envelope = try await api.getWorld(id: worldId)
+            world = envelope.world
+            assets = envelope.assets
         } catch {
             if showErrors, !Task.isCancelled {
                 toast = Toast(error)

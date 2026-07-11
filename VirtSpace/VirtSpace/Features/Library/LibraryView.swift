@@ -162,7 +162,8 @@ struct WorldCard: View {
                         startPoint: .topLeading, endPoint: .bottomTrailing
                     )
                 )
-            if let url = world.thumbnailAsURL {
+            // List items carry a thumbnail-only `assets` object from the API.
+            if let url = world.assets?.thumbnailAsURL {
                 AsyncImage(url: url) { phase in
                     switch phase {
                     case .success(let image):
