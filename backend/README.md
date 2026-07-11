@@ -190,7 +190,11 @@ collider) is downloaded and re-hosted on **our** storage under `worlds/{id}/`.
 
 `PROVIDER_MODE=mock` (the default) runs the whole pipeline with **no network and
 no credits** via `provider/mock.ts` (instant operations, fixture asset bytes
-served from an in-memory map). End to end offline:
+served from an in-memory map). Cost is a property of the provider: the mock's
+`creditsForModel` returns **0**, so dev runs reserve 0 against
+`DAILY_CREDIT_BUDGET` (a 0-amount `credit_events` row keeps the ledger path
+exercised) and `worlds.credits_spent` stays 0 — spend metrics reflect only real
+generations. End to end offline:
 
 ```bash
 cp .env.example .env         # defaults are mock + local storage

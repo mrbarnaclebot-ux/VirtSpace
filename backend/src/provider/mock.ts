@@ -35,7 +35,18 @@ export function createMockProvider(): WorldGenProvider {
 
   return {
     mode: 'mock',
-    creditsForModel,
+
+    // Mock generations are FREE. Cost is a property of the provider (not a
+    // PROVIDER_MODE check in the worker): the worker derives BOTH the
+    // reserveCredits amount and the world's credits_spent increment from
+    // creditsForModel, so returning 0 here means dev runs never consume the
+    // DAILY_CREDIT_BUDGET or inflate spend metrics — while reserveCredits(0)
+    // still runs, keeping the budget/ledger money path exercised offline
+    // (a 0-amount credit_events row is intentional).
+    creditsForModel(model: WorldModel): number {
+      creditsForModel(model); // validate the model id exactly like live.
+      return 0;
+    },
 
     async uploadPano(_bytes, _filename): Promise<string> {
       return `mock-media-${randomUUID()}`;

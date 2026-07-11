@@ -20,3 +20,6 @@ dist/
 # Python
 __pycache__/
 *.pyc
+
+# iOS local secrets (template: Secrets.swift.example)
+VirtSpace/VirtSpace/**/Secrets.swift

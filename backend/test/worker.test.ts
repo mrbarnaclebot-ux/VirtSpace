@@ -5,7 +5,8 @@ import {
   type GenerationIO,
   type GenerationClock,
 } from '../src/worker.js';
-import type { WorldGenProvider } from '../src/provider/index.js';
+import { MODEL_CREDITS, type WorldGenProvider } from '../src/provider/index.js';
+import { createMockProvider } from '../src/provider/mock.js';
 
 // --- stitch passthrough decision (pure) -------------------------------------
 describe('stitchPlan', () => {
@@ -137,5 +138,46 @@ describe('runGeneration credit safety', () => {
         { timeoutMs: 1 },
       ),
     ).rejects.toMatchObject({ name: 'ProviderTimeoutError' });
+  });
+});
+
+// --- mock generations are FREE ------------------------------------------------
+// PROVIDER_MODE=mock must not eat the daily budget or inflate spend metrics.
+// The worker derives BOTH the reserveCredits amount and the world's
+// credits_spent increment from provider.creditsForModel(model), so asserting
+// the mock reports 0 (and that reserve is still called, with 0) covers both.
+describe('mock provider billing', () => {
+  it('creditsForModel returns 0 for every model (draft and hq)', () => {
+    const provider = createMockProvider();
+    expect(provider.creditsForModel('marble-1.0-draft')).toBe(0);
+    expect(provider.creditsForModel('marble-1.1')).toBe(0);
+  });
+
+  it('mock generation still exercises the budget path: reserveCredits(0)', async () => {
+    const provider = createMockProvider();
+    const io = fakeIO();
+    // Exactly how handleGenerate derives the cost it reserves AND increments
+    // credits_spent by — 0 on the mock, so the world's spend stays 0.
+    const cost = provider.creditsForModel('marble-1.0-draft');
+
+    const result = await runGeneration(
+      provider,
+      io,
+      { model: 'marble-1.0-draft', displayName: 'W', cost, existingOperationId: null },
+      instantClock,
+    );
+
+    expect(io.reserveCredits).toHaveBeenCalledTimes(1);
+    expect(io.reserveCredits).toHaveBeenCalledWith(0); // ledger row of amount 0.
+    expect(cost).toBe(0); // → worlds.credits_spent += 0.
+    // The pipeline itself still completes end to end offline.
+    expect(result.worldId).toMatch(/^mock-world-/);
+    expect(result.assetKeys.spz500kUrl).toBe('worlds/world-1/splat_500k.spz');
+  });
+
+  it('real provider costs are unchanged (draft 150 / hq 1500)', () => {
+    // MODEL_CREDITS is what the live provider returns verbatim.
+    expect(MODEL_CREDITS['marble-1.0-draft']).toBe(150);
+    expect(MODEL_CREDITS['marble-1.1']).toBe(1500);
   });
 });
