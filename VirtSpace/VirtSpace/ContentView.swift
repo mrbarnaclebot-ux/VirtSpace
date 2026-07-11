@@ -2,23 +2,40 @@
 //  ContentView.swift
 //  VirtSpace
 //
-//  Created by Uzman Fassy on 2026-07-11.
+//  App shell: Capture · Library tab bar (v1 locked scope, spec §1).
+//  Dark-mode-first, content-forward.
 //
 
 import SwiftUI
 
 struct ContentView: View {
+    private enum Tab: Hashable {
+        case capture
+        case library
+    }
+
+    @State private var selectedTab: Tab = .capture
+
     var body: some View {
-        VStack {
-            Image(systemName: "globe")
-                .imageScale(.large)
-                .foregroundStyle(.tint)
-            Text("Hello, world!")
+        TabView(selection: $selectedTab) {
+            CaptureView(switchToLibrary: { selectedTab = .library })
+                .tabItem {
+                    Label("Capture", systemImage: "viewfinder")
+                }
+                .tag(Tab.capture)
+
+            LibraryView()
+                .tabItem {
+                    Label("Library", systemImage: "square.grid.2x2")
+                }
+                .tag(Tab.library)
         }
-        .padding()
+        .tint(.cyan)
+        .preferredColorScheme(.dark)
     }
 }
 
 #Preview {
     ContentView()
+        .environment(APIClient())
 }

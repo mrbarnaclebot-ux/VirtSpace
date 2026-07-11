@@ -9,9 +9,12 @@ import SwiftUI
 
 @main
 struct VirtSpaceApp: App {
+    @State private var apiClient = APIClient()
+
     var body: some Scene {
         WindowGroup {
             ContentView()
+                .environment(apiClient)
         }
     }
 }
