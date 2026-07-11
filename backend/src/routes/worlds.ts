@@ -5,6 +5,7 @@ import { getDb } from '../db/client.js';
 import { captures, users, worlds, type World } from '../db/schema.js';
 import { enqueue } from '../queue.js';
 import { evaluateQuota } from '../quota.js';
+import type { StorageDriver } from '../storage/index.js';
 import type { RouteDeps } from './deps.js';
 
 const MAX_FRAME_BYTES = 12 * 1024 * 1024; // per-frame ceiling (spec §8).
@@ -51,6 +52,28 @@ function serializeWorld(w: World): Record<string, unknown> {
     credits_spent: w.creditsSpent,
     created_at: w.createdAt,
   };
+}
+
+/**
+ * List-item shape for GET /v1/worlds (iOS Library screen contract): the
+ * serializeWorld fields plus an `assets` object carrying ONLY a presigned
+ * `thumbnail_url` (when the key column is set). Deliberately does NOT presign
+ * the heavy asset fields (spz/pano/collider) in list context — presigning is
+ * per-item crypto and the Library only renders thumbnails; the detail route
+ * keeps signing everything. Exported for tests.
+ */
+export async function serializeWorldListItem(
+  w: World,
+  storage: StorageDriver,
+): Promise<Record<string, unknown>> {
+  const assets: { thumbnail_url?: string } = {};
+  if (w.thumbnailUrl) {
+    assets.thumbnail_url = await storage.presignDownload(
+      w.thumbnailUrl,
+      DOWNLOAD_TTL_SECONDS,
+    );
+  }
+  return { ...serializeWorld(w), assets };
 }
 
 export function worldsRoutes(app: FastifyInstance, deps: RouteDeps): void {
@@ -181,8 +204,16 @@ export function worldsRoutes(app: FastifyInstance, deps: RouteDeps): void {
 
     const hasMore = rows.length > q.limit;
     const page = hasMore ? rows.slice(0, q.limit) : rows;
+    // Each list item carries assets.thumbnail_url (only) — see
+    // serializeWorldListItem. Presigning is pure crypto (no I/O), so the
+    // per-item Promise.all is cheap.
+    const items = await Promise.all(
+      page.map((w) => serializeWorldListItem(w, storage)),
+    );
     return reply.send({
-      worlds: page.map(serializeWorld),
+      worlds: items,
+      has_more: hasMore,
+      // Kept alongside has_more for existing pagination consumers.
       next_offset: hasMore ? q.offset + q.limit : null,
     });
   });

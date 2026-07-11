@@ -87,7 +87,10 @@ test/                vitest: config, storage, auth, quota/backoff
 - `GET  /v1/worlds/:id` — status/phase + signed download URLs for any asset
   columns that are set.
 - `GET  /v1/worlds` — owner's library, paginated (`limit`/`offset`), excludes
-  soft-deleted.
+  soft-deleted. Each item carries `assets` with ONLY a presigned
+  `thumbnail_url` (when set) for the iOS Library grid — heavy asset URLs are
+  signed exclusively by the detail route. Response:
+  `{ worlds: [{ ...world, assets: { thumbnail_url? } }], has_more, next_offset }`.
 - `POST /v1/worlds/:id/enhance` — enqueue `generate_hq` if `status=draft_ready`
   (else 409).
 - `DELETE /v1/worlds/:id` — soft delete + enqueue `purge`.
