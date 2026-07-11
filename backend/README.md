@@ -1,9 +1,10 @@
 # VirtSpace Backend
 
-Fastify API + Postgres-backed job queue for VirtSpace (spec §3.2, §7, §14). This
-is the **Stage 1 skeleton**: schema, storage drivers, auth, the REST surface, and
-a credit-safe queue. There is **no worker loop yet** (Stage 2) and no external
-API / DB calls happen on boot.
+Fastify API + Postgres-backed job queue for VirtSpace (spec §3.2, §7, §14).
+**Stage 1** is the API + schema + storage + credit-safe queue; **Stage 2** (this
+build) adds the **worker loop**, the **World Labs provider** (live + mock), the
+**daily credit budget guard**, and the **APNs push stub**. No external API / DB
+calls happen at import or boot.
 
 ## Stack (locked — spec §3.2)
 
@@ -32,6 +33,7 @@ npm run dev               # tsx watch + dotenv → http://localhost:8080/healthz
 | Script | What it does |
 |---|---|
 | `dev` | `tsx watch` the server, loading `.env` via dotenv |
+| `worker` | run the Stage-2 worker loop (`tsx src/worker.ts`), loading `.env` |
 | `build` | `tsc` → `dist/` |
 | `start` | run the compiled `dist/server.js` |
 | `typecheck` | `tsc --noEmit` |
@@ -46,10 +48,18 @@ src/
   config.ts          zod-validated env loader (loadConfig / getConfig, memoized)
   server.ts          buildServer() + main(); lazy DB, boots without Postgres
   auth.ts            dev-token + Sign in with Apple (jose/JWKS) preHandler
-  queue.ts           enqueue / claimNextJob (SKIP LOCKED) / complete / fail + backoff
+  queue.ts           enqueue / claimNextJob (SKIP LOCKED + lease expiry) / complete / fail / parkDead
   quota.ts           pure daily-scan-quota logic (evaluateQuota)
+  budget.ts          daily credit budget guard (reserveCredits, BudgetExceededError)
+  worker.ts          Stage-2 loop: claims stitch/generate/purge jobs; credit-safe generation
+  push.ts            APNs sendPush STUB (logs in dev; real APNs is a later phase)
+  provider/
+    types.ts         WorldGenProvider interface + WorldModel/credits + typed errors
+    worldlabs.ts     LIVE World Labs Marble client (ported from tools/spike/spike.py)
+    mock.ts          offline zero-credit provider (PROVIDER_MODE=mock)
+    index.ts         createProvider(config) factory (mock | live)
   db/
-    schema.ts        Drizzle tables — users, worlds, captures, jobs, devices, share_slugs
+    schema.ts        Drizzle tables — users, worlds, captures, jobs, devices, credit_events, share_slugs
     client.ts        LAZY pg Pool + drizzle db (created on first query, not at boot)
     users.ts         upsertUserBySub (idempotent identity upsert)
   storage/
@@ -101,7 +111,8 @@ test/                vitest: config, storage, auth, quota/backoff
 Drizzle-kit is schema-first: edit `src/db/schema.ts`, then `npm run db:generate`
 writes a timestamped SQL file + snapshot into `drizzle/`. `generate` needs **no**
 database connection. `npm run db:migrate` applies pending files to
-`DATABASE_URL`. The initial migration (`drizzle/0000_*.sql`) is committed.
+`DATABASE_URL`. Committed migrations: `0000_*.sql` (initial schema) and
+`0001_*.sql` (the `credit_events` ledger for the Stage-2 budget guard).
 
 ## Dev storage (`STORAGE_DRIVER=local`)
 
@@ -119,20 +130,88 @@ app only ever calls the `StorageDriver` interface, so nothing else changes.
 
 ## Job queue (spec §14)
 
-`queue.ts` implements a Postgres-backed queue (no worker loop yet):
+`queue.ts` implements a Postgres-backed queue:
 
 - `enqueue(kind, worldId, payload?)` inserts a `jobs` row.
 - `claimNextJob(kinds, workerId)` uses
   `UPDATE ... WHERE id = (SELECT ... FOR UPDATE SKIP LOCKED) RETURNING`, takes a
   lease (`locked_at`/`locked_by`) and increments `attempts`.
+- **Lease expiry (`LEASE_SECONDS = 600`)** — a job is claimable when it is
+  unlocked **OR** its lease is older than 10 minutes. This fixes a QA defect: a
+  worker that crashes mid-job previously left `locked_at` set forever, stranding
+  the job. `isJobClaimable()` is the pure mirror of that WHERE clause (tested).
 - `failJob` sets `run_after = now + min(2^attempts · 30s, 1h)` and parks the job
   as `phase='dead'` after 5 attempts (DLQ-equivalent).
+- `parkJobDead` parks a job dead **immediately**, bypassing retry — used for
+  non-retryable failures (budget exceeded, un-implemented stitch).
 - `setProviderOperationId` persists the provider op id atomically so a resumed
   worker never blind-resubmits a credit-spending `worlds:generate` call.
 
-## Notes / Stage-1 boundaries
+## Worker (Stage 2) — `npm run worker`
+
+A long-running loop (`workerId = hostname:pid`) that claims jobs of kinds
+`stitch | generate_draft | generate_hq | purge` every `WORKER_POLL_MS` (default
+2000). Handlers:
+
+- **stitch** — *v0 passthrough* (Phase 0.5 gate pending). Exactly **1** capture
+  frame is copied verbatim to `worlds/{id}/pano.jpg` (no real stitch/transcode),
+  then `status=generating_draft` and a `generate_draft` job is enqueued. **>1
+  frame fails** with `stitching not yet implemented (Phase 0.5 gate pending)`.
+- **generate_draft / generate_hq** — the credit-safe money path (see below);
+  `marble-1.0-draft` (150 credits) → `draft_ready`, `marble-1.1` (1500 credits)
+  → `complete`. Fires the APNs push stub on success.
+- **purge** — deletes storage objects under the world prefix + captures' frame
+  prefixes; **keeps** the DB row (soft-deleted).
+
+Boot is crash-safe: the DB pool is lazy, so with a dummy `DATABASE_URL` the
+worker starts, logs claim errors, and idles instead of exiting.
+
+### Credit safety (spec §14) — the money-touching path
+
+`worlds:generate` is the only step that spends credits, and it runs **exactly
+once** per job:
+
+1. If the job already has a `provider_operation_id`, the worker **resumes at
+   polling** — no reserve, no upload, no second `generateWorld`, no re-bill.
+2. Otherwise it (a) `reserveCredits(cost)` against the **daily budget**, (b)
+   uploads the pano, (c) calls `generateWorld`, and (d) **persists the
+   operation id immediately** — so a crash between generate and completion
+   resumes via step 1.
+3. `reserveCredits` (`budget.ts`) sums today's `credit_events.amount` inside a
+   transaction (with a `pg_advisory_xact_lock` so parallel workers can't both
+   slip past) and inserts a new event iff `sum + cost <= DAILY_CREDIT_BUDGET`;
+   else it throws `BudgetExceededError` and the job is **parked dead (no
+   retry)**.
+
+Provider CDN URLs are never exposed: every asset (SPZ 500k/100k, thumbnail,
+collider) is downloaded and re-hosted on **our** storage under `worlds/{id}/`.
+
+### Mock mode walkthrough (offline, zero credits)
+
+`PROVIDER_MODE=mock` (the default) runs the whole pipeline with **no network and
+no credits** via `provider/mock.ts` (instant operations, fixture asset bytes
+served from an in-memory map). End to end offline:
+
+```bash
+cp .env.example .env         # defaults are mock + local storage
+# start Postgres + apply migrations
+npm run db:migrate
+# terminal 1 — API
+npm run dev
+# terminal 2 — worker
+npm run worker
+```
+
+Then drive the API (`POST /v1/worlds` with `frame_count: 1` → PUT the frame →
+`POST /v1/worlds/{id}/frames:done`). The worker stitches (passthrough),
+"generates" a mock world, re-hosts fixture assets into local storage, and the
+world reaches `draft_ready` — all with zero World Labs calls.
+
+## Notes / boundaries
 
 - No DB connection is made on boot — the `pg` pool is created lazily on the first
   query, so the process and `/healthz` come up without Postgres.
-- No World Labs / external calls; `PROVIDER_MODE` defaults to `mock`.
-- The worker loop, provider client, stitching, and APNs delivery are Stage 2.
+- `worldlabs.ts` is a faithful port of `tools/spike/spike.py` (the live-verified
+  contract), incl. `media_asset.media_asset_id`, the `WLT-Api-Key` header, and
+  the `is_pano: true` generate body. It is exercised only when `PROVIDER_MODE=live`.
+- Real APNs delivery and multi-frame stitching remain future phases.

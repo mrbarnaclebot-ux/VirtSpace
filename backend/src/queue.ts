@@ -11,6 +11,32 @@ const BASE_BACKOFF_SECONDS = 30;
 const MAX_BACKOFF_SECONDS = 60 * 60; // 1 hour cap.
 
 /**
+ * Lease duration for a claimed job. A worker that crashes mid-job leaves
+ * locked_at set forever; without expiry the job is stuck permanently (QA
+ * defect). claimNextJob therefore treats a lease older than LEASE_SECONDS as
+ * expired and re-claimable — a crashed job is safely resumed by another worker
+ * (idempotent + provider_operation_id resume means no double-bill, spec §14).
+ */
+export const LEASE_SECONDS = 600; // 10 minutes.
+
+/**
+ * Pure mirror of the claimNextJob WHERE clause — a job is claimable when it is
+ * queued/running, its backoff gate (run_after) has passed, and it is either
+ * unlocked OR its lease has expired. The SQL in claimNextJob MUST stay in sync
+ * with this predicate (it is the testable spec of the claim condition).
+ */
+export function isJobClaimable(
+  job: Pick<Job, 'phase' | 'lockedAt' | 'runAfter'>,
+  now: Date = new Date(),
+  leaseSeconds: number = LEASE_SECONDS,
+): boolean {
+  if (job.phase !== 'queued' && job.phase !== 'running') return false;
+  if (job.runAfter.getTime() > now.getTime()) return false;
+  if (job.lockedAt === null) return true;
+  return job.lockedAt.getTime() < now.getTime() - leaseSeconds * 1000;
+}
+
+/**
  * Exponential backoff in seconds for a given attempt count:
  * min(2^attempts * 30s, 1h). Pure — exported for testing.
  */
@@ -60,7 +86,9 @@ export async function claimNextJob(
       SELECT id FROM jobs
       WHERE kind = ANY(${kinds})
         AND phase IN ('queued', 'running')
-        AND locked_at IS NULL
+        -- Lease expiry (mirrors isJobClaimable): claimable when unlocked OR the
+        -- lease is older than LEASE_SECONDS, so a crashed worker's job resumes.
+        AND (locked_at IS NULL OR locked_at < now() - (${LEASE_SECONDS} * interval '1 second'))
         AND run_after <= now()
       ORDER BY run_after ASC
       FOR UPDATE SKIP LOCKED
@@ -98,6 +126,28 @@ export async function failJob(
         locked_by = NULL,
         phase = CASE WHEN attempts >= ${MAX_ATTEMPTS} THEN 'dead' ELSE 'queued' END,
         run_after = now() + (LEAST(POWER(2, attempts) * ${BASE_BACKOFF_SECONDS}, ${MAX_BACKOFF_SECONDS}) * interval '1 second'),
+        updated_at = now()
+    WHERE id = ${jobId}
+  `);
+}
+
+/**
+ * Park a job as 'dead' immediately, bypassing retry/backoff. Used for
+ * non-retryable failures (budget exceeded, un-implemented paths) where retrying
+ * cannot succeed and would only waste attempts or, worse, re-touch the
+ * money-path (spec §14).
+ */
+export async function parkJobDead(
+  db: Db,
+  jobId: string,
+  error: string,
+): Promise<void> {
+  await db.execute(sql`
+    UPDATE jobs
+    SET last_error = ${error},
+        locked_at = NULL,
+        locked_by = NULL,
+        phase = 'dead',
         updated_at = now()
     WHERE id = ${jobId}
   `);

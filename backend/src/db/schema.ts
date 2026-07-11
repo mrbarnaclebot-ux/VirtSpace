@@ -146,6 +146,20 @@ export const devices = pgTable(
   (t) => [index('devices_user_idx').on(t.userId)],
 );
 
+// Append-only ledger of credit spends (spec §14 credit safety). The daily
+// budget guard (src/budget.ts) sums today's `amount` inside a transaction and
+// only inserts a new event if the cap would not be exceeded — atomic reserve.
+export const creditEvents = pgTable(
+  'credit_events',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    amount: integer('amount').notNull(),
+    worldId: uuid('world_id').references(() => worlds.id),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index('credit_events_created_idx').on(t.createdAt)],
+);
+
 export const shareSlugs = pgTable('share_slugs', {
   id: uuid('id').primaryKey().defaultRandom(),
   worldId: uuid('world_id')
@@ -160,3 +174,5 @@ export type User = typeof users.$inferSelect;
 export type World = typeof worlds.$inferSelect;
 export type Job = typeof jobs.$inferSelect;
 export type Device = typeof devices.$inferSelect;
+export type Capture = typeof captures.$inferSelect;
+export type CreditEvent = typeof creditEvents.$inferSelect;

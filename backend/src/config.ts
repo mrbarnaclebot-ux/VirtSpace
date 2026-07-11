@@ -35,6 +35,9 @@ const baseSchema = z.object({
 
   DAILY_CREDIT_BUDGET: numberFromEnv(500),
   DAILY_SCAN_QUOTA: numberFromEnv(10),
+
+  // Worker loop poll interval (ms) between empty claim attempts (Stage 2).
+  WORKER_POLL_MS: numberFromEnv(2000),
 });
 
 export type Config = z.infer<typeof baseSchema> & { PUBLIC_BASE_URL: string };
