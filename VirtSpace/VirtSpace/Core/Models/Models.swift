@@ -186,6 +186,12 @@ struct WorldAssets: Decodable, Hashable {
         guard let thumbnailURL, !thumbnailURL.isEmpty else { return nil }
         return URL(string: thumbnailURL)
     }
+
+    /// Stitched equirectangular panorama as a URL, when the signed URL is present.
+    var panoAsURL: URL? {
+        guard let panoURL, !panoURL.isEmpty else { return nil }
+        return URL(string: panoURL)
+    }
 }
 
 // MARK: - FrameUpload

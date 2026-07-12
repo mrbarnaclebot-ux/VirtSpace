@@ -123,6 +123,26 @@ actor SplatCache {
         return dest
     }
 
+    // MARK: - Maintenance (Settings)
+
+    /// Total bytes currently held in the splats cache directory.
+    func totalBytes() -> Int64 {
+        guard let dir = try? directory,
+              let items = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.fileSizeKey]) else { return 0 }
+        return items.reduce(0) { $0 + Int64((try? $1.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) }
+    }
+
+    /// Delete every cached splat. Returns the number of bytes freed.
+    @discardableResult
+    func clear() -> Int64 {
+        let before = totalBytes()
+        guard let dir = try? directory,
+              let items = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) else { return 0 }
+        for url in items { try? fm.removeItem(at: url) }
+        log.info("Cleared splat cache (\(before) bytes)")
+        return before
+    }
+
     // MARK: - LRU eviction
 
     private func touch(_ url: URL) {

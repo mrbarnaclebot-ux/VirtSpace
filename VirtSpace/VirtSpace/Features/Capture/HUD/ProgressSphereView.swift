@@ -3,12 +3,12 @@
 //  VirtSpace
 //
 //  The "filling sphere" progress hero (spec §6.1: progress as a filling
-//  sphere, not just "1 of 16"). A stylized 2D azimuthal projection of the
-//  16-target pattern drawn with Canvas: an outer band of 8 facets (horizon
-//  ring), a middle band of 4 (upper ring), an inner band of 2 (down pair)
-//  and a center core split into Sky (top half) and Ground (bottom half).
-//  Facets light up as their target is captured; the current target's facet
-//  carries a brighter rim.
+//  sphere, not just "1 of 28"). A stylized 2D azimuthal projection of the
+//  Phase 0.5 densified 28-target pattern drawn with Canvas: an outer band of
+//  12 facets (horizon ring, 30°), a middle band of 8 (upper ring, 45°), an
+//  inner band of 6 (down ring, 60°) and a center core split into Sky (top
+//  half) and Ground (bottom half). Facets light up as their target is
+//  captured; the current target's facet carries a brighter rim.
 //
 
 import SwiftUI
@@ -42,30 +42,33 @@ struct ProgressSphereView: View {
         let endDegrees: Double
     }
 
-    /// The 16 facets, indexed like TargetLayout: 0…7 horizon, 8…11 up,
-    /// 12…13 down, 14 sky, 15 ground.
+    /// The 28 facets, indexed like TargetLayout: 0…11 horizon, 12…19 up,
+    /// 20…25 down, 26 sky, 27 ground.
     private static let facets: [Facet] = {
         var facets: [Facet] = []
-        let gap = 5.0 // degrees between facets
+        let gap = 4.0 // degrees between facets
+        // Horizon ring — 12 facets every 30°, outer band.
+        for i in 0..<12 {
+            let start = Double(i) * 30 - 15
+            facets.append(Facet(index: i, innerRadius: 0.76, outerRadius: 1.0,
+                                startDegrees: start + gap / 2, endDegrees: start + 30 - gap / 2))
+        }
+        // Upper ring — 8 facets every 45°, middle band.
         for i in 0..<8 {
             let start = Double(i) * 45 - 22.5
-            facets.append(Facet(index: i, innerRadius: 0.76, outerRadius: 1.0,
+            facets.append(Facet(index: 12 + i, innerRadius: 0.5, outerRadius: 0.7,
                                 startDegrees: start + gap / 2, endDegrees: start + 45 - gap / 2))
         }
-        for i in 0..<4 {
-            let start = Double(i) * 90 - 45
-            facets.append(Facet(index: 8 + i, innerRadius: 0.5, outerRadius: 0.7,
-                                startDegrees: start + gap / 2, endDegrees: start + 90 - gap / 2))
-        }
-        for i in 0..<2 {
-            let start = Double(i) * 180 - 90
-            facets.append(Facet(index: 12 + i, innerRadius: 0.26, outerRadius: 0.44,
-                                startDegrees: start + gap / 2, endDegrees: start + 180 - gap / 2))
+        // Lower ring — 6 facets every 60°, inner band.
+        for i in 0..<6 {
+            let start = Double(i) * 60 - 30
+            facets.append(Facet(index: 20 + i, innerRadius: 0.26, outerRadius: 0.44,
+                                startDegrees: start + gap / 2, endDegrees: start + 60 - gap / 2))
         }
         // Sky = top half of the core, Ground = bottom half.
-        facets.append(Facet(index: 14, innerRadius: 0, outerRadius: 0.18,
+        facets.append(Facet(index: 26, innerRadius: 0, outerRadius: 0.18,
                             startDegrees: -90 + gap, endDegrees: 90 - gap))
-        facets.append(Facet(index: 15, innerRadius: 0, outerRadius: 0.18,
+        facets.append(Facet(index: 27, innerRadius: 0, outerRadius: 0.18,
                             startDegrees: 90 + gap, endDegrees: 270 - gap))
         return facets
     }()
@@ -118,8 +121,8 @@ struct ProgressSphereView: View {
     ZStack {
         Color.black
         ProgressSphereView(
-            capturedFlags: (0..<16).map { $0 < 9 },
-            currentIndex: 9
+            capturedFlags: (0..<28).map { $0 < 15 },
+            currentIndex: 15
         )
     }
 }

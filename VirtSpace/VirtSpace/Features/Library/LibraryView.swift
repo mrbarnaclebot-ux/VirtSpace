@@ -18,6 +18,8 @@ struct LibraryView: View {
     @State private var toast: Toast?
     @State private var pollTask: Task<Void, Never>?
 
+    @State private var showSettings = false
+
     // Debug log viewer entry (Stage B3 deliverable 3c).
     @State private var showDebugLog = false
     @State private var titleTapCount = 0
@@ -45,6 +47,14 @@ struct LibraryView: View {
                         .font(.headline)
                         .onTapGesture { registerTitleTap() }
                 }
+                ToolbarItem(placement: .topBarLeading) {
+                    Button {
+                        showSettings = true
+                    } label: {
+                        Image(systemName: "gearshape")
+                    }
+                    .accessibilityLabel("Settings")
+                }
                 // Wrench/ladybug shortcut — DEBUG builds only. TestFlight
                 // (release) builds strip this, so the 5-tap-on-title gesture
                 // below is the ALWAYS-available path to reach the log viewer.
@@ -61,6 +71,9 @@ struct LibraryView: View {
             }
             .sheet(isPresented: $showDebugLog) {
                 DebugLogView()
+            }
+            .sheet(isPresented: $showSettings) {
+                SettingsView()
             }
         }
         .task {

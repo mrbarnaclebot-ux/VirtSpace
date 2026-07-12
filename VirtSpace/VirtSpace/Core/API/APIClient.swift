@@ -74,6 +74,13 @@ final class APIClient {
         _ = try await send(request("DELETE", "v1/worlds/\(id)"))
     }
 
+    /// `DELETE /v1/account` (Apple account-deletion requirement, spec §13):
+    /// cascades Neon rows, R2 assets, APNs tokens and provider-side worlds. The
+    /// caller is responsible for clearing local caches afterwards.
+    func deleteAccount() async throws {
+        _ = try await send(request("DELETE", "v1/account"))
+    }
+
     // MARK: - Request plumbing
 
     private func request(_ method: String, _ path: String, body: Data? = nil) -> URLRequest? {

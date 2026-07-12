@@ -14,7 +14,9 @@ import Foundation
 import OSLog
 
 final class CaptureUploader {
-    static let expectedFrameCount = 16
+    /// Expected full-sphere frame count — derived from the capture pattern
+    /// (Phase 0.5 densified layout = 28) so nothing hardcodes the old 16.
+    static let expectedFrameCount = TargetLayout.targets().count
 
     private let api: APIClient
     private let store: CaptureStore

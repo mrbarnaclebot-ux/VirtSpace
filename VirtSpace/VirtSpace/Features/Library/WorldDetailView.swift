@@ -31,6 +31,17 @@ struct WorldDetailView: View {
     @State private var explorerProgress: Double = 0
     @State private var explorer: ExplorerPresentation?
 
+    // 2D 360° pano preview (spec §6.4) — presented full-screen when the world
+    // has a stitched equirect pano (assets.pano_url).
+    @State private var pano: PanoPresentation?
+
+    /// Identifiable wrapper so the pano viewer can drive `fullScreenCover(item:)`.
+    struct PanoPresentation: Identifiable {
+        let id = UUID()
+        let source: PanoPreviewView.Source
+        let title: String
+    }
+
     /// Identifiable wrapper so the explorer can drive `fullScreenCover(item:)`.
     struct ExplorerPresentation: Identifiable {
         let id = UUID()
@@ -69,6 +80,9 @@ struct WorldDetailView: View {
         .toast($toast)
         .fullScreenCover(item: $explorer) { presentation in
             ExplorerView(source: presentation.source, title: presentation.title)
+        }
+        .fullScreenCover(item: $pano) { presentation in
+            PanoPreviewView(source: presentation.source, title: presentation.title)
         }
         .task {
             await refresh(showErrors: world == nil)
@@ -204,6 +218,19 @@ struct WorldDetailView: View {
             .buttonStyle(.borderedProminent)
             .disabled(!canExplore(world) || isPreparingExplorer)
 
+            // 2D 360° pano preview — enabled once the stitched equirect pano
+            // (assets.pano_url) is available.
+            Button {
+                openPano(world)
+            } label: {
+                Label("View 360° Photo", systemImage: "pano")
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 6)
+            }
+            .buttonStyle(.bordered)
+            .tint(.cyan)
+            .disabled(!canViewPano)
+
             // Enhance — enabled only at draft_ready.
             Button {
                 Task { await enhance() }
@@ -227,6 +254,22 @@ struct WorldDetailView: View {
             .disabled(isWorking)
         }
         .padding(.top, 4)
+    }
+
+    // MARK: - Pano preview
+
+    /// The 360° photo is available once the stitched equirect pano URL is present.
+    private var canViewPano: Bool { assets?.panoAsURL != nil }
+
+    private func openPano(_ world: World) {
+        guard let url = assets?.panoAsURL else {
+            toast = Toast(message: "This world has no 360° photo yet.", style: .error)
+            return
+        }
+        pano = PanoPresentation(
+            source: .remote(worldId: world.id, version: world.assetVersion ?? 1, url: url),
+            title: world.title
+        )
     }
 
     // MARK: - Explorer

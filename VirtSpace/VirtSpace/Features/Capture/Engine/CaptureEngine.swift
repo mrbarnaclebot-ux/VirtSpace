@@ -36,7 +36,7 @@ enum CaptureEngineState: Equatable {
     case failed(String)
 }
 
-/// A completed 16-frame capture, persisted on disk and ready to upload.
+/// A completed full-sphere capture (28 frames), persisted on disk and ready to upload.
 struct CaptureResult: Equatable {
     let sessionID: UUID
     let directory: URL
@@ -80,7 +80,7 @@ final class CaptureEngine {
     private(set) var state: CaptureEngineState = .idle
     private(set) var targets: [CaptureTarget] = TargetLayout.targets()
     /// Per-target captured flag, indexed like `targets`.
-    private(set) var capturedFlags: [Bool] = Array(repeating: false, count: 16)
+    private(set) var capturedFlags: [Bool] = Array(repeating: false, count: TargetLayout.targets().count)
     /// Degrees between the camera forward and the current target.
     private(set) var angularDistanceDegrees: Double = 180
     /// Signed aim hints, degrees: yaw > 0 → turn right; pitch > 0 → look up.
@@ -539,7 +539,7 @@ final class CaptureEngine {
 
         switch result {
         case .failure(let error):
-            // One missed shot shouldn't kill a 16-shot walk-around: surface it
+            // One missed shot shouldn't kill a 28-shot walk-around: surface it
             // and let the dwell re-fire on the same target.
             isTakingStill = false
             dwell.reset()
@@ -697,22 +697,24 @@ extension CaptureEngine {
     /// Compile-and-runtime sanity checks on the pure math, run once at first
     /// engine start in debug builds (Stage B1 verification requirement).
     static let debugValidation: Void = {
+        // Phase 0.5 densified pattern: 12 horizon (30°) + 8 up (45°) +
+        // 6 down (60°) + zenith + nadir = 28.
         let targets = TargetLayout.targets()
-        assert(targets.count == 16, "expected 16 targets")
-        assert(targets.filter { $0.pitchDegrees == 0 }.count == 8, "expected 8 horizon targets")
-        assert(targets.filter { $0.pitchDegrees == 45 }.count == 4, "expected 4 up-ring targets")
-        assert(targets.filter { $0.pitchDegrees == -45 }.count == 2, "expected 2 down targets")
+        assert(targets.count == 28, "expected 28 targets")
+        assert(targets.filter { $0.pitchDegrees == 0 }.count == 12, "expected 12 horizon targets")
+        assert(targets.filter { $0.pitchDegrees == 45 }.count == 8, "expected 8 up-ring targets")
+        assert(targets.filter { $0.pitchDegrees == -45 }.count == 6, "expected 6 down-ring targets")
         assert(targets.filter { $0.pitchDegrees == 90 }.count == 1, "expected 1 zenith")
         assert(targets.filter { $0.pitchDegrees == -90 }.count == 1, "expected 1 nadir")
         assert(targets.allSatisfy { abs(simd_length($0.direction) - 1) < 1e-4 }, "directions must be unit vectors")
-        assert(targets.map(\.index) == Array(0..<16), "indices must be capture-ordered")
+        assert(targets.map(\.index) == Array(0..<28), "indices must be capture-ordered")
 
-        // Horizon neighbors sit 45° apart; forward is (0,0,-1); zenith is +Y.
+        // Horizon neighbors sit 30° apart; forward is (0,0,-1); poles are ±Y.
         let d01 = AlignmentMath.angularDistanceDegrees(targets[0].direction, targets[1].direction)
-        assert(abs(d01 - 45) < 0.01, "horizon spacing should be 45°, got \(d01)")
+        assert(abs(d01 - 30) < 0.01, "horizon spacing should be 30°, got \(d01)")
         assert(simd_length(targets[0].direction - simd_float3(0, 0, -1)) < 1e-4, "target 0 must be straight ahead")
-        assert(simd_length(targets[14].direction - simd_float3(0, 1, 0)) < 1e-4, "zenith must be +Y")
-        assert(simd_length(targets[15].direction - simd_float3(0, -1, 0)) < 1e-4, "nadir must be -Y")
+        assert(simd_length(targets[26].direction - simd_float3(0, 1, 0)) < 1e-4, "zenith must be +Y")
+        assert(simd_length(targets[27].direction - simd_float3(0, -1, 0)) < 1e-4, "nadir must be -Y")
 
         // Forward of the identity transform is -Z; drift math is euclidean.
         assert(simd_length(AlignmentMath.forward(of: matrix_identity_float4x4) - simd_float3(0, 0, -1)) < 1e-5)

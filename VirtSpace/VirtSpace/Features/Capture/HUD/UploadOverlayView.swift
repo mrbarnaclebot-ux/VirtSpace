@@ -4,7 +4,7 @@
 //
 //  Full-screen handoff shown the moment a capture finishes: a progress ring
 //  driven by CaptureUploader's per-frame callback ("Uploading your space…
-//  i/16"), after which CaptureView routes to the Library.
+//  i/28"), after which CaptureView routes to the Library.
 //
 
 import SwiftUI
@@ -59,6 +59,6 @@ struct UploadOverlayView: View {
 }
 
 #Preview {
-    UploadOverlayView(uploaded: 6, total: 16)
+    UploadOverlayView(uploaded: 12, total: 28)
         .preferredColorScheme(.dark)
 }
