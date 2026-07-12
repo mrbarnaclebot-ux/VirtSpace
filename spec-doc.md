@@ -300,12 +300,12 @@ Everything else scales cheaply: Neon scale-to-zero, serverless workers (jobs are
 - Full API pipeline proven live: upload → generate (draft, `is_pano:true`) → poll → SPZ download. ~16 s, 150 credits.
 - Leftover (rolled into 0.5): Spark render check on a real device.
 
-**Phase 0.5 — Stitch spike (NEXT — hard gate before any capture UI)**
-- Hand-capture ~16 photos with an iPhone (manual, no app yet — locked exposure via a camera app, rotate in place), plus pose estimates.
-- Stitch server-side two ways (Hugin `nona`+`enblend` pose-seeded vs OpenCV) → feed the best pano to `marble-1.0-draft` → judge world quality. Also run **one `marble-1.1`** on the winner (latency, sizes, `semantics_metadata`).
-- In parallel: same scene via the **multi-image fallback** (§5.1) for an apples-to-apples fidelity comparison.
-- Load `world.spz` in a WKWebView Spark page **on-device** (verify render, axis orientation, memory, fps).
-- **Gate decision:** own-stitch (which toolchain) vs multi-image for v1.
+**Phase 0.5 — Stitch spike** ✅ **GATE DECIDED 2026-07-12** (input: a real 16-frame on-device capture from the Stage B app)
+- **Feature-based stitching is DEAD for this product**: OpenCV `Stitcher` produced a warped 270° strip (no closed sphere); Hugin `cpfind` collapsed entirely (5 disconnected groups, 321 px CP error) — guided-capture geometry (~5° overlap at 45° yaw, blank walls, moving subjects) starves feature matchers. Not a tuning problem.
+- **Winner: pose-assisted equirectangular reprojection** (custom ray-trace + feather blend + inpaint, ~30 s in NumPy). Even with *nominal* target angles it produced a coherent 8192×4096 full sphere (6.5/10: strong horizon band + zenith; weak nadir/mid-latitude inpaint). Real ARKit poses — now flowing client→backend (`captures.poses_json`, verified 16/16 in prod) — remove the nominal-pose seams.
+- **Marble validated the pano**: `marble-1.0-draft` reconstructed the bedroom into a correct, navigable 3D world with an accurate scene caption. End-to-end own-capture → own-stitch → Marble is PROVEN.
+- **v1 decisions:** ship the pose-assisted reprojection as the stitch worker (port `reproject.py` to the backend); densify the capture pattern (yaw step ≤30°, more pitch-ring frames — or evaluate ultra-wide lens for rings); multi-image fallback (§5.1) stays documented but is NOT needed.
+- Deferred leftovers: one `marble-1.1` HQ run + `semantics_metadata` check; on-device Spark render check (moves to Stage C).
 
 **Phase 1 — Backend skeleton** ✅ **DONE 2026-07-12**
 - Deployed & E2E-verified on production infra: Railway api+worker, Neon schema (8 tables incl. credit_events), R2 (`virtspace-assets`) presigned uploads, credit-safe SKIP LOCKED queue (idempotent resume via persisted operation_id), daily budget guard, mock-provider mode, SIWA verification implemented (dev-auth mode active until the iOS app lands). Live smoke: world reached `draft_ready` in ~12 s with all assets re-hosted on R2.
