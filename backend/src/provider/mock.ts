@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { gzipSync } from 'node:zlib';
 import {
   creditsForModel,
   ProviderError,
@@ -15,8 +16,58 @@ import {
 
 const FAKE_HOST = 'https://mock.worldlabs.local';
 
-/** A byte fixture used for every mock asset (small, non-empty, deterministic). */
-const FIXTURE_BYTES = Buffer.from('VIRTSPACE-MOCK-ASSET');
+// --- Fixtures ---------------------------------------------------------------
+// Realistic-enough bytes so the iOS app renders them in dev (plain text stubs
+// made AsyncImage show its empty placeholder in simulator QA).
+
+/**
+ * A REAL 951-byte 64x32 blue→orange gradient JPEG (base64-inlined), generated
+ * once via a raw-BMP + `sips` one-off script. Valid JFIF: starts FF D8 and
+ * decodes in any image stack. Served for thumbnail AND pano downloads.
+ */
+const JPEG_FIXTURE = Buffer.from(
+  '/9j/4AAQSkZJRgABAQAASABIAAD/4QBMRXhpZgAATU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKAC' +
+    'AAQAAAABAAAAQKADAAQAAAABAAAAIAAAAAD/7QA4UGhvdG9zaG9wIDMuMAA4QklNBAQAAAAAAAA4QklNBCUAAAAAABDUHYzZ' +
+    'jwCyBOmACZjs+EJ+/8AAEQgAIABAAwEiAAIRAQMRAf/EAB8AAAEFAQEBAQEBAAAAAAAAAAABAgMEBQYHCAkKC//EALUQAAIB' +
+    'AwMCBAMFBQQEAAABfQECAwAEEQUSITFBBhNRYQcicRQygZGhCCNCscEVUtHwJDNicoIJChYXGBkaJSYnKCkqNDU2Nzg5OkNE' +
+    'RUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6g4SFhoeIiYqSk5SVlpeYmZqio6Slpqeoqaqys7S1tre4ubrCw8TFxsfI' +
+    'ycrS09TV1tfY2drh4uPk5ebn6Onq8fLz9PX29/j5+v/EAB8BAAMBAQEBAQEBAQEAAAAAAAABAgMEBQYHCAkKC//EALURAAIB' +
+    'AgQEAwQHBQQEAAECdwABAgMRBAUhMQYSQVEHYXETIjKBCBRCkaGxwQkjM1LwFWJy0QoWJDThJfEXGBkaJicoKSo1Njc4OTpD' +
+    'REVGR0hJSlNUVVZXWFlaY2RlZmdoaWpzdHV2d3h5eoKDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXG' +
+    'x8jJytLT1NXW19jZ2uLj5OXm5+jp6vLz9PX29/j5+v/bAEMAAgICAgICBAICBAYEBAQGCAYGBgYICggICAgICgwKCgoKCgoM' +
+    'DAwMDAwMDA4ODg4ODhAQEBAQEhISEhISEhISEv/bAEMBAwMDBQQFCAQECBMNCw0TExMTExMTExMTExMTExMTExMTExMTExMT' +
+    'ExMTExMTExMTExMTExMTExMTExMTExMTE//dAAQABP/aAAwDAQACEQMRAD8A+TLTpXTWvUVzNp0rprXqK/ozOep+f5d0Ons+' +
+    '1dRZ9q5ez7V1Fn2r8lzrqfeZcdNada6e07VzFp1rp7TtX5LnXU+7y7odPa9q6ez61zFr2rp7PrX5JnXU+8y7of/Q+TLTpXTW' +
+    'vUVzNp0rprXqK/ozOep+f5d0Ons+1dRZ9q5ez7V1Fn2r8lzrqfeZcdNada6e07VzFp1rp7TtX5LnXU+7y7odPa9q6ez61zFr' +
+    '2rp7PrX5JnXU+8y7of/Z',
+  'base64',
+);
+
+/**
+ * SPZ stub: SPZ files are gzip streams whose decompressed payload starts with
+ * the magic "NGSP". This passes byte-sniffing/gzip checks in the pipeline but
+ * is NOT Spark-renderable — Stage C viewer tests use a real SPZ fixture.
+ */
+const SPZ_FIXTURE = gzipSync(
+  Buffer.concat([Buffer.from('NGSP'), Buffer.alloc(60, 0)]),
+);
+
+/** GLB stub: 12-byte glTF-binary header — magic "glTF", version 2, length. */
+const GLB_FIXTURE = (() => {
+  const b = Buffer.alloc(12);
+  b.write('glTF', 0, 'ascii');
+  b.writeUInt32LE(2, 4); // container version
+  b.writeUInt32LE(12, 8); // total length (header only)
+  return b;
+})();
+
+/** Pick the fixture matching an asset URL/filename extension. */
+function fixtureFor(url: string): Buffer {
+  if (url.endsWith('.spz')) return SPZ_FIXTURE;
+  if (url.endsWith('.glb')) return GLB_FIXTURE;
+  // .jpg (thumbnail, pano) and anything else image-ish.
+  return JPEG_FIXTURE;
+}
 
 interface MockState {
   operations: Map<string, string>; // operationId -> worldId
@@ -29,7 +80,7 @@ export function createMockProvider(): WorldGenProvider {
 
   const mintAssetUrl = (worldId: string, name: string): string => {
     const url = `${FAKE_HOST}/worlds/${worldId}/${name}`;
-    assetBytes.set(url, FIXTURE_BYTES);
+    assetBytes.set(url, fixtureFor(name));
     return url;
   };
 
@@ -87,8 +138,9 @@ export function createMockProvider(): WorldGenProvider {
     async downloadAsset(url): Promise<Buffer> {
       const bytes = assetBytes.get(url);
       if (!bytes) {
-        // Tolerate resumed worlds whose URLs were minted in a prior process.
-        if (url.startsWith(FAKE_HOST)) return FIXTURE_BYTES;
+        // Tolerate resumed worlds whose URLs were minted in a prior process —
+        // still serve the format-correct fixture for the extension.
+        if (url.startsWith(FAKE_HOST)) return fixtureFor(url);
         throw new ProviderError(`mock asset not found: ${url}`);
       }
       return bytes;
