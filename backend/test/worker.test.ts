@@ -1,29 +1,99 @@
 import { describe, it, expect, vi } from 'vitest';
+import { writeFile } from 'node:fs/promises';
 import {
   stitchPlan,
+  serializePoses,
+  posesPresent,
+  buildStitcherArgs,
+  handleStitch,
   runGeneration,
   type GenerationIO,
   type GenerationClock,
+  type WorkerDeps,
+  type StitcherSpawner,
 } from '../src/worker.js';
 import { MODEL_CREDITS, type WorldGenProvider } from '../src/provider/index.js';
 import { createMockProvider } from '../src/provider/mock.js';
+import { worlds, captures, type World, type Capture, type Job } from '../src/db/schema.js';
+import { loadConfig } from '../src/config.js';
+import type { StorageDriver } from '../src/storage/index.js';
 
-// --- stitch passthrough decision (pure) -------------------------------------
+// --- stitch decision (pure) --------------------------------------------------
 describe('stitchPlan', () => {
   it('single frame → passthrough (the frame IS the pano)', () => {
     expect(stitchPlan(1)).toEqual({ type: 'passthrough' });
   });
 
-  it('multi-frame → unsupported (Phase 0.5 gate pending)', () => {
-    expect(stitchPlan(16)).toEqual({
-      type: 'unsupported',
-      reason: 'stitching not yet implemented (Phase 0.5 gate pending)',
-    });
-    expect(stitchPlan(2).type).toBe('unsupported');
+  it('multi-frame → stitch (production reprojection)', () => {
+    expect(stitchPlan(16)).toEqual({ type: 'stitch', frameCount: 16 });
+    expect(stitchPlan(2).type).toBe('stitch');
+  });
+});
+
+// --- poses.json serialization from a captures row shape ----------------------
+describe('serializePoses / posesPresent', () => {
+  // Mirrors captures.poses_json: array of ARKit pose objects (spec §schema).
+  const row = [
+    {
+      index: 0,
+      timestamp: 0.0,
+      transform: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+      intrinsics: [1600, 0, 960, 0, 1600, 720, 0, 0, 1],
+      exposureLocked: true,
+    },
+    {
+      index: 1,
+      timestamp: 0.1,
+      transform: [0, 0, 1, 0, 0, 1, 0, 0, -1, 0, 0, 0, 0, 0, 0, 1],
+      intrinsics: [1600, 0, 960, 0, 1600, 720, 0, 0, 1],
+      exposureLocked: true,
+    },
+  ];
+
+  it('serializes the pose array verbatim (round-trips)', () => {
+    const json = serializePoses(row);
+    expect(JSON.parse(json)).toEqual(row);
   });
 
-  it('zero frames is also unsupported', () => {
-    expect(stitchPlan(0).type).toBe('unsupported');
+  it('posesPresent is true for a non-empty array, false otherwise', () => {
+    expect(posesPresent(row)).toBe(true);
+    expect(posesPresent(null)).toBe(false);
+    expect(posesPresent([])).toBe(false);
+    expect(posesPresent(undefined)).toBe(false);
+  });
+
+  it('serializePoses rejects a null / empty poses column', () => {
+    expect(() => serializePoses(null)).toThrow();
+    expect(() => serializePoses([])).toThrow();
+  });
+});
+
+// --- stitcher argv construction ---------------------------------------------
+describe('buildStitcherArgs', () => {
+  const base = {
+    scriptPath: '/app/stitcher/reproject.py',
+    framesDir: '/tmp/w/frames',
+    outPath: '/tmp/w/pano.jpg',
+    width: 8192,
+  };
+
+  it('includes --poses when a poses path is provided', () => {
+    const args = buildStitcherArgs({ ...base, posesPath: '/tmp/w/poses.json' });
+    expect(args).toContain('--poses');
+    expect(args[args.indexOf('--poses') + 1]).toBe('/tmp/w/poses.json');
+    expect(args).toEqual(
+      expect.arrayContaining(['--frames-dir', '/tmp/w/frames', '--out', '/tmp/w/pano.jpg', '--width', '8192']),
+    );
+  });
+
+  it('omits --poses when no poses path (nominal fallback)', () => {
+    const args = buildStitcherArgs({ ...base, posesPath: null });
+    expect(args).not.toContain('--poses');
+  });
+
+  it('includes --preview-out only when a preview path is given', () => {
+    expect(buildStitcherArgs({ ...base, previewPath: '/tmp/w/prev.jpg' })).toContain('--preview-out');
+    expect(buildStitcherArgs({ ...base })).not.toContain('--preview-out');
   });
 });
 
@@ -179,5 +249,177 @@ describe('mock provider billing', () => {
     // MODEL_CREDITS is what the live provider returns verbatim.
     expect(MODEL_CREDITS['marble-1.0-draft']).toBe(150);
     expect(MODEL_CREDITS['marble-1.1']).toBe(1500);
+  });
+});
+
+// --- stitch dispatch (handleStitch) -----------------------------------------
+// Exercises the branch decision + subprocess wiring with a MOCKED spawner and
+// an in-memory db/storage. No Python, no DB, no network.
+const stitchConfig = loadConfig({
+  DATABASE_URL: 'postgres://u:p@localhost:5432/db',
+  DEV_AUTH_TOKEN: 't',
+  STITCHER_WIDTH: '4096',
+} as NodeJS.ProcessEnv);
+
+function fakeWorld(): World {
+  return {
+    id: 'w-1', ownerId: 'user-1', title: null, caption: null, lat: null, lng: null,
+    placeName: null, isPublic: false, status: 'stitching', phase: null, panoUrl: null,
+    thumbnailUrl: null, spz100kUrl: null, spz500kUrl: null, spzFullUrl: null,
+    colliderGlbUrl: null, assetVersion: 1, provider: null, draftWorldId: null,
+    hqWorldId: null, draftModel: null, hqModel: null, creditsSpent: 0,
+    createdAt: new Date('2026-07-12T10:00:00Z'), deletedAt: null,
+  };
+}
+
+function fakeCapture(frameCount: number, posesJson: unknown): Capture {
+  return {
+    id: 'cap-1', worldId: 'w-1', frameCount, posesJson,
+    r2FramesPrefix: 'captures/cap-1', createdAt: new Date('2026-07-12T10:00:00Z'),
+  } as Capture;
+}
+
+interface Sink {
+  updates: { table: unknown; patch: Record<string, unknown> }[];
+  inserts: { table: unknown; vals: Record<string, unknown> }[];
+  executes: number;
+}
+
+function makeStitchDb(world: World, capture: Capture, sink: Sink) {
+  return {
+    select: () => ({
+      from: (table: unknown) => {
+        const rows = table === worlds ? [world] : table === captures ? [capture] : [];
+        const chain = { where: () => chain, orderBy: () => chain, limit: async () => rows };
+        return chain;
+      },
+    }),
+    update: (table: unknown) => ({
+      set: (patch: Record<string, unknown>) => ({
+        where: async () => { sink.updates.push({ table, patch }); },
+      }),
+    }),
+    insert: (table: unknown) => ({
+      values: (vals: Record<string, unknown>) => ({
+        returning: async () => { sink.inserts.push({ table, vals }); return [{ id: 'job-x' }]; },
+      }),
+    }),
+    execute: async () => { sink.executes += 1; },
+  };
+}
+
+function fakeStorage() {
+  const puts: string[] = [];
+  const gets: string[] = [];
+  const storage = {
+    kind: 'local',
+    presignUpload: vi.fn(),
+    presignDownload: vi.fn(),
+    putObject: vi.fn(async (key: string) => { puts.push(key); }),
+    getObject: vi.fn(async (key: string) => { gets.push(key); return Buffer.from(`bytes:${key}`); }),
+    deleteObject: vi.fn(),
+  } as unknown as StorageDriver;
+  return { storage, puts, gets };
+}
+
+/** Spawner mock that writes dummy pano/preview files so the handler can read them. */
+function fakeSpawner(): StitcherSpawner & { calls: string[][] } {
+  const calls: string[][] = [];
+  const fn = (async (_bin: string, args: string[]) => {
+    calls.push(args);
+    const out = args[args.indexOf('--out') + 1]!;
+    await writeFile(out, Buffer.from('PANOBYTES'));
+    const pv = args.indexOf('--preview-out');
+    if (pv >= 0) await writeFile(args[pv + 1]!, Buffer.from('PREVIEWBYTES'));
+    return { code: 0, stdout: 'coverage 90%', stderr: '', timedOut: false };
+  }) as StitcherSpawner & { calls: string[][] };
+  fn.calls = calls;
+  return fn;
+}
+
+const stitchJob = { id: 'job-1', kind: 'stitch', worldId: 'w-1' } as unknown as Job;
+
+function deps(db: unknown, storage: StorageDriver, stitcher: StitcherSpawner): WorkerDeps {
+  return {
+    db: db as WorkerDeps['db'],
+    storage,
+    provider: {} as WorkerDeps['provider'],
+    config: stitchConfig,
+    push: (async () => undefined) as unknown as WorkerDeps['push'],
+    stitcher,
+  };
+}
+
+describe('handleStitch dispatch', () => {
+  it('frame_count 1 → passthrough: copies the frame, never spawns Python', async () => {
+    const sink: Sink = { updates: [], inserts: [], executes: 0 };
+    const db = makeStitchDb(fakeWorld(), fakeCapture(1, null), sink);
+    const { storage, puts, gets } = fakeStorage();
+    const spawner = fakeSpawner();
+
+    await handleStitch(deps(db, storage, spawner), stitchJob);
+
+    expect(spawner.calls).toHaveLength(0); // no stitcher subprocess
+    expect(gets).toEqual(['captures/cap-1/frame_0.heic']);
+    expect(puts).toEqual(['worlds/w-1/pano.jpg']);
+    // Advanced to generating_draft + enqueued generate_draft + completed.
+    expect(sink.updates.some((u) => u.patch['status'] === 'generating_draft')).toBe(true);
+    expect(sink.inserts.some((i) => i.vals['kind'] === 'generate_draft')).toBe(true);
+    expect(sink.executes).toBe(1);
+  });
+
+  it('multi-frame WITH poses → spawns with --poses, uploads pano + preview', async () => {
+    const sink: Sink = { updates: [], inserts: [], executes: 0 };
+    const poses = [
+      { index: 0, transform: Array(16).fill(0), intrinsics: Array(9).fill(1) },
+      { index: 1, transform: Array(16).fill(0), intrinsics: Array(9).fill(1) },
+    ];
+    const db = makeStitchDb(fakeWorld(), fakeCapture(3, poses), sink);
+    const { storage, puts, gets } = fakeStorage();
+    const spawner = fakeSpawner();
+
+    await handleStitch(deps(db, storage, spawner), stitchJob);
+
+    expect(spawner.calls).toHaveLength(1);
+    const args = spawner.calls[0]!;
+    expect(args).toContain('--poses');
+    expect(args).toContain('--frames-dir');
+    expect(args[args.indexOf('--width') + 1]).toBe('4096');
+    // Downloaded all 3 frames.
+    expect(gets).toEqual([
+      'captures/cap-1/frame_0.heic',
+      'captures/cap-1/frame_1.heic',
+      'captures/cap-1/frame_2.heic',
+    ]);
+    // Uploaded pano and preview.
+    expect(puts).toContain('worlds/w-1/pano.jpg');
+    expect(puts).toContain('worlds/w-1/pano_preview.jpg');
+    expect(sink.updates.some((u) => u.patch['status'] === 'generating_draft')).toBe(true);
+    expect(sink.inserts.some((i) => i.vals['kind'] === 'generate_draft')).toBe(true);
+  });
+
+  it('multi-frame WITHOUT poses → spawns WITHOUT --poses (nominal fallback)', async () => {
+    const sink: Sink = { updates: [], inserts: [], executes: 0 };
+    const db = makeStitchDb(fakeWorld(), fakeCapture(2, null), sink);
+    const { storage } = fakeStorage();
+    const spawner = fakeSpawner();
+
+    await handleStitch(deps(db, storage, spawner), stitchJob);
+
+    expect(spawner.calls).toHaveLength(1);
+    expect(spawner.calls[0]).not.toContain('--poses');
+  });
+
+  it('stitcher non-zero exit → throws retryable (does not advance the world)', async () => {
+    const sink: Sink = { updates: [], inserts: [], executes: 0 };
+    const db = makeStitchDb(fakeWorld(), fakeCapture(2, null), sink);
+    const { storage } = fakeStorage();
+    const failing: StitcherSpawner = async () => ({
+      code: 1, stdout: '', stderr: 'boom: out of memory', timedOut: false,
+    });
+
+    await expect(handleStitch(deps(db, storage, failing), stitchJob)).rejects.toThrow(/boom/);
+    // Not a NonRetryableJobError → the loop's handleJobError will retry it.
+    expect(sink.updates.some((u) => u.patch['status'] === 'generating_draft')).toBe(false);
   });
 });

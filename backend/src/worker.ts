@@ -1,5 +1,8 @@
 import os from 'node:os';
-import { pathToFileURL } from 'node:url';
+import path from 'node:path';
+import { spawn } from 'node:child_process';
+import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises';
+import { pathToFileURL, fileURLToPath } from 'node:url';
 import { desc, eq, sql } from 'drizzle-orm';
 import { getConfig, type Config } from './config.js';
 import { getDb, closeDb, type Db } from './db/client.js';
@@ -44,10 +47,12 @@ export class NonRetryableJobError extends Error {
 
 // --- Storage key layout ------------------------------------------------------
 const panoKeyFor = (worldId: string) => `worlds/${worldId}/pano.jpg`;
+const panoPreviewKeyFor = (worldId: string) => `worlds/${worldId}/pano_preview.jpg`;
 const assetKeyFor = (worldId: string, name: string) => `worlds/${worldId}/${name}`;
 // Asset objects a world may own (used by purge).
 const WORLD_ASSET_NAMES = [
   'pano.jpg',
+  'pano_preview.jpg',
   'splat_100k.spz',
   'splat_500k.spz',
   'splat_full.spz',
@@ -55,26 +60,123 @@ const WORLD_ASSET_NAMES = [
   'collider.glb',
 ];
 
+/** Absolute path to the production Python stitcher, resolved relative to this
+ * module so it works both under tsx (src/) and compiled (dist/) — the
+ * `stitcher/` dir sits next to `src/` and `dist/`, and is COPYed into the
+ * Docker image at the same relative location. */
+function stitcherScriptPath(): string {
+  return fileURLToPath(new URL('../stitcher/reproject.py', import.meta.url));
+}
+
+/** Keep only the trailing `max` chars of a (stderr) string for error messages. */
+function tail(s: string, max = 800): string {
+  const t = s.trim();
+  return t.length > max ? `…${t.slice(-max)}` : t;
+}
+
 // =============================================================================
 // Pure / injectable pieces (unit-testable without a DB or network).
 // =============================================================================
 
 export type StitchAction =
   | { type: 'passthrough' }
-  | { type: 'unsupported'; reason: string };
+  | { type: 'stitch'; frameCount: number };
 
 /**
- * v0 stitch decision. Phase 0.5 gate is still pending, so we do NOT stitch:
- * exactly one frame is a passthrough (that single frame IS the pano); anything
- * more is unsupported and fails the job. See handleStitch for the loud caveat.
+ * Stitch decision (Phase 0.5 gate PASSED — the reprojection stitcher is live).
+ * Exactly one frame is a passthrough (that single frame IS the pano — the
+ * test-scan path, no real stitching or HEIC→JPEG transcode). More than one
+ * frame runs the production Python reprojection stitcher (stitcher/reproject.py).
  */
 export function stitchPlan(frameCount: number): StitchAction {
   if (frameCount === 1) return { type: 'passthrough' };
-  return {
-    type: 'unsupported',
-    reason: 'stitching not yet implemented (Phase 0.5 gate pending)',
-  };
+  return { type: 'stitch', frameCount };
 }
+
+// --- Stitcher subprocess plumbing (unit-testable) ----------------------------
+
+/**
+ * Serialize captures.poses_json into the poses.json payload the Python stitcher
+ * consumes (the ARKit pose array verbatim). Throws if the row has no usable
+ * pose array — callers only invoke this when poses are actually present.
+ */
+export function serializePoses(posesJson: unknown): string {
+  if (!Array.isArray(posesJson) || posesJson.length === 0) {
+    throw new Error('poses_json must be a non-empty array to stitch with poses');
+  }
+  return JSON.stringify(posesJson);
+}
+
+/** True when a captures row carries a usable ARKit pose array. */
+export function posesPresent(posesJson: unknown): boolean {
+  return Array.isArray(posesJson) && posesJson.length > 0;
+}
+
+export interface StitcherArgs {
+  scriptPath: string;
+  framesDir: string;
+  outPath: string;
+  width: number;
+  previewPath?: string | null;
+  posesPath?: string | null;
+}
+
+/**
+ * Build reproject.py's argv. `--poses` is included ONLY when a poses path is
+ * given (poses-driven reprojection); omitting it selects the nominal fallback.
+ */
+export function buildStitcherArgs(a: StitcherArgs): string[] {
+  const args = [
+    a.scriptPath,
+    '--frames-dir', a.framesDir,
+    '--out', a.outPath,
+    '--width', String(a.width),
+  ];
+  if (a.posesPath) args.push('--poses', a.posesPath);
+  if (a.previewPath) args.push('--preview-out', a.previewPath);
+  return args;
+}
+
+export interface StitcherRun {
+  code: number;
+  stdout: string;
+  stderr: string;
+  timedOut: boolean;
+}
+
+/** Injectable stitcher runner (real impl spawns Python; tests mock it). */
+export type StitcherSpawner = (
+  bin: string,
+  args: string[],
+  timeoutMs: number,
+) => Promise<StitcherRun>;
+
+/** Real spawner: runs `bin args`, capturing stdout/stderr, SIGKILL on timeout. */
+export const realStitcherSpawner: StitcherSpawner = (bin, args, timeoutMs) =>
+  new Promise<StitcherRun>((resolve, reject) => {
+    const child = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill('SIGKILL');
+    }, timeoutMs);
+    child.stdout.on('data', (d) => {
+      stdout += d.toString();
+    });
+    child.stderr.on('data', (d) => {
+      stderr += d.toString();
+    });
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      resolve({ code: code ?? -1, stdout, stderr, timedOut });
+    });
+  });
 
 export interface GenerationClock {
   now(): number;
@@ -201,6 +303,8 @@ export interface WorkerDeps {
   config: Config;
   push: SendPush;
   clock?: GenerationClock;
+  /** Injectable stitcher runner — defaults to spawning real Python. */
+  stitcher?: StitcherSpawner;
 }
 
 async function loadWorld(db: Db, worldId: string): Promise<World> {
@@ -209,14 +313,35 @@ async function loadWorld(db: Db, worldId: string): Promise<World> {
   return world;
 }
 
+/** Update the world row + enqueue draft generation after a pano lands. */
+async function finalizeStitch(db: Db, worldId: string, panoKey: string): Promise<void> {
+  await db
+    .update(worlds)
+    .set({ panoUrl: panoKey, status: 'generating_draft', phase: null })
+    .where(eq(worlds.id, worldId));
+  await enqueue(db, 'generate_draft', worldId);
+}
+
 /**
- * stitch — v0 PASSTHROUGH (Phase 0.5 gate pending). LOUD CAVEAT: a single frame
- * is copied verbatim to pano.jpg WITHOUT any real stitching or HEIC→JPEG
- * transcode; it only works because the client can supply one equirect frame.
- * Multi-frame stitching (Hugin/OpenCV, spec §5) is NOT implemented and fails.
+ * stitch (Phase 0.5 — production reprojection stitcher).
+ *
+ * frame_count == 1 → PASSTHROUGH (the test-scan path): the lone frame IS the
+ * pano, copied verbatim to pano.jpg. v0 caveat: no HEIC→JPEG transcode, so this
+ * assumes the single frame is already an equirect-usable image.
+ *
+ * frame_count > 1 → real stitch: download every frame to a temp dir, write
+ * poses.json when captures.poses_json is present, then spawn
+ * stitcher/reproject.py (5-min timeout). On success upload pano.jpg (+ optional
+ * pano_preview.jpg) and advance to generating_draft. On Python failure the job
+ * fails RETRYABLE (transient disk/memory pressure is real). Temp dir is always
+ * cleaned in finally.
+ *
+ * NOTE (documented gap, shared with the passthrough path): frames are written
+ * to the temp dir as frame_<i>.jpg from the stored bytes. The winning pipeline
+ * assumes JPEG-decodable frames; a true HEIC→JPEG transcode is a follow-up.
  */
-async function handleStitch(deps: WorkerDeps, job: Job): Promise<void> {
-  const { db, storage } = deps;
+export async function handleStitch(deps: WorkerDeps, job: Job): Promise<void> {
+  const { db, storage, config } = deps;
   const world = await loadWorld(db, job.worldId);
 
   const [capture] = await db
@@ -227,24 +352,74 @@ async function handleStitch(deps: WorkerDeps, job: Job): Promise<void> {
     .limit(1);
   if (!capture) throw new NonRetryableJobError(`no capture row for world ${job.worldId}`);
 
+  const framePrefix = capture.r2FramesPrefix ?? `captures/${capture.id}`;
+  const panoKey = panoKeyFor(world.id);
   const plan = stitchPlan(capture.frameCount);
-  if (plan.type === 'unsupported') {
-    // Non-retryable: retrying can never make multi-frame stitching succeed.
-    throw new NonRetryableJobError(plan.reason);
+
+  if (plan.type === 'passthrough') {
+    // Passthrough: the lone frame IS the pano. NOTE v0 limitation — no transcode.
+    const frameBytes = await storage.getObject(`${framePrefix}/frame_0.heic`);
+    await storage.putObject(panoKey, frameBytes);
+    await finalizeStitch(db, world.id, panoKey);
+    await completeJob(db, job.id);
+    return;
   }
 
-  // Passthrough: the lone frame IS the pano. NOTE v0 limitation — no transcode.
-  const framePrefix = capture.r2FramesPrefix ?? `captures/${capture.id}`;
-  const frameBytes = await storage.getObject(`${framePrefix}/frame_0.heic`);
-  const panoKey = panoKeyFor(world.id);
-  await storage.putObject(panoKey, frameBytes);
+  // Multi-frame reprojection stitch.
+  const spawner = deps.stitcher ?? realStitcherSpawner;
+  const workDir = await mkdtemp(path.join(os.tmpdir(), `virtspace-stitch-${world.id}-`));
+  try {
+    const framesDir = path.join(workDir, 'frames');
+    await mkdir(framesDir, { recursive: true });
+    for (let i = 0; i < capture.frameCount; i++) {
+      const bytes = await storage.getObject(`${framePrefix}/frame_${i}.heic`);
+      await writeFile(path.join(framesDir, `frame_${i}.jpg`), bytes);
+    }
 
-  await db
-    .update(worlds)
-    .set({ panoUrl: panoKey, status: 'generating_draft', phase: null })
-    .where(eq(worlds.id, world.id));
-  await enqueue(db, 'generate_draft', world.id);
-  await completeJob(db, job.id);
+    let posesPath: string | null = null;
+    if (posesPresent(capture.posesJson)) {
+      posesPath = path.join(workDir, 'poses.json');
+      await writeFile(posesPath, serializePoses(capture.posesJson));
+    }
+
+    const outPath = path.join(workDir, 'pano.jpg');
+    const previewPath = path.join(workDir, 'pano_preview.jpg');
+    const args = buildStitcherArgs({
+      scriptPath: stitcherScriptPath(),
+      framesDir,
+      outPath,
+      width: config.STITCHER_WIDTH,
+      previewPath,
+      posesPath,
+    });
+
+    const run = await spawner(config.PYTHON_BIN, args, config.STITCHER_TIMEOUT_MS);
+    if (run.timedOut) {
+      throw new Error(`stitcher timed out after ${config.STITCHER_TIMEOUT_MS}ms`);
+    }
+    if (run.code !== 0) {
+      // Retryable: transient disk/memory issues can clear on a re-run.
+      throw new Error(`stitcher exited ${run.code}: ${tail(run.stderr)}`);
+    }
+
+    const panoBytes = await readFile(outPath);
+    await storage.putObject(panoKey, panoBytes);
+
+    // Optional preview (2000x1000) — best-effort, not referenced by any DB
+    // column (thumbnail comes from Marble later). Purge cleans it via
+    // WORLD_ASSET_NAMES.
+    try {
+      const previewBytes = await readFile(previewPath);
+      await storage.putObject(panoPreviewKeyFor(world.id), previewBytes);
+    } catch {
+      // preview is optional; ignore if the stitcher didn't emit one.
+    }
+
+    await finalizeStitch(db, world.id, panoKey);
+    await completeJob(db, job.id);
+  } finally {
+    await rm(workDir, { recursive: true, force: true }).catch(() => undefined);
+  }
 }
 
 async function handleGenerate(

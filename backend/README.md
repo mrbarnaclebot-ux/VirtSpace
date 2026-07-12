@@ -160,10 +160,12 @@ A long-running loop (`workerId = hostname:pid`) that claims jobs of kinds
 `stitch | generate_draft | generate_hq | purge` every `WORKER_POLL_MS` (default
 2000). Handlers:
 
-- **stitch** — *v0 passthrough* (Phase 0.5 gate pending). Exactly **1** capture
-  frame is copied verbatim to `worlds/{id}/pano.jpg` (no real stitch/transcode),
-  then `status=generating_draft` and a `generate_draft` job is enqueued. **>1
-  frame fails** with `stitching not yet implemented (Phase 0.5 gate pending)`.
+- **stitch** — **1** frame is a passthrough (copied verbatim to
+  `worlds/{id}/pano.jpg`, the test-scan path; no transcode). **>1** frame runs
+  the production reprojection stitcher (see [Stitcher](#stitcher-spec-5--phase-05)
+  below): frames + poses are staged to a temp dir, `reproject.py` builds the
+  equirect pano, and it's uploaded before `status=generating_draft` +
+  `generate_draft` enqueue. A stitcher failure fails the job **retryable**.
 - **generate_draft / generate_hq** — the credit-safe money path (see below);
   `marble-1.0-draft` (150 credits) → `draft_ready`, `marble-1.1` (1500 credits)
   → `complete`. Fires the APNs push stub on success.
@@ -172,6 +174,71 @@ A long-running loop (`workerId = hostname:pid`) that claims jobs of kinds
 
 Boot is crash-safe: the DB pool is lazy, so with a dummy `DATABASE_URL` the
 worker starts, logs claim errors, and idles instead of exiting.
+
+### Stitcher (spec §5 / Phase 0.5)
+
+Multi-frame captures are stitched into an 8192×4096 equirectangular pano by
+`stitcher/reproject.py` — the Phase 0.5 gate-winning algorithm, spawned as a
+subprocess by the worker's `stitch` handler.
+
+**Algorithm.** Each ARKit-native landscape frame is rotated 90° CW to upright,
+then **rotation-only reprojected** onto an equirect sphere (camera translation
+is ignored — this is a pure orientation panorama). Overlaps are **feather
+blended** (center-weighted, `weight = ((1-|nx|)(1-|ny|))²`, pole frames boosted
+so caps don't smear), and residual holes are **Telea-inpainted** at reduced res
+then composited back.
+
+Two orientation modes:
+
+- **poses provided** (`captures.poses_json` present) — each frame's orientation
+  comes from its ARKit 4×4 camera-to-world `transform` and its intrinsics-derived
+  FOV. This gives a level horizon and correct relative yaw/roll from real device
+  attitude.
+- **poses absent** — falls back to the nominal 16-target guided-capture angles
+  with the winning parameters (`pitch_sign=-1`, `hfov=52`), exactly as the spike.
+
+**Coordinate reconciliation.** Equirect world and ARKit world are both
+right-handed, +Y up (gravity), so the horizon stays level. The ARKit camera is
+right-handed (+X right, +Y up, optical axis **−Z**); after the 90° CW upright
+rotation the fixed rebasing `X_proj=+Y_ak, Y_proj=−X_ak, Z_proj=−Z_ak` maps it
+into the left-handed pinhole the reprojection equations use (forward **+Z**).
+Intrinsics (native-landscape `fx,fy,cx,cy`) yield resolution-independent FOVs;
+after rotation the upright **width** spans the native **vertical** FOV and the
+upright **height** the native **horizontal** FOV.
+
+**CLI** (deterministic; progress on stdout; non-zero exit + stderr on failure):
+
+```bash
+python3 stitcher/reproject.py \
+  --frames-dir DIR --out pano.jpg \
+  [--poses poses.json] [--width 8192] [--preview-out pano_preview.jpg]
+```
+
+**Worker integration.** For `frame_count > 1` the handler downloads every
+`frame_i.heic` to a temp dir (as `frame_i.jpg`), writes `poses.json` when the
+capture carries poses, spawns `PYTHON_BIN` with a `STITCHER_TIMEOUT_MS` ceiling,
+and on success uploads `pano.jpg` (+ optional `pano_preview.jpg`). The temp dir
+is always cleaned. Config: `STITCHER_TIMEOUT_MS` (300000), `STITCHER_WIDTH`
+(8192), `PYTHON_BIN` (`python3`). *Known gap (shared with the passthrough path):
+frames are staged with a `.jpg` name from the stored bytes; a true HEIC→JPEG
+transcode is a follow-up — the winning pipeline assumes JPEG-decodable frames.*
+
+**Docker.** The single `Dockerfile` (both services, selected by `SERVICE_ENTRY`)
+installs Python 3 + `stitcher/requirements.txt` (numpy, opencv-python-headless)
+into a venv on `PATH` alongside the Node build, so the worker's `python3`
+resolves to the bundled interpreter.
+
+**Local dev.** Create a venv and install the stitcher deps:
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r stitcher/requirements.txt
+# then run the worker with PYTHON_BIN pointing at this interpreter:
+PYTHON_BIN="$(pwd)/.venv/bin/python" npm run worker
+```
+
+The Python smoke test (`test/stitcher.smoke.test.ts`) `skipIf`s when `python3`
+lacks the deps; point it at a venv with `STITCHER_TEST_PYTHON=/path/to/python`.
 
 ### Credit safety (spec §14) — the money-touching path
 
@@ -216,7 +283,10 @@ npm run worker
 Then drive the API (`POST /v1/worlds` with `frame_count: 1` → PUT the frame →
 `POST /v1/worlds/{id}/frames:done`). The worker stitches (passthrough),
 "generates" a mock world, re-hosts fixture assets into local storage, and the
-world reaches `draft_ready` — all with zero World Labs calls.
+world reaches `draft_ready` — all with zero World Labs calls. (Multi-frame
+captures additionally exercise the Python stitcher — ensure `PYTHON_BIN` points
+at a venv with `stitcher/requirements.txt` installed; see
+[Stitcher](#stitcher-spec-5--phase-05).)
 
 ## Notes / boundaries
 
@@ -225,4 +295,5 @@ world reaches `draft_ready` — all with zero World Labs calls.
 - `worldlabs.ts` is a faithful port of `tools/spike/spike.py` (the live-verified
   contract), incl. `media_asset.media_asset_id`, the `WLT-Api-Key` header, and
   the `is_pano: true` generate body. It is exercised only when `PROVIDER_MODE=live`.
-- Real APNs delivery and multi-frame stitching remain future phases.
+- Multi-frame stitching is live (Phase 0.5, see [Stitcher](#stitcher-spec-5--phase-05));
+  real APNs delivery and a HEIC→JPEG frame transcode remain future phases.

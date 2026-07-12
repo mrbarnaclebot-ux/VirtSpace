@@ -38,6 +38,15 @@ const baseSchema = z.object({
 
   // Worker loop poll interval (ms) between empty claim attempts (Stage 2).
   WORKER_POLL_MS: numberFromEnv(2000),
+
+  // --- Stitcher (Phase 0.5) -------------------------------------------------
+  // Wall-clock ceiling for a single reproject.py run before it's killed and the
+  // stitch job fails (retryable). Default 5 minutes.
+  STITCHER_TIMEOUT_MS: numberFromEnv(300000),
+  // Equirect pano width (height = width/2). Default 8192 → 8192x4096.
+  STITCHER_WIDTH: numberFromEnv(8192),
+  // Python interpreter used to run stitcher/reproject.py.
+  PYTHON_BIN: z.string().default('python3'),
 });
 
 export type Config = z.infer<typeof baseSchema> & { PUBLIC_BASE_URL: string };
