@@ -11,6 +11,7 @@
 //
 
 import Foundation
+import OSLog
 
 final class CaptureUploader {
     static let expectedFrameCount = 16
@@ -63,18 +64,40 @@ final class CaptureUploader {
     private func upload(session: CaptureStore.PendingSession, progress: @escaping (Int) -> Void) async throws -> World {
         let frameCount = session.manifest.frames.count
         let title = "Scan \(Date().formatted(date: .abbreviated, time: .shortened))"
+        AppLog.upload.log("Upload start: session \(session.id.uuidString, privacy: .public), \(frameCount) frames")
+
         let (world, slots) = try await api.createWorld(title: title, frameCount: frameCount)
+        AppLog.upload.log("World created: \(world.id, privacy: .public), \(slots.count) upload slots")
 
         progress(0)
         var done = 0
         for slot in slots.sorted(by: { $0.index < $1.index }) {
+            // loadFrameData reads off the main actor: this method runs in a
+            // non-isolated async context (cooperative pool), never on MainActor.
             let data = try store.loadFrameData(index: slot.index, in: session.directory)
-            try await frameUploader.upload(data, to: slot)
+            do {
+                try await frameUploader.upload(data, to: slot)
+            } catch {
+                AppLog.upload.error("Frame \(slot.index) upload failed: \(error.localizedDescription, privacy: .public)")
+                throw error
+            }
             done += 1
             progress(done)
         }
 
-        try await api.framesDone(worldId: world.id)
+        // Include the captured poses so the backend gets pose-assisted stitching
+        // data (spec §5). The field is optional on the contract.
+        let poses = session.manifest.frames.map {
+            FramePose(
+                index: $0.index,
+                timestamp: $0.timestamp,
+                transform: $0.transform,
+                intrinsics: $0.intrinsics,
+                exposureLocked: $0.exposureLocked
+            )
+        }
+        try await api.framesDone(worldId: world.id, poses: poses)
+        AppLog.upload.log("frames:done ok for \(world.id, privacy: .public) with \(poses.count) poses")
         store.purge(id: session.id)
         return world
     }

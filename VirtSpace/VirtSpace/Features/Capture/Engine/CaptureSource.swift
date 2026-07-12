@@ -64,6 +64,12 @@ protocol CaptureSource: AnyObject {
     func start()
     func stop()
 
+    /// Temporarily suspend the feed (thermal-critical cool-down) WITHOUT
+    /// tearing down tracking, so `resume()` continues the same world/heading.
+    func pause()
+    /// Resume after `pause()`, preserving the established world frame.
+    func resume()
+
     /// Take one still. Completion may arrive on any queue.
     func captureStill(_ completion: @escaping (Result<CapturedStill, Error>) -> Void)
 
@@ -128,6 +134,10 @@ final class SimulatedCaptureSource: CaptureSource {
         timer = nil
         lastTick = nil
     }
+
+    func pause() { stop() }
+
+    func resume() { start() }
 
     private func tick() {
         let now = CACurrentMediaTime()

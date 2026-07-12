@@ -9,6 +9,7 @@
 
 import Foundation
 import Observation
+import OSLog
 
 @Observable
 final class APIClient {
@@ -38,9 +39,16 @@ final class APIClient {
         return (resp.world, resp.uploads)
     }
 
-    func framesDone(worldId: String) async throws {
+    /// Signal all frames uploaded. `poses` (when present) is included in the
+    /// body so the backend can persist per-frame ARKit attitude for
+    /// pose-assisted stitching; the field is optional on the contract.
+    func framesDone(worldId: String, poses: [FramePose]? = nil) async throws {
+        var body: Data?
+        if let poses, !poses.isEmpty {
+            body = try encoder.encode(FramesDoneRequest(poses: poses))
+        }
         // Response is { world: {metadata}, job_id } — not needed by callers.
-        _ = try await send(request("POST", "v1/worlds/\(worldId)/frames:done"))
+        _ = try await send(request("POST", "v1/worlds/\(worldId)/frames:done", body: body))
     }
 
     /// `GET /v1/worlds/:id` → `{ world: {metadata}, assets: {...} }`. Presigned
@@ -85,23 +93,33 @@ final class APIClient {
 
     private func send(_ request: URLRequest?) async throws -> Data {
         guard let request else { throw APIError.invalidResponse }
+        // Redacted for logs: method + path only, never the Authorization header.
+        let tag = "\(request.httpMethod ?? "?") \(AppLog.redact(request.url))"
         let data: Data
         let response: URLResponse
         do {
             (data, response) = try await session.data(for: request)
         } catch {
+            AppLog.api.error("Network failure: \(tag, privacy: .public) — \(error.localizedDescription, privacy: .public)")
             throw APIError.network(error)
         }
-        guard let http = response as? HTTPURLResponse else { throw APIError.invalidResponse }
+        guard let http = response as? HTTPURLResponse else {
+            AppLog.api.error("Non-HTTP response: \(tag, privacy: .public)")
+            throw APIError.invalidResponse
+        }
         switch http.statusCode {
         case 200..<300:
             return data
         case 401, 403:
+            AppLog.api.error("Unauthorized (\(http.statusCode)): \(tag, privacy: .public)")
             throw APIError.unauthorized
         case 402, 429:
+            AppLog.api.error("Quota (\(http.statusCode)): \(tag, privacy: .public)")
             throw APIError.quota
         default:
-            throw APIError.server(http.statusCode, APIClient.errorMessage(from: data))
+            let message = APIClient.errorMessage(from: data)
+            AppLog.api.error("Server error \(http.statusCode): \(tag, privacy: .public) — \(message ?? "no body", privacy: .public)")
+            throw APIError.server(http.statusCode, message)
         }
     }
 

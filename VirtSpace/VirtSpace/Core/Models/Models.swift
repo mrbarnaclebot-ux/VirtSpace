@@ -239,6 +239,29 @@ struct CreateWorldResponse: Decodable {
     let uploads: [FrameUpload]
 }
 
+// MARK: - Frame poses (capture → backend)
+
+/// One per-frame pose, mirroring a `poses.json` entry (see CaptureStore).
+/// Sent up in the `frames:done` body so the server stitcher can do
+/// pose-assisted reprojection (spec §5, §7 `captures.poses_json`). Field names
+/// match poses.json exactly — the backend contract keys off these.
+struct FramePose: Codable, Hashable {
+    let index: Int
+    let timestamp: TimeInterval
+    /// Camera-to-world transform, 16 floats, column-major.
+    let transform: [Float]
+    /// Camera intrinsics, 9 floats, column-major (matches the JPEG pixels).
+    let intrinsics: [Float]
+    /// Whether AE/AWB/AF were locked when this frame was taken.
+    let exposureLocked: Bool
+}
+
+/// `POST /v1/worlds/:id/frames:done` body. `poses` is optional on the wire —
+/// the backend tolerates it being absent (older clients / test harness).
+struct FramesDoneRequest: Encodable {
+    let poses: [FramePose]?
+}
+
 /// `GET /v1/worlds` → `{ worlds: [...], has_more }`.
 struct WorldsListResponse: Decodable {
     let worlds: [World]

@@ -43,6 +43,15 @@ final class ARKitCaptureSource: NSObject, CaptureSource, ARSessionDelegate {
     private let ciContext = CIContext()
     private var supportsHighResCapture = false
     private var isRunning = false
+    /// Retained so a thermal `resume()` can re-run the SAME configuration
+    /// without `.resetTracking` — preserving the world frame + heading basis.
+    private var configuration: ARWorldTrackingConfiguration?
+
+    /// Off-main queue for the heavy still encode (Lanczos downscale + JPEG).
+    /// `captureHighResolutionFrame`'s completion is delivered on the main
+    /// thread; encoding there would hang the UI and add heat (Stage B3
+    /// deliverable 2c), so we hop here first.
+    private let encodeQueue = DispatchQueue(label: "com.virtspace.arkit-encode", qos: .userInitiated)
 
     init(queue: DispatchQueue) {
         super.init()
@@ -59,7 +68,18 @@ final class ARKitCaptureSource: NSObject, CaptureSource, ARSessionDelegate {
         }
         let configuration = ARWorldTrackingConfiguration()
         configuration.worldAlignment = .gravity
+        // Thermal trim (Stage B3 deliverable 2a): this is a pure pose+still
+        // capture — turn OFF every ARKit subsystem we don't use so the device
+        // does less work and runs cooler. Plane detection, scene
+        // reconstruction (LiDAR mesh), frame semantics (segmentation/depth),
+        // environment texturing and light estimation are all unnecessary here.
+        configuration.planeDetection = []
+        configuration.frameSemantics = []
+        configuration.environmentTexturing = .none
         configuration.isLightEstimationEnabled = false
+        if ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
+            configuration.sceneReconstruction = []
+        }
         // Opt into a video format that supports 12 MP+ mid-session stills.
         if let format = ARWorldTrackingConfiguration.recommendedVideoFormatForHighResolutionFrameCapturing {
             configuration.videoFormat = format
@@ -67,6 +87,7 @@ final class ARKitCaptureSource: NSObject, CaptureSource, ARSessionDelegate {
         } else {
             supportsHighResCapture = false
         }
+        self.configuration = configuration
         isRunning = true
         session.run(configuration, options: [.resetTracking, .removeExistingAnchors])
     }
@@ -76,25 +97,48 @@ final class ARKitCaptureSource: NSObject, CaptureSource, ARSessionDelegate {
         session.pause()
     }
 
+    func pause() {
+        // Suspend the feed to cool down; keep `configuration` so resume()
+        // continues the same world map (no reset → heading basis survives).
+        isRunning = false
+        session.pause()
+    }
+
+    func resume() {
+        guard let configuration else { start(); return }
+        isRunning = true
+        // No options → ARKit relocalizes into the existing world; the engine's
+        // established heading basis and captured poses stay valid.
+        session.run(configuration)
+    }
+
     func captureStill(_ completion: @escaping (Result<CapturedStill, Error>) -> Void) {
         guard isRunning else {
             completion(.failure(CaptureSourceError.notRunning))
             return
         }
         if supportsHighResCapture {
+            // Benign device-log noise: at high-res still capture the camera
+            // stack emits `FigCaptureSourceRemote ... err=-17281` and CoreMedia
+            // `-12710` bursts. Captures succeed regardless — these are Apple's
+            // internal chatter, not our failure. Don't chase them when debugging.
             session.captureHighResolutionFrame { [weak self] frame, _ in
                 guard let self else { return }
-                if let frame {
-                    completion(self.encode(frame))
-                } else {
-                    // High-res capture can transiently fail (e.g. one already
-                    // in flight) — degrade to the live feed rather than lose
-                    // the shot.
-                    completion(self.captureCurrentFrame())
+                // Encode off the main thread: this callback lands on main and
+                // the Lanczos+JPEG work is expensive (deliverable 2c).
+                self.encodeQueue.async {
+                    if let frame {
+                        completion(self.encode(frame))
+                    } else {
+                        // High-res capture can transiently fail (e.g. one
+                        // already in flight) — degrade to the live feed rather
+                        // than lose the shot.
+                        completion(self.captureCurrentFrame())
+                    }
                 }
             }
         } else {
-            completion(captureCurrentFrame())
+            encodeQueue.async { completion(self.captureCurrentFrame()) }
         }
     }
 
@@ -102,6 +146,9 @@ final class ARKitCaptureSource: NSObject, CaptureSource, ARSessionDelegate {
         guard let device = ARWorldTrackingConfiguration.configurableCaptureDeviceForPrimaryCamera else {
             return false
         }
+        // Benign device-log noise: locking AE/AWB/AF here also triggers the
+        // `FigCaptureSourceRemote err=-17281` / CoreMedia `-12710` bursts seen
+        // at capture time. The lock takes effect regardless — expected, non-fatal.
         do {
             try device.lockForConfiguration()
             defer { device.unlockForConfiguration() }

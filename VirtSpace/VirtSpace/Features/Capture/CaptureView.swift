@@ -39,11 +39,15 @@ struct CaptureView: View {
             ZStack {
                 backdrop
                 content
+                if engine.isThermallyPaused {
+                    thermalPauseOverlay
+                }
                 if let uploadedFrames {
                     UploadOverlayView(uploaded: uploadedFrames, total: engine.targets.count)
                 }
             }
             .animation(.easeOut(duration: 0.25), value: uploadedFrames == nil)
+            .animation(.easeOut(duration: 0.25), value: engine.isThermallyPaused)
             .navigationBarHidden(true)
             .toast($toast)
             .onChange(of: engine.state) { _, newState in
@@ -81,20 +85,36 @@ struct CaptureView: View {
     }
 
     /// Live camera feed behind the HUD. On device: the engine's ARSession
-    /// rendered by a bare ARSCNView (see CameraPreviewView for the rationale).
-    /// Simulator: stylized animated placeholder.
+    /// rendered by a bare ARSCNView (see CameraPreviewView for the rationale),
+    /// with painted-sphere quads for captured shots. Simulator: stylized
+    /// animated placeholder with the same paint quads via a Canvas overlay.
     @ViewBuilder
     private var cameraLayer: some View {
         #if targetEnvironment(simulator)
-        SimulatedCameraBackdrop()
+        SimulatedCameraBackdrop(
+            paintedShots: engine.paintedShots,
+            cameraTransform: engine.cameraTransform,
+            intrinsics: engine.cameraIntrinsics,
+            imageResolution: engine.imageResolution
+        )
         #else
         if let session = engine.previewSession {
-            CameraPreviewView(session: session)
-                .ignoresSafeArea()
+            CameraPreviewView(
+                session: session,
+                paintedShots: engine.paintedShots,
+                preferredFPS: previewFPS
+            )
+            .ignoresSafeArea()
         } else {
             Color.black.ignoresSafeArea()
         }
         #endif
+    }
+
+    /// Viewfinder frame rate: 30 fps normally, dropped to 24 under thermal
+    /// pressure to shed load and heat (Stage B3 deliverable 2d/2e).
+    private var previewFPS: Int {
+        CaptureEngine.previewFrameRate(for: engine.thermalState)
     }
 
     // MARK: - Idle / failed
@@ -224,6 +244,46 @@ struct CaptureView: View {
             toast = Toast(message: "Camera access is denied. Enable it in Settings → VirtSpace.", style: .error)
         }
         #endif
+    }
+
+    // MARK: - Thermal pause
+
+    /// Full-screen cool-down UI shown when the device hits `.critical` and the
+    /// engine has paused the session (Stage B3 deliverable 2e). Capture resumes
+    /// only when the user taps — giving the phone a chance to cool.
+    private var thermalPauseOverlay: some View {
+        ZStack {
+            Color.black.opacity(0.82).ignoresSafeArea()
+            VStack(spacing: 18) {
+                Image(systemName: "thermometer.high")
+                    .font(.system(size: 52, weight: .light))
+                    .foregroundStyle(.orange)
+                Text("Paused to cool down")
+                    .font(.title2.weight(.bold))
+                    .foregroundStyle(.white)
+                Text("Your iPhone got too warm, so capture paused to protect it. Give it a moment, then resume — your progress is saved.")
+                    .font(.subheadline)
+                    .foregroundStyle(.white.opacity(0.7))
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 40)
+                Button {
+                    engine.resumeFromThermal()
+                } label: {
+                    Label("Resume capture", systemImage: "play.fill")
+                        .font(.headline)
+                        .padding(.horizontal, 28)
+                        .padding(.vertical, 14)
+                        .background(Color.orange, in: Capsule())
+                        .foregroundStyle(.black)
+                }
+                Button("Abandon scan", role: .destructive) {
+                    engine.cancel()
+                }
+                .font(.subheadline.weight(.semibold))
+                .tint(.red)
+            }
+        }
+        .transition(.opacity)
     }
 
     // MARK: - Visuals

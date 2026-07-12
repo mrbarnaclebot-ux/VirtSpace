@@ -80,6 +80,11 @@ final class CaptureStore {
     /// read-modify-write of poses.json on every shot). Callers use the store
     /// from a single queue (the engine queue).
     private var manifests: [UUID: Manifest] = [:]
+    /// Off-main queue for teardown I/O (session purge). Directory removal is
+    /// slow, blocking I/O; on-device logs flagged `removeItemAtURL` running on
+    /// the MAIN THREAD (hang-risk / excessive-I/O Faults). Keeping it here
+    /// guarantees the delete never blocks the UI, regardless of caller.
+    private let ioQueue = DispatchQueue(label: "com.virtspace.capture-store.io", qos: .utility)
 
     private let encoder: JSONEncoder = {
         let e = JSONEncoder()
@@ -114,6 +119,11 @@ final class CaptureStore {
 
     /// Persist one shot: frame_<i>.jpg written atomically, then poses.json
     /// rewritten atomically. After this returns, the shot survives a crash.
+    ///
+    /// Threading: intentionally synchronous — the write MUST complete before we
+    /// return so the shot is crash-safe (spec §6.1). It is only ever called
+    /// from the engine's background serial queue (never the main actor), so the
+    /// blocking disk I/O stays off the UI thread. Do not call from MainActor.
     func saveFrame(_ jpegData: Data, pose: FramePose, in session: Session) throws {
         try jpegData.write(to: frameURL(index: pose.index, in: session.directory), options: .atomic)
         var manifest = manifests[session.id] ?? (try? readManifest(in: session.directory))
@@ -149,10 +159,16 @@ final class CaptureStore {
         try Data(contentsOf: frameURL(index: index, in: directory))
     }
 
-    /// Remove a session after a successful upload (or user cancel).
+    /// Remove a session after a successful upload (or user cancel). The
+    /// in-memory manifest is dropped synchronously (cheap, preserves ordering
+    /// on the caller's queue) but the actual directory removal — the slow,
+    /// blocking part — is punted to `ioQueue` so it never runs on the main
+    /// thread (see `ioQueue` docs: this was a flagged on-device Fault).
     func purge(id: UUID) {
         manifests[id] = nil
-        try? fileManager.removeItem(at: directoryURL(for: id))
+        let url = directoryURL(for: id)
+        let fm = fileManager
+        ioQueue.async { try? fm.removeItem(at: url) }
     }
 
     // MARK: - Paths & JSON

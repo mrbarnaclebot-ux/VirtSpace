@@ -116,14 +116,18 @@ struct CaptureHUDView: View {
     @ViewBuilder
     private func targetDot(captured: Bool, isCurrent: Bool, degreesOff: Double) -> some View {
         if captured {
+            // Dimmed once captured (Stage B3 deliverable 1): the painted
+            // imagery now fills that direction, so the marker recedes to a
+            // small, low-contrast tick and lets the panorama read clearly.
             ZStack {
                 Circle()
-                    .fill(Color.green.opacity(0.28))
-                    .frame(width: 22, height: 22)
+                    .fill(Color.green.opacity(0.14))
+                    .frame(width: 15, height: 15)
                 Image(systemName: "checkmark")
-                    .font(.system(size: 10, weight: .bold))
-                    .foregroundStyle(.green)
+                    .font(.system(size: 7, weight: .bold))
+                    .foregroundStyle(.green.opacity(0.6))
             }
+            .opacity(0.7)
         } else {
             // 0 (far) → 1 (dead-on) over a 60° falloff.
             let closeness = max(0, 1 - degreesOff / 60)

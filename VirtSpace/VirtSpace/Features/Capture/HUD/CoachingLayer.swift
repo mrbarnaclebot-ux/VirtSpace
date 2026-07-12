@@ -14,6 +14,7 @@ import SwiftUI
 struct CoachingBanner: Equatable, Identifiable {
     enum Kind: Equatable {
         case tracking
+        case thermal
         case driftHard
         case driftSoft
         case exposure
@@ -39,6 +40,9 @@ struct CoachingLayer: View {
     /// `.onChange` fires only on meaningful transitions (not per frame).
     private struct Conditions: Equatable {
         let trackingWarning: String?
+        /// True at `.serious` thermal state (deliverable 2e). `.critical` is
+        /// handled by the full-screen pause UI, not a banner.
+        let thermalWarming: Bool
         let driftTier: Int // 0 none, 1 soft, 2 hard
         let wantsExposureNotice: Bool
     }
@@ -46,6 +50,7 @@ struct CoachingLayer: View {
     private var conditions: Conditions {
         Conditions(
             trackingWarning: engine.warning,
+            thermalWarming: CaptureEngine.showsWarmingBanner(for: engine.thermalState),
             driftTier: engine.driftMeters > AlignmentMath.driftHardWarnMeters ? 2
                 : (engine.driftMeters > AlignmentMath.driftWarnMeters ? 1 : 0),
             wantsExposureNotice: engine.capturedCount > 0 && !engine.exposureLocked
@@ -97,6 +102,16 @@ struct CoachingLayer: View {
                 text: warning,
                 systemImage: "eye.trianglebadge.exclamationmark",
                 tint: .yellow,
+                isSticky: true
+            )
+            return
+        }
+        if c.thermalWarming {
+            banner = CoachingBanner(
+                kind: .thermal,
+                text: "Phone is warming up — normal during capture",
+                systemImage: "thermometer.medium",
+                tint: .orange,
                 isSticky: true
             )
             return

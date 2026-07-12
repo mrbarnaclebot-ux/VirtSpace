@@ -18,6 +18,11 @@ struct LibraryView: View {
     @State private var toast: Toast?
     @State private var pollTask: Task<Void, Never>?
 
+    // Debug log viewer entry (Stage B3 deliverable 3c).
+    @State private var showDebugLog = false
+    @State private var titleTapCount = 0
+    @State private var firstTitleTapAt = Date.distantPast
+
     private var anyActive: Bool { worlds.contains { $0.status.isActive } }
 
     var body: some View {
@@ -29,9 +34,34 @@ struct LibraryView: View {
                     worldList
                 }
             }
-            .navigationTitle("Library")
+            .navigationBarTitleDisplayMode(.inline)
             .background(Color(.systemBackground))
             .toast($toast)
+            .toolbar {
+                // A tappable title stands in for the nav title so the secret
+                // gesture has a reliable hit target.
+                ToolbarItem(placement: .principal) {
+                    Text("Library")
+                        .font(.headline)
+                        .onTapGesture { registerTitleTap() }
+                }
+                // Wrench/ladybug shortcut — DEBUG builds only. TestFlight
+                // (release) builds strip this, so the 5-tap-on-title gesture
+                // below is the ALWAYS-available path to reach the log viewer.
+                #if DEBUG
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        showDebugLog = true
+                    } label: {
+                        Image(systemName: "ladybug")
+                    }
+                    .accessibilityLabel("Debug logs")
+                }
+                #endif
+            }
+            .sheet(isPresented: $showDebugLog) {
+                DebugLogView()
+            }
         }
         .task {
             if !hasLoadedOnce {
@@ -86,6 +116,24 @@ struct LibraryView: View {
             .frame(maxWidth: .infinity)
         }
         .refreshable { await refresh(showErrors: true) }
+    }
+
+    // MARK: - Debug log gesture
+
+    /// Five taps on the title within 2 s opens the debug log viewer. This is
+    /// the release/TestFlight-safe entry point (no #if DEBUG), so the owner can
+    /// pull logs from a build that has no debug toolbar button.
+    private func registerTitleTap() {
+        let now = Date()
+        if now.timeIntervalSince(firstTitleTapAt) > 2 {
+            titleTapCount = 0
+            firstTitleTapAt = now
+        }
+        titleTapCount += 1
+        if titleTapCount >= 5 {
+            titleTapCount = 0
+            showDebugLog = true
+        }
     }
 
     // MARK: - Data
