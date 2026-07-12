@@ -1,0 +1,33 @@
+VirtSpace bundled 3D renderer — pinned versions (spec §3.1)
+============================================================
+
+No runtime CDN dependency: every file below is bundled in the app and served
+to the WKWebView via the custom `virtspace-viewer://` WKURLSchemeHandler.
+Downloaded 2026-07-12.
+
+three.js — 0.180.0 (MIT)
+  three.module.js   603 KB  https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js
+  three.core.js     1.4 MB  https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.core.js
+  Pass.js           4.2 KB  https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/postprocessing/Pass.js
+
+Spark — 2.1.0 (MIT, World Labs)
+  spark.module.js   5.4 MB  https://sparkjs.dev/releases/spark/2.1.0/spark.module.js
+
+Transitive-dependency note
+--------------------------
+The task named two files (three.module.js + spark.module.js), but neither works
+standalone — they are ES modules with hard imports that MUST also be bundled or
+nothing loads:
+  * three.module.js  imports  ./three.core.js            (modern three ships split)
+  * spark.module.js  imports  three/addons/postprocessing/Pass.js  (FullScreenQuad)
+  * Pass.js          imports  three
+So three.core.js and Pass.js are bundled as required transitive deps. Their
+bare/relative specifiers are resolved by the <script type="importmap"> in
+viewer.html, all pointing back at the custom scheme (see viewer.html).
+
+fixture.spz — 5.98 MB
+  The owner's own bedroom capture (tools/spike/world.spz, produced live from a
+  real 16-shot capture through the World Labs pipeline). Bundled in ALL builds
+  (per Stage C brief) so simulator/device testing needs no backend. ~6 MB is an
+  accepted cost; it powers the DEBUG "Explore fixture world" row. A production
+  optimization would strip it from Release via a build phase — noted, not done.

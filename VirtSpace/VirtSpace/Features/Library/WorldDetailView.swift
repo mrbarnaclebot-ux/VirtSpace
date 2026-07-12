@@ -25,6 +25,19 @@ struct WorldDetailView: View {
     @State private var isWorking = false
     @State private var pollTask: Task<Void, Never>?
 
+    // 3D explorer (Stage C): tapping downloads the 500k SPZ via SplatCache
+    // (inline button progress) then presents the immersive explorer.
+    @State private var isPreparingExplorer = false
+    @State private var explorerProgress: Double = 0
+    @State private var explorer: ExplorerPresentation?
+
+    /// Identifiable wrapper so the explorer can drive `fullScreenCover(item:)`.
+    struct ExplorerPresentation: Identifiable {
+        let id = UUID()
+        let source: ExplorerView.SplatSource
+        let title: String
+    }
+
     init(worldId: String, initialWorld: World? = nil) {
         self.worldId = worldId
         _world = State(initialValue: initialWorld)
@@ -54,6 +67,9 @@ struct WorldDetailView: View {
         .navigationBarTitleDisplayMode(.inline)
         .background(Color(.systemBackground))
         .toast($toast)
+        .fullScreenCover(item: $explorer) { presentation in
+            ExplorerView(source: presentation.source, title: presentation.title)
+        }
         .task {
             await refresh(showErrors: world == nil)
             startPollingIfNeeded()
@@ -164,16 +180,29 @@ struct WorldDetailView: View {
 
     private func actions(_ world: World) -> some View {
         VStack(spacing: 12) {
-            // 3D explorer — Stage C placeholder. Future wiring: load
-            // `assets?.spz500kURL` into the Spark WKWebView (500k tier is the
-            // phone default per spec §3.1).
-            Button {} label: {
-                Label("Explorer coming in Stage C", systemImage: "move.3d")
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 6)
+            // 3D explorer (Stage C) — enabled once the 500k SPZ tier is
+            // available (phone default per spec §3.1). Downloads via SplatCache
+            // with inline progress, then presents the immersive explorer.
+            Button {
+                Task { await openExplorer(world) }
+            } label: {
+                Group {
+                    if isPreparingExplorer {
+                        HStack(spacing: 8) {
+                            ProgressView().controlSize(.small).tint(.white)
+                            Text(explorerProgress > 0
+                                 ? "Preparing… \(Int(explorerProgress * 100))%"
+                                 : "Preparing…")
+                        }
+                    } else {
+                        Label("Explore in 3D", systemImage: "move.3d")
+                    }
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 6)
             }
             .buttonStyle(.borderedProminent)
-            .disabled(true)
+            .disabled(!canExplore(world) || isPreparingExplorer)
 
             // Enhance — enabled only at draft_ready.
             Button {
@@ -198,6 +227,36 @@ struct WorldDetailView: View {
             .disabled(isWorking)
         }
         .padding(.top, 4)
+    }
+
+    // MARK: - Explorer
+
+    /// Explore is available once the 500k SPZ tier URL is present.
+    private func canExplore(_ world: World) -> Bool {
+        guard let s = assets?.spz500kURL else { return false }
+        return !s.isEmpty
+    }
+
+    private func openExplorer(_ world: World) async {
+        guard let urlStr = assets?.spz500kURL, let remoteURL = URL(string: urlStr) else {
+            toast = Toast(message: "This world has no 3D asset yet.", style: .error)
+            return
+        }
+        isPreparingExplorer = true
+        explorerProgress = 0
+        defer { isPreparingExplorer = false }
+        do {
+            let local = try await SplatCache.shared.ensure(
+                worldId: world.id,
+                version: world.assetVersion ?? 1,
+                remoteURL: remoteURL
+            ) { p in
+                Task { @MainActor in explorerProgress = p }
+            }
+            explorer = ExplorerPresentation(source: .file(local), title: world.title)
+        } catch {
+            toast = Toast(error)
+        }
     }
 
     // MARK: - Data / actions

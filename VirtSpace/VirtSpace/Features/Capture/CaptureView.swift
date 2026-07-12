@@ -33,6 +33,10 @@ struct CaptureView: View {
     @State private var didResumePending = false
     /// True when a finished session is stranded on disk after a failed upload.
     @State private var hasPendingUpload = false
+    #if DEBUG
+    /// Drives the DEBUG-only bundled-fixture explorer (no backend needed).
+    @State private var showFixtureExplorer = false
+    #endif
 
     var body: some View {
         NavigationStack {
@@ -50,6 +54,15 @@ struct CaptureView: View {
             .animation(.easeOut(duration: 0.25), value: engine.isThermallyPaused)
             .navigationBarHidden(true)
             .toast($toast)
+            #if DEBUG
+            .fullScreenCover(isPresented: $showFixtureExplorer) {
+                if let url = ViewerSchemeHandler.bundledURL("fixture.spz") {
+                    ExplorerView(source: .file(url), title: "Fixture World")
+                } else {
+                    missingFixtureView
+                }
+            }
+            #endif
             .onChange(of: engine.state) { _, newState in
                 if case .finished(let result) = newState {
                     Task { await upload(result) }
@@ -163,8 +176,11 @@ struct CaptureView: View {
             }
             Spacer()
             #if DEBUG
-            testScanButton
-                .padding(.bottom, 24)
+            VStack(spacing: 12) {
+                testScanButton
+                fixtureExplorerButton
+            }
+            .padding(.bottom, 24)
             #endif
         }
     }
@@ -324,6 +340,40 @@ struct CaptureView: View {
             .foregroundStyle(.black)
         }
         .disabled(isRunningTestScan)
+    }
+
+    /// DEBUG: open the bundled bedroom fixture straight in the 3D explorer —
+    /// exercises Spark/WKWebView with zero backend dependency (Stage C).
+    private var fixtureExplorerButton: some View {
+        Button {
+            showFixtureExplorer = true
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "cube.transparent")
+                Text("Explore fixture world")
+            }
+            .font(.subheadline.weight(.semibold))
+            .padding(.horizontal, 22)
+            .padding(.vertical, 12)
+            .foregroundStyle(.cyan)
+            .overlay(Capsule().stroke(.cyan.opacity(0.6), lineWidth: 1.5))
+        }
+    }
+
+    private var missingFixtureView: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+            VStack(spacing: 12) {
+                Image(systemName: "questionmark.folder")
+                    .font(.system(size: 40, weight: .light))
+                    .foregroundStyle(.orange)
+                Text("fixture.spz isn't bundled in this build.")
+                    .font(.subheadline)
+                    .foregroundStyle(.white.opacity(0.7))
+                Button("Close") { showFixtureExplorer = false }
+                    .tint(.cyan)
+            }
+        }
     }
 
     /// On-device E2E harness: exercises createWorld → presigned frame upload →

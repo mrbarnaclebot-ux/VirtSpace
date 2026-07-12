@@ -1,0 +1,171 @@
+//
+//  SplatCache.swift
+//  VirtSpace
+//
+//  Download-and-cache manager for world SPZ splats (spec §8: "aggressive
+//  on-device caching keyed by world-id+version"). Files live under
+//  Application Support/splats/{worldId}_v{version}.spz. A missing file is
+//  streamed from its presigned R2 URL with progress, written to a temp file,
+//  then atomically moved into place. Total cache is held under a 1 GB budget by
+//  evicting least-recently-used files.
+//
+
+import Foundation
+import OSLog
+
+actor SplatCache {
+    static let shared = SplatCache()
+
+    /// Eviction trigger: keep the splats directory under 1 GB.
+    private let budgetBytes: Int64 = 1_000_000_000
+
+    private let fm = FileManager.default
+    private let log = Logger(subsystem: "dev.virtspace.app", category: "SplatCache")
+
+    // MARK: - Paths
+
+    private var directory: URL {
+        get throws {
+            let base = try fm.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+            let dir = base.appendingPathComponent("splats", isDirectory: true)
+            if !fm.fileExists(atPath: dir.path) {
+                try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            }
+            return dir
+        }
+    }
+
+    private func fileURL(worldId: String, version: Int) throws -> URL {
+        // Sanitize the id so it can't escape the directory.
+        let safe = worldId.replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "..", with: "_")
+        return try directory.appendingPathComponent("\(safe)_v\(version).spz")
+    }
+
+    // MARK: - API
+
+    /// The cached file, if present. Touches it so LRU sees a fresh access.
+    func cached(worldId: String, version: Int) -> URL? {
+        guard let url = try? fileURL(worldId: worldId, version: version),
+              fm.fileExists(atPath: url.path) else { return nil }
+        touch(url)
+        return url
+    }
+
+    /// Return the local SPZ, downloading + caching it if absent. `progress` is
+    /// called with 0…1 on an arbitrary executor — marshal to the main actor in
+    /// the UI. When the server sends no Content-Length, progress stays at 0
+    /// until completion (then no explicit final call — callers treat return as
+    /// done).
+    func ensure(
+        worldId: String,
+        version: Int,
+        remoteURL: URL,
+        progress: @Sendable @escaping (Double) -> Void
+    ) async throws -> URL {
+        let dest = try fileURL(worldId: worldId, version: version)
+        if fm.fileExists(atPath: dest.path) {
+            touch(dest)
+            return dest
+        }
+
+        let (bytes, response) = try await URLSession.shared.bytes(from: remoteURL)
+        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            throw SplatCacheError.badStatus(http.statusCode)
+        }
+        let expected = response.expectedContentLength // -1 if unknown
+
+        // Stream to a temp file in the same directory (same volume → atomic move).
+        let tmp = try directory.appendingPathComponent("\(UUID().uuidString).partial")
+        fm.createFile(atPath: tmp.path, contents: nil)
+        guard let handle = try? FileHandle(forWritingTo: tmp) else {
+            throw SplatCacheError.writeFailed
+        }
+
+        var received: Int64 = 0
+        var buffer = Data()
+        buffer.reserveCapacity(256 * 1024)
+        do {
+            for try await byte in bytes {
+                buffer.append(byte)
+                if buffer.count >= 256 * 1024 {
+                    try handle.write(contentsOf: buffer)
+                    received += Int64(buffer.count)
+                    buffer.removeAll(keepingCapacity: true)
+                    if expected > 0 { progress(min(1, Double(received) / Double(expected))) }
+                }
+            }
+            if !buffer.isEmpty {
+                try handle.write(contentsOf: buffer)
+                received += Int64(buffer.count)
+            }
+            try handle.close()
+        } catch {
+            try? handle.close()
+            try? fm.removeItem(at: tmp)
+            throw error
+        }
+
+        // Atomic move into place (replace if a racing writer beat us).
+        do {
+            if fm.fileExists(atPath: dest.path) {
+                _ = try fm.replaceItemAt(dest, withItemAt: tmp)
+            } else {
+                try fm.moveItem(at: tmp, to: dest)
+            }
+        } catch {
+            try? fm.removeItem(at: tmp)
+            throw error
+        }
+
+        progress(1)
+        evictIfNeeded(keeping: dest)
+        return dest
+    }
+
+    // MARK: - LRU eviction
+
+    private func touch(_ url: URL) {
+        try? fm.setAttributes([.modificationDate: Date()], ofItemAtPath: url.path)
+    }
+
+    /// Delete least-recently-used splats until the directory is under budget.
+    /// `keep` is never evicted (it's the file we just produced).
+    private func evictIfNeeded(keeping keep: URL) {
+        guard let dir = try? directory else { return }
+        let keys: [URLResourceKey] = [.fileSizeKey, .contentModificationDateKey]
+        guard let items = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: keys) else { return }
+
+        let files = items.filter { $0.pathExtension == "spz" }
+        var total: Int64 = files.reduce(0) { $0 + Int64((try? $1.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) }
+        guard total > budgetBytes else { return }
+
+        // Oldest access (modification date) first.
+        let sorted = files.sorted {
+            let a = (try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            let b = (try? $1.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            return a < b
+        }
+        for url in sorted {
+            if total <= budgetBytes { break }
+            if url.standardizedFileURL == keep.standardizedFileURL { continue }
+            let size = Int64((try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+            if (try? fm.removeItem(at: url)) != nil {
+                total -= size
+                log.info("Evicted cached splat \(url.lastPathComponent, privacy: .public)")
+            }
+        }
+    }
+}
+
+enum SplatCacheError: LocalizedError {
+    case badStatus(Int)
+    case writeFailed
+
+    var errorDescription: String? {
+        switch self {
+        case .badStatus(let code): return "Download failed (HTTP \(code))."
+        case .writeFailed: return "Couldn't write the world to disk."
+        }
+    }
+}
