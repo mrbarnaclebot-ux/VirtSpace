@@ -322,11 +322,11 @@ Everything else scales cheaply: Neon scale-to-zero, serverless workers (jobs are
 - ✅ Stage B2 HUD: world-locked dots + edge chevrons, reticle snap + dwell ring, filling-sphere progress, priority coaching banners, viewfinder chrome, upload overlay. Sim-verified end-to-end (screenshots archived).
 - ⏳ Pending: **real-device run** (ARKit transforms/projection sanity, real photos), preflight checks (low light/disk), on-device low-res preview stitch, and — critically — the **server stitcher is still v0 single-frame passthrough**: 16-frame scans fail at stitch until the Phase 0.5 gate decides own-stitch vs multi-image.
 
-**Phase 3 — Full loop + Library (v1 core)**
-- Draft-first generation + Enhance flow; APNs "world ready"; honest phase-based Generating state; Result detail screen; **private Library**; Spark explorer (bundled assets, in-page joystick); CTPanoramaView 2D pano preview.
+**Phase 3 — Full loop + Library (v1 core)** ✅ **DONE 2026-07-12**
+- Draft-first generation + Enhance flow; honest phase-based status timeline; Result detail; private Library w/ thumbnails + polling; **Spark explorer** (bundled Spark 2.1 + three 0.180, WKURLSchemeHandler, splat cache, in-page joystick — verified rendering the owner's real bedroom splat); **360° pano preview** (SceneKit inverted sphere + Save to Photos). APNs dropped from v1 (no paid Apple Developer account — foreground polling covers it; revisit with a paid account).
 
-**Phase 4 — v1 polish & ship**
-- Share links (public web viewer page + unguessable slugs); on-device caching + resumable downloads; empty/error/failed-retry states; account deletion + privacy compliance (§13); design-system pass (`impeccable`/`polish`/`animate`). **← v1 TestFlight ships here.**
+**Phase 4 — v1 ship (self-testing scope)** ✅ **DONE 2026-07-12** (adjusted: no TestFlight — free provisioning to the owner's device)
+- 28-target densified capture (Phase 0.5 remediation); Settings (cache mgmt, World Labs attribution, double-confirmed account deletion); PrivacyInfo.xcprivacy; splat/pano caching; error/failed-retry states; production live-provider mode with DAILY_CREDIT_BUDGET=2000 (fits one HQ enhance/day). **Deferred deliberately:** public share links + web viewer, deep design-system pass (pending real-device feedback), APNs, on-device orientation sanity check (owner's next run).
 
 **Phase 5+ — Post-v1 (deferred)**
 - Public **Explore** social gallery (brings App Store UGC moderation duties), map clustering, search; **PRO+** monetization; **native MetalSplatter** explorer + LoD tiers; cost dashboards, autoscaling, egress tuning.
