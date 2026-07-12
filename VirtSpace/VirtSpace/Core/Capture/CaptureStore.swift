@@ -182,6 +182,19 @@ final class CaptureStore {
         mutateManifest(id: id, in: directory) { $0.createdWorldId = worldId }
     }
 
+    /// Reset a session's server-side world binding so a resume starts completely
+    /// fresh: clears the minted `createdWorldId` AND every per-frame uploaded
+    /// flag, persisted atomically via the same manifest write path. Used only
+    /// when the backend reports the created world is gone (404 / world_not_found)
+    /// — the frames + poses (the real capture data) are left untouched on disk so
+    /// they can be re-uploaded to a brand-new world.
+    func resetWorldState(forSession id: UUID, in directory: URL) {
+        mutateManifest(id: id, in: directory) { m in
+            m.createdWorldId = nil
+            m.uploadedFrameIndices = []
+        }
+    }
+
     /// Mark one frame confirmed-uploaded (crash-safe). Called after each frame's
     /// PUT succeeds so a resume re-PUTs only what's missing.
     func markFrameUploaded(index: Int, forSession id: UUID, in directory: URL) {

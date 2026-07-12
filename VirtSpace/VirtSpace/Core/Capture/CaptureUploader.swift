@@ -105,6 +105,17 @@ final class CaptureUploader {
                 completed += 1
             } catch is CancellationError {
                 AppLog.upload.fault("frames:done for stranded world \(worldId, privacy: .public) hit CancellationError — this flow must be app-scoped (UploadManager), investigate!")
+            } catch let error as APIError where error.isWorldGone {
+                // The stranded world was deleted server-side (404 world_not_found):
+                // frames:done can never land. Clear the dead world id + uploaded
+                // flags (frames stay on disk), then start a fresh upload in this
+                // same run so the user's 28 frames aren't stranded forever.
+                AppLog.upload.fault("resume: world \(worldId, privacy: .public) gone server-side — starting fresh")
+                store.resetWorldState(forSession: session.id, in: session.directory)
+                if let fresh = store.loadPending().first(where: { $0.id == session.id }),
+                   (try? await upload(session: fresh, progress: { _ in })) != nil {
+                    completed += 1
+                }
             } catch {
                 AppLog.upload.error("Stranded-session frames:done failed for \(worldId, privacy: .public): \(error.localizedDescription, privacy: .public)")
             }
@@ -114,8 +125,31 @@ final class CaptureUploader {
 
     // MARK: - Internals
 
+    /// Mint a brand-new backend world for this session and persist its id BEFORE
+    /// any frame uploads (crash-safe: a kill mid-upload resumes onto this world
+    /// instead of orphaning it). Quota edge: if `createWorld` is refused for
+    /// quota (429), the session is intentionally left pending on disk — NOT
+    /// discarded — so it retries once the user's allowance frees up.
+    private func createFreshWorld(session: CaptureStore.PendingSession, frameCount: Int) async throws -> (World, [FrameUpload]) {
+        let title = "Scan \(Date().formatted(date: .abbreviated, time: .shortened))"
+        AppLog.upload.log("Upload start: session \(session.id.uuidString, privacy: .public), \(frameCount) frames")
+        do {
+            let (world, slots) = try await api.createWorld(title: title, frameCount: frameCount)
+            // Persist the world id BEFORE uploading any frame so a crash/kill
+            // mid-upload resumes onto this same world instead of orphaning it.
+            store.setCreatedWorldId(world.id, forSession: session.id, in: session.directory)
+            AppLog.upload.log("World created: \(world.id, privacy: .public), \(slots.count) upload slots")
+            return (world, slots)
+        } catch APIError.quota {
+            AppLog.upload.log("createWorld refused for quota (429) — keeping session \(session.id.uuidString, privacy: .public) pending, will retry when allowance frees up")
+            throw APIError.quota
+        }
+    }
+
     private func upload(session: CaptureStore.PendingSession, progress: @escaping (Int) -> Void) async throws -> World {
-        let manifest = session.manifest
+        // Mutable local copy: a world-gone reset below clears the resume fields
+        // so the rest of this run re-uploads EVERY frame to the fresh world.
+        var manifest = session.manifest
         let frameCount = manifest.frames.count
 
         // World reuse (spec §6.1): if this session already minted a world, RESUME
@@ -124,17 +158,23 @@ final class CaptureUploader {
         let world: World
         let slots: [FrameUpload]
         if let existingWorldId = manifest.createdWorldId {
-            AppLog.upload.log("Resuming upload for world \(existingWorldId, privacy: .public), \(manifest.uploadedFrameIndices.count)/\(frameCount) already uploaded")
-            (world, slots) = try await api.refreshUploads(worldId: existingWorldId)
-            AppLog.upload.log("Refreshed \(slots.count) upload slots")
+            do {
+                AppLog.upload.log("Resuming upload for world \(existingWorldId, privacy: .public), \(manifest.uploadedFrameIndices.count)/\(frameCount) already uploaded")
+                (world, slots) = try await api.refreshUploads(worldId: existingWorldId)
+                AppLog.upload.log("Refreshed \(slots.count) upload slots")
+            } catch let error as APIError where error.isWorldGone {
+                // The created world was deleted server-side (404 world_not_found):
+                // retrying uploads:refresh can NEVER succeed. Clear the dead world
+                // id + every uploaded flag (frames stay on disk), then start fresh
+                // in this same run so the user's captured frames aren't stranded.
+                AppLog.upload.fault("resume: world \(existingWorldId, privacy: .public) gone server-side — starting fresh")
+                store.resetWorldState(forSession: session.id, in: session.directory)
+                manifest.createdWorldId = nil
+                manifest.uploadedFrameIndices = []
+                (world, slots) = try await createFreshWorld(session: session, frameCount: frameCount)
+            }
         } else {
-            let title = "Scan \(Date().formatted(date: .abbreviated, time: .shortened))"
-            AppLog.upload.log("Upload start: session \(session.id.uuidString, privacy: .public), \(frameCount) frames")
-            (world, slots) = try await api.createWorld(title: title, frameCount: frameCount)
-            // Persist the world id BEFORE uploading any frame so a crash/kill
-            // mid-upload resumes onto this same world instead of orphaning it.
-            store.setCreatedWorldId(world.id, forSession: session.id, in: session.directory)
-            AppLog.upload.log("World created: \(world.id, privacy: .public), \(slots.count) upload slots")
+            (world, slots) = try await createFreshWorld(session: session, frameCount: frameCount)
         }
 
         // Count frames already confirmed uploaded (resume) toward progress.
