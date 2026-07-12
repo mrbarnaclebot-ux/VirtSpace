@@ -19,6 +19,7 @@ function fakeWorld(overrides: Partial<World> = {}): World {
     isPublic: false,
     status: 'draft_ready',
     phase: null,
+    progress: null,
     panoUrl: null,
     thumbnailUrl: null,
     spz100kUrl: null,
@@ -33,6 +34,7 @@ function fakeWorld(overrides: Partial<World> = {}): World {
     hqModel: null,
     creditsSpent: 0,
     createdAt: new Date('2026-07-12T10:00:00Z'),
+    updatedAt: new Date('2026-07-12T11:00:00Z'),
     deletedAt: null,
     ...overrides,
   };

@@ -42,12 +42,23 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
 @main
 struct VirtSpaceApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+    @Environment(\.scenePhase) private var scenePhase
     @State private var apiClient = APIClient()
 
     var body: some Scene {
         WindowGroup {
             ContentView()
                 .environment(apiClient)
+        }
+        // Completion kick (launch + every return to foreground): finish any
+        // pending session whose manifest shows createdWorldId + all frames
+        // flagged uploaded by going straight to frames:done — recovery for
+        // flows that died between the last frame PUT and frames:done. The
+        // flow is app-scoped (UploadManager), never tied to a view.
+        .onChange(of: scenePhase, initial: true) { _, phase in
+            if phase == .active {
+                UploadManager.shared.kickStrandedRecovery(api: apiClient)
+            }
         }
     }
 }

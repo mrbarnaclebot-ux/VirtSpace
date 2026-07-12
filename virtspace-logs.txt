@@ -1,0 +1,35 @@
+VirtSpace logs — 12/7/2026, 3:36 pm
+Filter: All
+
+2026-07-12T10:06:00Z  [ERROR]  api: Quota (429): POST https://api-production-dbd38.up.railway.app/v1/worlds
+2026-07-12T10:05:59Z  [NOTICE]  upload: Upload start: session EBDC3032-894E-48F9-B840-CB68934218D1, 28 frames
+2026-07-12T10:05:59Z  [NOTICE]  capture: Capture complete: 28 frames, session EBDC3032-894E-48F9-B840-CB68934218D1
+2026-07-12T10:05:59Z  [NOTICE]  capture: Shot 28/28 saved
+2026-07-12T10:05:54Z  [NOTICE]  capture: Shot 27/28 saved
+2026-07-12T10:05:49Z  [NOTICE]  capture: Shot 26/28 saved
+2026-07-12T10:05:45Z  [NOTICE]  capture: Shot 25/28 saved
+2026-07-12T10:05:42Z  [NOTICE]  capture: Shot 24/28 saved
+2026-07-12T10:05:39Z  [NOTICE]  capture: Shot 23/28 saved
+2026-07-12T10:05:36Z  [NOTICE]  capture: Shot 22/28 saved
+2026-07-12T10:05:33Z  [NOTICE]  capture: Shot 21/28 saved
+2026-07-12T10:05:29Z  [NOTICE]  capture: Shot 20/28 saved
+2026-07-12T10:05:27Z  [NOTICE]  capture: Shot 19/28 saved
+2026-07-12T10:05:25Z  [NOTICE]  capture: Shot 18/28 saved
+2026-07-12T10:05:23Z  [NOTICE]  capture: Shot 17/28 saved
+2026-07-12T10:05:20Z  [NOTICE]  capture: Shot 16/28 saved
+2026-07-12T10:05:18Z  [NOTICE]  capture: Shot 15/28 saved
+2026-07-12T10:05:15Z  [NOTICE]  capture: Shot 14/28 saved
+2026-07-12T10:05:12Z  [NOTICE]  capture: Shot 13/28 saved
+2026-07-12T10:05:07Z  [NOTICE]  capture: Shot 12/28 saved
+2026-07-12T10:05:05Z  [NOTICE]  capture: Shot 11/28 saved
+2026-07-12T10:05:03Z  [NOTICE]  capture: Shot 10/28 saved
+2026-07-12T10:05:01Z  [NOTICE]  capture: Shot 9/28 saved
+2026-07-12T10:04:58Z  [NOTICE]  capture: Shot 8/28 saved
+2026-07-12T10:04:56Z  [NOTICE]  capture: Shot 7/28 saved
+2026-07-12T10:04:54Z  [NOTICE]  capture: Shot 6/28 saved
+2026-07-12T10:04:51Z  [NOTICE]  capture: Shot 5/28 saved
+2026-07-12T10:04:49Z  [NOTICE]  capture: Shot 4/28 saved
+2026-07-12T10:04:47Z  [NOTICE]  capture: Shot 3/28 saved
+2026-07-12T10:04:44Z  [NOTICE]  capture: Shot 2/28 saved
+2026-07-12T10:04:38Z  [NOTICE]  capture: Shot 1/28 saved
+2026-07-12T10:04:32Z  [NOTICE]  engine: Capture started: session EBDC3032-894E-48F9-B840-CB68934218D1

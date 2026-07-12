@@ -78,7 +78,18 @@ struct CaptureView: View {
                 // Belt-and-braces: always hand the screen back when we leave.
                 UIApplication.shared.isIdleTimerDisabled = false
             }
-            .task { await resumePendingOnce() }
+            .task {
+                // Orphan-world prevention: abandoning a scan whose session
+                // already minted a backend world (confirm-abandon in the HUD,
+                // thermal-overlay abandon — both land in engine.cancel())
+                // best-effort deletes that world server-side before the local
+                // purge. The worker's 24 h uploading reaper is the backstop
+                // when this can't land (e.g. abandoned while offline).
+                engine.onSessionDiscarded = { worldId in
+                    Task { try? await api.deleteWorld(id: worldId) }
+                }
+                await resumePendingOnce()
+            }
         }
     }
 
@@ -258,30 +269,34 @@ struct CaptureView: View {
     private func upload(_ result: CaptureResult) async {
         uploadedFrames = 0
         defer { uploadedFrames = nil }
-        let uploader = CaptureUploader(api: api)
-        do {
-            _ = try await uploader.upload(result: result) { done in
-                Task { @MainActor in uploadedFrames = done }
-            }
+        // App-scoped flow (UploadManager owns the task): navigating tabs or
+        // dismissing this view can no longer cancel the upload — awaiting the
+        // handle below is UI-only, the flow survives this view.
+        let handle = UploadManager.shared.kickUpload(result: result, api: api) { done in
+            Task { @MainActor in uploadedFrames = done }
+        }
+        switch await handle.value {
+        case .success:
             hasPendingUpload = false
             engine.reset()
             toast = Toast(message: "Scan uploaded — watch it build in Library.", style: .success)
             try? await Task.sleep(for: .milliseconds(700))
             switchToLibrary()
-        } catch {
+        case .failure(let error):
             hasPendingUpload = true
             engine.reset()
             toast = Toast(message: "Upload failed — your scan is saved. Retry from here or relaunch. (\((error as? LocalizedError)?.errorDescription ?? error.localizedDescription))", style: .error)
         }
     }
 
-    /// Manual retry of a stranded session (wired to CaptureUploader.resumePending).
+    /// Manual retry of a stranded session (app-scoped via UploadManager).
     private func retryPendingUpload() async {
         uploadedFrames = 0
         defer { uploadedFrames = nil }
-        let uploaded = await CaptureUploader(api: api).resumePending { done in
+        let handle = UploadManager.shared.kickResume(api: api) { done in
             Task { @MainActor in uploadedFrames = done }
         }
+        let uploaded = await handle.value
         if uploaded.isEmpty {
             toast = Toast(message: "Upload failed again — check your connection and retry.", style: .error)
         } else {
@@ -293,10 +308,11 @@ struct CaptureView: View {
     }
 
     /// Retry any capture sessions stranded on disk by a crash or failed upload.
+    /// The flow itself is app-scoped (UploadManager); this await is UI-only.
     private func resumePendingOnce() async {
         guard !didResumePending else { return }
         didResumePending = true
-        let uploaded = await CaptureUploader(api: api).resumePending()
+        let uploaded = await UploadManager.shared.kickResume(api: api).value
         if !uploaded.isEmpty {
             toast = Toast(message: "Resumed \(uploaded.count) pending scan upload\(uploaded.count == 1 ? "" : "s").", style: .success)
         }

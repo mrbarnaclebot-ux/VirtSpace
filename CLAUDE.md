@@ -26,6 +26,12 @@
 - **Never commit secrets**: `.env` is gitignored; the World Labs key lives in local `.env` (dev scripts) and Railway env vars (production) only. Never in the app bundle or repo.
 - CLIs available & authenticated: `git`, `gh` (mrbarnaclebot-ux), `railway` (project deploys), `xcodebuild`.
 
+## Agent isolation (added after production data pollution)
+
+- Implementation/QA agents must NEVER run app builds against the production backend. Simulator runs use the DEBUG `VIRTSPACE_API_BASE_URL` override pointing at a local mock — no exceptions, including "read-only" launches (launch-time resume/recovery kicks create real state: a sim verification run uploaded 28 test frames into the owner's production library).
+- Before any simulator app launch, clear pending capture sessions from prior runs or use a fresh simulator.
+- Agent sim runs previously also exhausted the owner's daily scan quota. Treat the production backend as the owner's data, always.
+
 ## Cost guardrails (real money)
 
 - World Labs credits are billed per generation (~7k credits ≈ $5.60 on the account). Development defaults to `marble-1.0-draft` (150 credits); use the backend **mock-provider mode** for app development. **Never call `worlds:generate` in a loop or retry it blind** — persist `provider_operation_id` first (spec §14).

@@ -204,6 +204,27 @@ final class CaptureStore {
 
     // MARK: - Reading back
 
+    /// The backend world id a session has minted, if any (nil for sessions
+    /// that never reached createWorld). Reads the on-disk manifest for
+    /// sessions from a previous launch, falling back to the in-memory cache.
+    func createdWorldId(forSession id: UUID, in directory: URL) -> String? {
+        if let manifest = manifests[id] { return manifest.createdWorldId }
+        return (try? readManifest(in: directory))?.createdWorldId
+    }
+
+    /// Client-truth upload progress for the world a pending (not yet purged)
+    /// session minted: (frames confirmed uploaded, total expected), or nil when
+    /// no pending session references `worldId`. The Library consults this on
+    /// each refresh tick to render "Uploading i/N" — the server only knows the
+    /// world is `uploading`, the manifest knows how far along it actually is.
+    func pendingSessionProgress(worldId: String) -> (uploaded: Int, total: Int)? {
+        guard
+            let session = loadPending().first(where: { $0.manifest.createdWorldId == worldId })
+        else { return nil }
+        let manifest = session.manifest
+        return (manifest.uploadedFrameIndices.count, manifest.expectedFrameCount)
+    }
+
     /// All persisted sessions, complete or not (crash-recovery entry point).
     func loadPending() -> [PendingSession] {
         guard let entries = try? fileManager.contentsOfDirectory(
@@ -234,6 +255,12 @@ final class CaptureStore {
     func purge(id: UUID) {
         manifests[id] = nil
         let url = directoryURL(for: id)
+        // Tombstone first (synchronous, single unlink): removing poses.json
+        // makes the session invisible to loadPending() IMMEDIATELY, so a
+        // resume/stranded-recovery flow racing the async directory removal can
+        // never see a purged session and re-send frames:done for it. The slow
+        // recursive removal stays off-thread below.
+        try? fileManager.removeItem(at: manifestURL(in: url))
         let fm = fileManager
         ioQueue.async { try? fm.removeItem(at: url) }
     }

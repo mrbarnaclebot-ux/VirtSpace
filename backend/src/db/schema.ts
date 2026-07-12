@@ -3,6 +3,7 @@ import {
   uuid,
   text,
   integer,
+  smallint,
   boolean,
   doublePrecision,
   timestamp,
@@ -25,6 +26,7 @@ export const WORLD_STATUSES = [
   'draft_ready',
   'generating_hq',
   'complete',
+  'failed_upload',
   'failed_stitch',
   'failed_generating_draft',
   'failed_generating_hq',
@@ -70,6 +72,10 @@ export const worlds = pgTable(
     // Status state machine + optional finer-grained phase label for UI.
     status: text('status').notNull().default('capturing'),
     phase: text('phase'),
+    // Within-status completion, 0–100. Written (throttled) by the worker while
+    // stitching/generating; reset to NULL on every status transition so a
+    // stale percentage never bleeds into the next phase.
+    progress: smallint('progress'),
 
     // Asset columns — all point at OUR storage (never the provider CDN).
     panoUrl: text('pano_url'),
@@ -89,6 +95,9 @@ export const worlds = pgTable(
     creditsSpent: integer('credits_spent').notNull().default(0),
 
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    // Heartbeat: touched on every worker/route mutation of the row, surfaced to
+    // clients as `heartbeat_at` so the UI can flag a stalled pipeline.
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
     deletedAt: timestamp('deleted_at', { withTimezone: true }),
   },
   (t) => [index('worlds_owner_idx').on(t.ownerId)],

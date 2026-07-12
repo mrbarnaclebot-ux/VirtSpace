@@ -3,7 +3,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises';
 import { pathToFileURL, fileURLToPath } from 'node:url';
-import { desc, eq, sql } from 'drizzle-orm';
+import { and, desc, eq, lt, sql } from 'drizzle-orm';
 import { getConfig, type Config } from './config.js';
 import { getDb, closeDb, type Db } from './db/client.js';
 import { captures, worlds, type Job, type JobKind, type World } from './db/schema.js';
@@ -93,6 +93,79 @@ export function stitchPlan(frameCount: number): StitchAction {
   return { type: 'stitch', frameCount };
 }
 
+// --- Progress plumbing (pure, unit-testable) ---------------------------------
+
+/**
+ * Parse one stdout line from reproject.py. The stitcher emits machine-readable
+ * `PROGRESS <0-100>` lines between its human log lines; anything else → null.
+ */
+export function parseProgressLine(line: string): number | null {
+  const m = /^PROGRESS\s+(\d{1,3})\s*$/.exec(line.trim());
+  if (!m) return null;
+  const n = Number(m[1]);
+  return n >= 0 && n <= 100 ? n : null;
+}
+
+/**
+ * Incremental stream parser: feed raw stdout chunks (which may split lines
+ * arbitrarily); `onProgress` fires once per complete PROGRESS line.
+ */
+export function createProgressLineStream(
+  onProgress: (progress: number) => void,
+): (chunk: string) => void {
+  let buffer = '';
+  return (chunk: string) => {
+    buffer += chunk;
+    let nl: number;
+    while ((nl = buffer.indexOf('\n')) >= 0) {
+      const line = buffer.slice(0, nl);
+      buffer = buffer.slice(nl + 1);
+      const p = parseProgressLine(line);
+      if (p !== null) onProgress(p);
+    }
+  };
+}
+
+/**
+ * Write throttle for worlds.progress: a new value is written only when it
+ * moved >= `minDelta` points from the last write OR >= `minIntervalMs` elapsed
+ * since it. The first value always writes. Returns a stateful predicate.
+ */
+export function createProgressThrottle(opts: {
+  minDelta?: number;
+  minIntervalMs?: number;
+  now?: () => number;
+} = {}): (progress: number) => boolean {
+  const minDelta = opts.minDelta ?? 5;
+  const minIntervalMs = opts.minIntervalMs ?? 5_000;
+  const now = opts.now ?? Date.now;
+  let lastValue: number | null = null;
+  let lastAt = 0;
+  return (progress: number) => {
+    const t = now();
+    if (
+      lastValue !== null &&
+      Math.abs(progress - lastValue) < minDelta &&
+      t - lastAt < minIntervalMs
+    ) {
+      return false;
+    }
+    lastValue = progress;
+    lastAt = t;
+    return true;
+  };
+}
+
+/**
+ * Elapsed-based pseudo-progress for generation (the provider exposes no real
+ * progress): linear against the expected duration, capped at 95 so the bar
+ * never claims "done" before the status flips.
+ */
+export function pseudoProgress(elapsedMs: number, expectedMs: number): number {
+  if (expectedMs <= 0) return 95;
+  return Math.min(95, Math.floor((Math.max(0, elapsedMs) / expectedMs) * 100));
+}
+
 // --- Stitcher subprocess plumbing (unit-testable) ----------------------------
 
 /**
@@ -144,15 +217,18 @@ export interface StitcherRun {
   timedOut: boolean;
 }
 
-/** Injectable stitcher runner (real impl spawns Python; tests mock it). */
+/** Injectable stitcher runner (real impl spawns Python; tests mock it).
+ * `onStdout` (optional) receives raw stdout chunks as they stream — used for
+ * incremental PROGRESS-line parsing while the child is still running. */
 export type StitcherSpawner = (
   bin: string,
   args: string[],
   timeoutMs: number,
+  onStdout?: (chunk: string) => void,
 ) => Promise<StitcherRun>;
 
 /** Real spawner: runs `bin args`, capturing stdout/stderr, SIGKILL on timeout. */
-export const realStitcherSpawner: StitcherSpawner = (bin, args, timeoutMs) =>
+export const realStitcherSpawner: StitcherSpawner = (bin, args, timeoutMs, onStdout) =>
   new Promise<StitcherRun>((resolve, reject) => {
     const child = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '';
@@ -163,7 +239,9 @@ export const realStitcherSpawner: StitcherSpawner = (bin, args, timeoutMs) =>
       child.kill('SIGKILL');
     }, timeoutMs);
     child.stdout.on('data', (d) => {
-      stdout += d.toString();
+      const s = d.toString();
+      stdout += s;
+      onStdout?.(s);
     });
     child.stderr.on('data', (d) => {
       stderr += d.toString();
@@ -226,7 +304,12 @@ export async function runGeneration(
   io: GenerationIO,
   input: GenerationInput,
   clock: GenerationClock = realClock,
-  opts: { pollIntervalMs?: number; timeoutMs?: number } = {},
+  opts: {
+    pollIntervalMs?: number;
+    timeoutMs?: number;
+    /** Fires after each poll with elapsed ms since polling began (progress UI). */
+    onPoll?: (elapsedMs: number) => void | Promise<void>;
+  } = {},
 ): Promise<GenerationResult> {
   const pollIntervalMs = opts.pollIntervalMs ?? POLL_INTERVAL_MS;
   const timeoutMs = opts.timeoutMs ?? GENERATE_TIMEOUT_MS;
@@ -244,7 +327,8 @@ export async function runGeneration(
 
   // (f) Poll until done — in-process loop; the job lease outlives this via
   // re-claim + operation_id resume (see queue.ts LEASE_SECONDS).
-  const deadline = clock.now() + timeoutMs;
+  const startedAt = clock.now();
+  const deadline = startedAt + timeoutMs;
   let status = await provider.getOperation(operationId);
   while (!status.done) {
     if (clock.now() >= deadline) {
@@ -254,6 +338,12 @@ export async function runGeneration(
     }
     await clock.sleep(pollIntervalMs);
     status = await provider.getOperation(operationId);
+    // Progress tick — best-effort UI plumbing; never fail the money path on it.
+    try {
+      await opts.onPoll?.(clock.now() - startedAt);
+    } catch {
+      // ignore: progress reporting must not affect generation.
+    }
   }
   if (status.error) throw new ProviderError(`operation failed: ${status.error}`);
   if (!status.worldId) throw new ProviderError('operation done but returned no world_id');
@@ -313,11 +403,41 @@ async function loadWorld(db: Db, worldId: string): Promise<World> {
   return world;
 }
 
-/** Update the world row + enqueue draft generation after a pano lands. */
+/**
+ * Throttled, best-effort worlds.progress writer (>=5 point delta or >=5 s
+ * between writes). Also touches updated_at — the client-facing heartbeat.
+ */
+function makeProgressWriter(
+  db: Db,
+  worldId: string,
+  clock: GenerationClock,
+): (progress: number) => Promise<void> {
+  const shouldWrite = createProgressThrottle({ now: () => clock.now() });
+  return async (progress: number) => {
+    if (!shouldWrite(progress)) return;
+    try {
+      await db
+        .update(worlds)
+        .set({ progress, updatedAt: sql`now()` })
+        .where(eq(worlds.id, worldId));
+    } catch {
+      // Best-effort: a failed progress write must never fail the job.
+    }
+  };
+}
+
+/** Update the world row + enqueue draft generation after a pano lands.
+ * progress resets to NULL on the status transition (new phase, new bar). */
 async function finalizeStitch(db: Db, worldId: string, panoKey: string): Promise<void> {
   await db
     .update(worlds)
-    .set({ panoUrl: panoKey, status: 'generating_draft', phase: null })
+    .set({
+      panoUrl: panoKey,
+      status: 'generating_draft',
+      phase: null,
+      progress: null,
+      updatedAt: sql`now()`,
+    })
     .where(eq(worlds.id, worldId));
   await enqueue(db, 'generate_draft', worldId);
 }
@@ -393,7 +513,14 @@ export async function handleStitch(deps: WorkerDeps, job: Job): Promise<void> {
       posesPath,
     });
 
-    const run = await spawner(config.PYTHON_BIN, args, config.STITCHER_TIMEOUT_MS);
+    // Stream the child's stdout for PROGRESS lines and mirror them (throttled)
+    // into worlds.progress while the stitch runs.
+    const writeProgress = makeProgressWriter(db, world.id, deps.clock ?? realClock);
+    const onStdout = createProgressLineStream((p) => {
+      void writeProgress(p);
+    });
+
+    const run = await spawner(config.PYTHON_BIN, args, config.STITCHER_TIMEOUT_MS, onStdout);
     if (run.timedOut) {
       throw new Error(`stitcher timed out after ${config.STITCHER_TIMEOUT_MS}ms`);
     }
@@ -450,6 +577,13 @@ async function handleGenerate(
     },
   };
 
+  // The provider exposes no real progress, so publish elapsed-based
+  // pseudo-progress on each poll tick (throttled; capped at 95).
+  const expectedMs = isDraft
+    ? config.GENERATE_EXPECTED_DRAFT_MS
+    : config.GENERATE_EXPECTED_HQ_MS;
+  const writeProgress = makeProgressWriter(db, world.id, clock);
+
   const result = await runGeneration(
     provider,
     io,
@@ -460,6 +594,9 @@ async function handleGenerate(
       existingOperationId: job.providerOperationId,
     },
     clock,
+    {
+      onPoll: (elapsedMs) => writeProgress(pseudoProgress(elapsedMs, expectedMs)),
+    },
   );
 
   // Finalize the world row: asset keys, provider world id, credits, status.
@@ -470,6 +607,8 @@ async function handleGenerate(
     .set({
       status: isDraft ? 'draft_ready' : 'complete',
       phase: null,
+      progress: null, // status flip → the within-phase bar is over.
+      updatedAt: sql`now()`,
       provider: provider.mode === 'mock' ? 'mock' : 'worldlabs',
       creditsSpent: sql`${worlds.creditsSpent} + ${cost}`,
       ...result.assetKeys,
@@ -494,13 +633,21 @@ async function handleGenerate(
 /**
  * purge — delete storage objects under the world + its captures' frame
  * prefixes. The DB row is KEPT (soft-deleted) so history/analytics survive.
+ * A `{ framesOnly: true }` payload (reaper) skips the world-asset keys — a
+ * reaped uploading world never produced any, and its row is NOT soft-deleted.
  */
 async function handlePurge(deps: WorkerDeps, job: Job): Promise<void> {
   const { db, storage } = deps;
   const worldId = job.worldId;
+  const framesOnly =
+    typeof job.payload === 'object' &&
+    job.payload !== null &&
+    (job.payload as { framesOnly?: boolean }).framesOnly === true;
 
-  for (const name of WORLD_ASSET_NAMES) {
-    await storage.deleteObject(assetKeyFor(worldId, name)).catch(() => undefined);
+  if (!framesOnly) {
+    for (const name of WORLD_ASSET_NAMES) {
+      await storage.deleteObject(assetKeyFor(worldId, name)).catch(() => undefined);
+    }
   }
 
   const caps = await db.select().from(captures).where(eq(captures.worldId, worldId));
@@ -555,7 +702,7 @@ async function handleJobError(db: Db, job: Job, err: unknown): Promise<void> {
     if (failed) {
       await db
         .update(worlds)
-        .set({ status: failed })
+        .set({ status: failed, progress: null, updatedAt: sql`now()` })
         .where(eq(worlds.id, job.worldId))
         .catch(() => undefined);
     }
@@ -563,6 +710,52 @@ async function handleJobError(db: Db, job: Job, err: unknown): Promise<void> {
     console.error(`[worker] job ${job.id} (${job.kind}) failed (retryable): ${message}`);
     await failJob(db, job.id, message);
   }
+}
+
+// =============================================================================
+// Reaper — orphaned uploading worlds (client died before frames:done).
+// =============================================================================
+
+/** How long a world may sit in `uploading` before the reaper fails it. */
+export const REAPER_STALE_UPLOAD_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Pure mirror of the reapStaleUploads WHERE clause (same pattern as
+ * queue.isJobClaimable): a world is reapable when it is still `uploading` and
+ * was created more than `maxAgeMs` ago. The SQL MUST stay in sync with this.
+ */
+export function isWorldReapable(
+  world: Pick<World, 'status' | 'createdAt'>,
+  now: Date = new Date(),
+  maxAgeMs: number = REAPER_STALE_UPLOAD_MS,
+): boolean {
+  return world.status === 'uploading' && world.createdAt.getTime() < now.getTime() - maxAgeMs;
+}
+
+/**
+ * Sweep worlds stuck in `uploading` for >24 h → status 'failed_upload' and a
+ * frames-only purge of the capture prefix. The row is kept and NOT
+ * soft-deleted (it stays visible as failed in the Library); the client-side
+ * abandon flow deletes its world eagerly — this is the server backstop.
+ * Returns the reaped world ids (logged individually).
+ */
+export async function reapStaleUploads(db: Db): Promise<string[]> {
+  const rows = await db
+    .update(worlds)
+    .set({ status: 'failed_upload', progress: null, updatedAt: sql`now()` })
+    .where(
+      and(
+        eq(worlds.status, 'uploading'),
+        lt(worlds.createdAt, sql`now() - interval '24 hours'`),
+      ),
+    )
+    .returning({ id: worlds.id });
+
+  for (const row of rows) {
+    console.log(`[worker] reaped stale uploading world ${row.id} → failed_upload`);
+    await enqueue(db, 'purge', row.id, { framesOnly: true });
+  }
+  return rows.map((r) => r.id);
 }
 
 // =============================================================================
@@ -586,12 +779,24 @@ export interface WorkerHandle {
 export function startWorker(deps: WorkerDeps): WorkerHandle {
   const workerId = makeWorkerId();
   const pollMs = deps.config.WORKER_POLL_MS;
-  const sleep = (deps.clock ?? realClock).sleep;
+  const clock = deps.clock ?? realClock;
+  const sleep = clock.sleep;
   let running = true;
+  // Reaper cadence: sweep stale uploading worlds every REAPER_INTERVAL_MS
+  // (first sweep runs immediately on start).
+  let lastReapAt = -Infinity;
 
   const done = (async () => {
     console.log(`[worker] ${workerId} started; kinds=${WORKER_KINDS.join(',')} poll=${pollMs}ms`);
     while (running) {
+      if (clock.now() - lastReapAt >= deps.config.REAPER_INTERVAL_MS) {
+        lastReapAt = clock.now();
+        try {
+          await reapStaleUploads(deps.db);
+        } catch (err) {
+          console.error(`[worker] reaper error (staying alive): ${String(err)}`);
+        }
+      }
       let job: Job | null = null;
       try {
         job = await claimNextJob(deps.db, WORKER_KINDS, workerId);

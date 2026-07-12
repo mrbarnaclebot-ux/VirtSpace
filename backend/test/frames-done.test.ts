@@ -41,6 +41,7 @@ function fakeWorld(): World {
     isPublic: false,
     status: 'uploading',
     phase: null,
+    progress: null,
     panoUrl: null,
     thumbnailUrl: null,
     spz100kUrl: null,
@@ -55,6 +56,7 @@ function fakeWorld(): World {
     hqModel: null,
     creditsSpent: 0,
     createdAt: new Date('2026-07-12T10:00:00Z'),
+    updatedAt: new Date('2026-07-12T10:00:00Z'),
     deletedAt: null,
   };
 }
@@ -138,7 +140,12 @@ describe('POST /v1/worlds/:id/frames:done', () => {
     // Exactly one update — the world's status. Captures untouched.
     expect(state.updates).toHaveLength(1);
     expect(state.updates[0]!.table).toBe(worlds);
-    expect(state.updates[0]!.patch).toEqual({ status: 'stitching' });
+    // Status flip + progress reset + heartbeat touch, in one update.
+    expect(state.updates[0]!.patch).toEqual({
+      status: 'stitching',
+      progress: null,
+      updatedAt: expect.any(Date),
+    });
     expect(state.inserts).toHaveLength(1);
     expect(state.inserts[0]!.table).toBe(jobs);
     expect(state.inserts[0]!.vals['kind']).toBe('stitch');

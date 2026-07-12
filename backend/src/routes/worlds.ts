@@ -60,7 +60,7 @@ function requireUserId(req: FastifyRequest, reply: FastifyReply): string | null 
   return req.userId;
 }
 
-function serializeWorld(w: World): Record<string, unknown> {
+export function serializeWorld(w: World): Record<string, unknown> {
   return {
     id: w.id,
     title: w.title,
@@ -71,6 +71,11 @@ function serializeWorld(w: World): Record<string, unknown> {
     is_public: w.isPublic,
     status: w.status,
     phase: w.phase,
+    // Within-status completion 0–100 (null between phases) + the heartbeat
+    // (worlds.updated_at, touched on every pipeline write) so clients can
+    // render a progress bar and flag a stalled job.
+    progress: w.progress,
+    heartbeat_at: w.updatedAt,
     asset_version: w.assetVersion,
     provider: w.provider,
     credits_spent: w.creditsSpent,
@@ -245,7 +250,11 @@ export function worldsRoutes(app: FastifyInstance, deps: RouteDeps): void {
         }
       }
 
-      await db.update(worlds).set({ status: 'stitching' }).where(eq(worlds.id, world.id));
+      // Entering a new status → progress resets; updated_at is the heartbeat.
+      await db
+        .update(worlds)
+        .set({ status: 'stitching', progress: null, updatedAt: new Date() })
+        .where(eq(worlds.id, world.id));
       const jobId = await enqueue(db, 'stitch', world.id);
 
       const [updated] = await db.select().from(worlds).where(eq(worlds.id, world.id)).limit(1);
@@ -318,7 +327,7 @@ export function worldsRoutes(app: FastifyInstance, deps: RouteDeps): void {
     }
     await db
       .update(worlds)
-      .set({ status: 'generating_hq' })
+      .set({ status: 'generating_hq', progress: null, updatedAt: new Date() })
       .where(eq(worlds.id, world.id));
     const jobId = await enqueue(db, 'generate_hq', world.id);
     const [updated] = await db.select().from(worlds).where(eq(worlds.id, world.id)).limit(1);
@@ -333,7 +342,10 @@ export function worldsRoutes(app: FastifyInstance, deps: RouteDeps): void {
     const world = await findOwnedWorld(db, req.params.id, userId);
     if (!world) return reply.code(404).send({ error: 'world_not_found' });
 
-    await db.update(worlds).set({ deletedAt: new Date() }).where(eq(worlds.id, world.id));
+    await db
+      .update(worlds)
+      .set({ deletedAt: new Date(), updatedAt: new Date() })
+      .where(eq(worlds.id, world.id));
     const jobId = await enqueue(db, 'purge', world.id);
     return reply.send({ ok: true, job_id: jobId });
   });

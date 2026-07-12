@@ -132,6 +132,11 @@ struct World: Identifiable, Decodable, Hashable {
     var lng: Double?
     var isPublic: Bool?
     var phase: String?
+    /// Within-status completion 0–100, or nil between phases / on old backends.
+    var progress: Int?
+    /// Server heartbeat (worlds.updated_at) — the last time the pipeline
+    /// touched this row. Drives the "working / taking longer" staleness UI.
+    var heartbeatAt: Date?
     var assetVersion: Int?
     var provider: String?
     var creditsSpent: Int?
@@ -150,6 +155,8 @@ struct World: Identifiable, Decodable, Hashable {
         case lng
         case isPublic = "is_public"
         case phase
+        case progress
+        case heartbeatAt = "heartbeat_at"
         case assetVersion = "asset_version"
         case provider
         case creditsSpent = "credits_spent"

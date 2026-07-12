@@ -264,11 +264,13 @@ const stitchConfig = loadConfig({
 function fakeWorld(): World {
   return {
     id: 'w-1', ownerId: 'user-1', title: null, caption: null, lat: null, lng: null,
-    placeName: null, isPublic: false, status: 'stitching', phase: null, panoUrl: null,
+    placeName: null, isPublic: false, status: 'stitching', phase: null, progress: null,
+    panoUrl: null,
     thumbnailUrl: null, spz100kUrl: null, spz500kUrl: null, spzFullUrl: null,
     colliderGlbUrl: null, assetVersion: 1, provider: null, draftWorldId: null,
     hqWorldId: null, draftModel: null, hqModel: null, creditsSpent: 0,
-    createdAt: new Date('2026-07-12T10:00:00Z'), deletedAt: null,
+    createdAt: new Date('2026-07-12T10:00:00Z'),
+    updatedAt: new Date('2026-07-12T10:00:00Z'), deletedAt: null,
   };
 }
 

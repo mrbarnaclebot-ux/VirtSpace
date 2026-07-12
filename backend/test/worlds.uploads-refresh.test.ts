@@ -49,6 +49,7 @@ function fakeWorld(): World {
     isPublic: false,
     status: 'uploading',
     phase: null,
+    progress: null,
     panoUrl: null,
     thumbnailUrl: null,
     spz100kUrl: null,
@@ -63,6 +64,7 @@ function fakeWorld(): World {
     hqModel: null,
     creditsSpent: 0,
     createdAt: new Date('2026-07-12T10:00:00Z'),
+    updatedAt: new Date('2026-07-12T10:00:00Z'),
     deletedAt: null,
   };
 }

@@ -15,6 +15,13 @@
       "when": 1783803812345,
       "tag": "0001_bouncy_blue_blade",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1783854591863,
+      "tag": "0002_foamy_wild_child",
+      "breakpoints": true
     }
   ]
 }

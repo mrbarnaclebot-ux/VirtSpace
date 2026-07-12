@@ -39,6 +39,14 @@ const baseSchema = z.object({
   // Worker loop poll interval (ms) between empty claim attempts (Stage 2).
   WORKER_POLL_MS: numberFromEnv(2000),
 
+  // --- Pipeline progress + reaper --------------------------------------------
+  // Expected wall-clock durations for generation pseudo-progress (the provider
+  // exposes no real progress; progress = min(95, elapsed/expected*100)).
+  GENERATE_EXPECTED_DRAFT_MS: numberFromEnv(45000),
+  GENERATE_EXPECTED_HQ_MS: numberFromEnv(360000),
+  // How often the worker sweeps for worlds stuck in `uploading` >24 h.
+  REAPER_INTERVAL_MS: numberFromEnv(900000),
+
   // --- Stitcher (Phase 0.5) -------------------------------------------------
   // Wall-clock ceiling for a single reproject.py run before it's killed and the
   // stitch job fails (retryable). Default 5 minutes.

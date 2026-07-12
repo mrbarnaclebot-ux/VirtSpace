@@ -160,6 +160,11 @@ final class CaptureEngine {
     @ObservationIgnored private var worldTargets: [simd_float3] = []
     @ObservationIgnored private var currentIndex = 0
     @ObservationIgnored private var running = false
+    /// Fired (on the engine queue) with the backend world id when a session
+    /// that already minted a world is permanently discarded (abandon flow).
+    /// The owner (CaptureView) uses it for a best-effort server-side delete;
+    /// the worker's 24 h uploading reaper is the backstop.
+    @ObservationIgnored var onSessionDiscarded: ((String) -> Void)?
     /// True from dwell-fire until the next target is ready — gates the dwell
     /// machine while a still is in flight.
     @ObservationIgnored private var isTakingStill = false
@@ -229,6 +234,11 @@ final class CaptureEngine {
     }
 
     /// Abort mid-capture: stops the camera and discards the partial session.
+    /// If the session already minted a backend world (createdWorldId in the
+    /// manifest), `onSessionDiscarded` fires with that id BEFORE the local
+    /// purge so the caller can best-effort delete the server-side world —
+    /// otherwise it would sit orphaned in `uploading` (the worker's 24 h
+    /// reaper is the backstop when the delete can't land, e.g. offline).
     func cancel() {
         queue.async { [weak self] in
             guard let self else { return }
@@ -236,6 +246,9 @@ final class CaptureEngine {
             self.source?.stop()
             self.source = nil
             if let session = self.session {
+                if let worldId = self.store.createdWorldId(forSession: session.id, in: session.directory) {
+                    self.onSessionDiscarded?(worldId)
+                }
                 self.store.purge(id: session.id)
             }
             self.resetOnQueue()

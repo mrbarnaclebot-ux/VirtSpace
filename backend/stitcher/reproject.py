@@ -35,6 +35,7 @@ import argparse
 import json
 import math
 import os
+import re
 import sys
 
 import cv2
@@ -69,6 +70,16 @@ def log(msg):
     print(msg, flush=True)
 
 
+def progress(pct):
+    """Machine-readable progress line for the worker (stdout stream parsing).
+
+    Format is exactly `PROGRESS <0-100>` on its own line; the Node worker
+    (src/worker.ts) parses these incrementally and mirrors them into
+    worlds.progress. Human log lines are unaffected.
+    """
+    print(f"PROGRESS {int(max(0, min(100, pct)))}", flush=True)
+
+
 def die(msg, code=1):
     print(f"reproject: error: {msg}", file=sys.stderr, flush=True)
     sys.exit(code)
@@ -93,6 +104,39 @@ def nominal_pose(i, yaw_dir, pitch_sign):
         return (0.0, -pitch_sign * 90.0, 0.0)  # nadir (down)
     # Beyond the nominal 16 targets we have no angle; treat as horizon spillover.
     return (yaw_dir * (i % 8) * 45.0, 0.0, 0.0)
+
+
+def nominal_angles(frame_count, yaw_dir, pitch_sign):
+    """Per-frame (yaw, pitch, roll) table for the pose-less fallback, selected
+    by capture pattern:
+
+      16 -> legacy layout (8 horizon @45 / 4 up @90 / 2 down / zenith / nadir)
+      28 -> densified layout, same order as the iOS TargetLayout:
+            12 horizon @30 / 8 up(+45) @45 / 6 down(-45) @60 / zenith / nadir
+      other -> WARN and evenly distribute a horizon-only ring.
+
+    pitch_sign follows the legacy convention (winning params use -1, i.e.
+    "up" rings get pitch_sign * 45).
+    """
+    if frame_count == 16:
+        return [nominal_pose(i, yaw_dir, pitch_sign) for i in range(16)]
+    if frame_count == 28:
+        angles = []
+        for i in range(12):  # horizon ring, every 30 deg
+            angles.append((yaw_dir * i * 30.0, 0.0, 0.0))
+        for i in range(8):  # upper ring (+45), every 45 deg
+            angles.append((yaw_dir * i * 45.0, pitch_sign * 45.0, 0.0))
+        for i in range(6):  # lower ring (-45), every 60 deg
+            angles.append((yaw_dir * i * 60.0, -pitch_sign * 45.0, 0.0))
+        angles.append((0.0, pitch_sign * 90.0, 0.0))  # zenith
+        angles.append((0.0, -pitch_sign * 90.0, 0.0))  # nadir
+        return angles
+    log(
+        f"WARN unknown capture pattern ({frame_count} frames) — "
+        "using an even horizon-only ring"
+    )
+    n = max(1, int(frame_count))
+    return [(yaw_dir * i * (360.0 / n), 0.0, 0.0) for i in range(n)]
 
 
 def rmat(yaw, pitch, roll):
@@ -130,20 +174,40 @@ def derive_pose_rotation(transform):
     return ARKIT_TO_PROJ @ r_ak.T
 
 
-def focals_from_intrinsics(intrinsics, wf, hf):
-    """Per-axis focal lengths (pixels) for the UPRIGHT wf x hf image.
+def intrinsics_fx_fy_cx_cy(intrinsics):
+    """Convention-tolerant (fx, fy, cx, cy) from 9 intrinsics floats.
 
-    `intrinsics` is 9 numbers ROW-MAJOR: [fx,0,cx, 0,fy,cy, 0,0,1], expressed in
-    the ARKit-native landscape sensor frame. We recover the native FOVs
-    (resolution-independent) and re-derive focals for the actual upright image
-    so a resolution mismatch between intrinsics and frame does not matter.
-    After the 90 deg CW rotation the upright WIDTH spans the native VERTICAL FOV
-    and the upright HEIGHT spans the native HORIZONTAL FOV.
+    The iOS client flattens ARKit's simd_float3x3 COLUMN-major —
+    [fx,0,0, 0,fy,0, cx,cy,1] (cx at [6], cy at [7]) — while this script
+    historically read ROW-major [fx,0,cx, 0,fy,cy, 0,0,1] (cx at [2], cy at
+    [5]); that mismatch made real captures look like "zeroed" centers. fx/fy
+    sit on the diagonal ([0]/[4]) in BOTH conventions; for the principal point
+    prefer the row-major slot and fall back to the column-major one when the
+    row-major slot is non-positive. Raises ValueError on wrong length or
+    non-numeric values; positivity is the CALLER's check (a non-positive
+    result after both fallbacks means genuinely unusable intrinsics).
     """
     k = [float(x) for x in intrinsics]
     if len(k) != 9:
         raise ValueError(f"intrinsics must have 9 elements, got {len(k)}")
-    fx, fy, cx, cy = k[0], k[4], k[2], k[5]
+    fx, fy = k[0], k[4]
+    cx = k[2] if k[2] > 0 else k[6]
+    cy = k[5] if k[5] > 0 else k[7]
+    return fx, fy, cx, cy
+
+
+def focals_from_intrinsics(intrinsics, wf, hf):
+    """Per-axis focal lengths (pixels) for the UPRIGHT wf x hf image.
+
+    `intrinsics` is 9 numbers (row- OR column-major — see
+    intrinsics_fx_fy_cx_cy), expressed in the ARKit-native landscape sensor
+    frame. We recover the native FOVs (resolution-independent) and re-derive
+    focals for the actual upright image so a resolution mismatch between
+    intrinsics and frame does not matter. After the 90 deg CW rotation the
+    upright WIDTH spans the native VERTICAL FOV and the upright HEIGHT spans
+    the native HORIZONTAL FOV.
+    """
+    fx, fy, cx, cy = intrinsics_fx_fy_cx_cy(intrinsics)
     if fx <= 0 or fy <= 0 or cx <= 0 or cy <= 0:
         raise ValueError("intrinsics fx/fy/cx/cy must be positive")
     ref_w, ref_h = 2.0 * cx, 2.0 * cy  # native landscape sensor extent
@@ -205,12 +269,21 @@ def build(width, frames_dir, poses, yaw_dir, pitch_sign, hfov_deg, power=2.0):
     if poses is not None:
         indices = [int(p["index"]) for p in poses]
         pose_by_index = {int(p["index"]): p for p in poses}
+        angles = None
     else:
-        indices = list(range(16))
+        # Pattern-aware fallback: pick the angle table from the number of
+        # frames actually present (16 legacy / 28 densified / other WARN+ring).
+        n_frames = count_frames(frames_dir) or 16
+        angles = nominal_angles(n_frames, yaw_dir, pitch_sign)
+        indices = list(range(len(angles)))
         pose_by_index = None
 
     processed = 0
-    for i in indices:
+    total = len(indices)
+    for k, i in enumerate(indices):
+        # Per-frame reprojection spans PROGRESS 5..70 (blend/inpaint/write take
+        # the rest — see main()).
+        progress(5 + 65 * k / total)
         img = load_frame(frames_dir, i)
         if img is None:
             log(f"frame {i}: missing, skipped")
@@ -235,10 +308,11 @@ def build(width, frames_dir, poses, yaw_dir, pitch_sign, hfov_deg, power=2.0):
             is_pole = abs(fwd_lat) > POLE_LAT_DEG
             label = f"pose(lat={fwd_lat:.0f})"
         else:
-            yaw, pitch, roll = nominal_pose(i, yaw_dir, pitch_sign)
+            yaw, pitch, roll = angles[i]
             r_proj = rmat(yaw, pitch, roll).T  # world -> camera
             focal_x = focal_y = (wf / 2.0) / math.tan(math.radians(hfov_deg) / 2.0)
-            is_pole = i in (14, 15)
+            # Pattern-independent pole detection (zenith/nadir at +/-90).
+            is_pole = abs(pitch) > POLE_LAT_DEG
             label = f"pose(y={yaw:.0f},p={pitch:.0f})"
 
         dc = r_proj @ d  # projection-camera-frame rays, 3xN
@@ -281,6 +355,7 @@ def build(width, frames_dir, poses, yaw_dir, pitch_sign, hfov_deg, power=2.0):
     if processed == 0:
         die(f"no usable frames found in {frames_dir}")
 
+    progress(70)  # reprojection done; feather-blend normalization next.
     out = np.zeros((n, 3), np.float32)
     nz = wsum > 0
     out[nz] = accum[nz] / wsum[nz, None]
@@ -305,25 +380,73 @@ def fill_holes(pano, mask):
     return np.where(m3, fu, pano)
 
 
-def load_poses(path):
-    """Load poses.json (the captures.poses_json array) and normalize it to a
-    list of pose dicts with integer indices and a transform. Returns None if the
-    file is absent; dies on malformed content."""
-    if not path:
+FRAME_NAME_RE = re.compile(r"^frame_\d+\.(jpg|jpeg|png)$", re.IGNORECASE)
+
+
+def count_frames(frames_dir):
+    """Number of frame_<i>.jpg/png files present, or None if unreadable."""
+    try:
+        return sum(1 for name in os.listdir(frames_dir) if FRAME_NAME_RE.match(name))
+    except OSError:
         return None
+
+
+def load_poses(path):
+    """Load poses.json (the captures.poses_json array).
+
+    Returns (poses, None) on success or (None, reason) when the file is
+    missing/unreadable/malformed. Pose problems are NEVER fatal — the caller
+    WARNs and falls back to the nominal-angle path (a legacy client once
+    shipped zeroed intrinsics and hard-failing here burned every retry)."""
+    if not path:
+        return None, None
     if not os.path.exists(path):
-        die(f"poses file not found: {path}")
+        return None, f"poses file not found: {path}"
     try:
         with open(path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
     except (OSError, json.JSONDecodeError) as exc:
-        die(f"failed to read poses: {exc}")
+        return None, f"failed to read poses: {exc}"
     if not isinstance(data, list) or len(data) == 0:
-        die("poses.json must be a non-empty array")
-    for p in data:
+        return None, "poses.json must be a non-empty array"
+    return data, None
+
+
+def pose_validation_error(poses, frame_count=None):
+    """Return a human-readable reason when the pose array is unusable, else
+    None. Checks entry shape, transform (16 numbers), intrinsics (9 numbers
+    with positive fx/fy/cx/cy) and — when known — pose count vs frame count.
+    Mirrors everything build() would otherwise die on mid-run."""
+    if frame_count is not None and frame_count > 0 and len(poses) != frame_count:
+        return f"pose count {len(poses)} != frame count {frame_count}"
+    for p in poses:
         if not isinstance(p, dict) or "transform" not in p or "index" not in p:
-            die("each pose needs at least 'index' and 'transform'")
-    return sorted(data, key=lambda p: int(p["index"]))
+            return "each pose needs at least 'index' and 'transform'"
+        try:
+            i = int(p["index"])
+        except (TypeError, ValueError):
+            return f"non-integer pose index {p.get('index')!r}"
+        t = p["transform"]
+        if not isinstance(t, (list, tuple)) or len(t) != 16:
+            return f"frame {i}: transform must have 16 elements"
+        try:
+            [float(x) for x in t]
+        except (TypeError, ValueError):
+            return f"frame {i}: non-numeric transform"
+        k = p.get("intrinsics")
+        if k is not None:
+            if not isinstance(k, (list, tuple)) or len(k) != 9:
+                return f"frame {i}: intrinsics must have 9 elements"
+            try:
+                # Convention-tolerant (row- or column-major) extraction; only
+                # when BOTH principal-point candidates are non-positive is the
+                # pose genuinely invalid.
+                fx, fy, cx, cy = intrinsics_fx_fy_cx_cy(k)
+            except (TypeError, ValueError):
+                return f"frame {i}: non-numeric intrinsics"
+            if fx <= 0 or fy <= 0 or cx <= 0 or cy <= 0:
+                return f"frame {i}: non-positive intrinsics"
+    return None
 
 
 def main(argv=None):
@@ -344,22 +467,37 @@ def main(argv=None):
     if not os.path.isdir(args.frames_dir):
         die(f"frames dir not found: {args.frames_dir}")
 
-    poses = load_poses(args.poses)
+    # Pose problems are never fatal: WARN and fall back to the nominal-angle
+    # path rather than exit non-zero (a hard fail here burns every job retry
+    # on a permanently-bad payload, e.g. a legacy client's zeroed intrinsics).
+    poses, reason = load_poses(args.poses)
+    if poses is not None and reason is None:
+        reason = pose_validation_error(poses, count_frames(args.frames_dir))
+        if reason is None:
+            poses = sorted(poses, key=lambda p: int(p["index"]))
+    if reason is not None:
+        log(f"WARN poses invalid ({reason}) — falling back to nominal angles")
+        poses = None
+
     mode = "poses" if poses is not None else "nominal-fallback"
     log(f"reproject: mode={mode} width={args.width} frames_dir={args.frames_dir}")
+    progress(0)
 
     pano, cov, mask = build(
         args.width, args.frames_dir, poses,
         args.yaw_dir, args.pitch_sign, args.hfov,
     )
     log(f"coverage {cov:.1f}% before inpaint")
+    progress(75)  # blend done; inpainting residual holes next.
     pano = fill_holes(pano, mask)
+    progress(85)  # inpaint done; encoding + writing outputs next.
 
     out_dir = os.path.dirname(os.path.abspath(args.out))
     os.makedirs(out_dir, exist_ok=True)
     if not cv2.imwrite(args.out, pano, [cv2.IMWRITE_JPEG_QUALITY, 92]):
         die(f"failed to write pano: {args.out}")
     log(f"wrote pano {pano.shape[1]}x{pano.shape[0]} -> {args.out}")
+    progress(95)
 
     if args.preview_out:
         preview = cv2.resize(pano, (2000, 1000), interpolation=cv2.INTER_AREA)
@@ -369,6 +507,7 @@ def main(argv=None):
             die(f"failed to write preview: {args.preview_out}")
         log(f"wrote preview 2000x1000 -> {args.preview_out}")
 
+    progress(100)
     log("reproject: done")
 
 

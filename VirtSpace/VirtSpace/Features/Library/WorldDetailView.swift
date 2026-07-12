@@ -61,7 +61,11 @@ struct WorldDetailView: View {
                 heroThumbnail
                 if let world {
                     header(world)
-                    StatusTimeline(status: world.status)
+                    StatusTimeline(
+                        status: world.status,
+                        progress: world.progress,
+                        heartbeatAt: world.heartbeatAt
+                    )
                     if let caption = world.caption, !caption.isEmpty {
                         captionSection(caption)
                     }
@@ -365,6 +369,11 @@ struct WorldDetailView: View {
 /// Draft ready → Enhancing → Complete. Rendered against the current status.
 struct StatusTimeline: View {
     let status: WorldStatus
+    /// Within-phase completion 0–100 (server truth, nullable) — rendered as a
+    /// bar under the active row via PipelineActivityView.
+    var progress: Int?
+    /// Pipeline heartbeat (worlds.updated_at) for the staleness caption.
+    var heartbeatAt: Date?
 
     private struct Phase: Identifiable {
         let id: Int
@@ -421,6 +430,17 @@ struct StatusTimeline: View {
                     }
                 }
                 .padding(.vertical, 7)
+                // Active-phase detail: progress bar/percent + heartbeat
+                // staleness, indented under the running row.
+                if phase.id == currentIndex, status.isActive {
+                    PipelineActivityView(
+                        status: status,
+                        progress: progress,
+                        heartbeatAt: heartbeatAt
+                    )
+                    .padding(.leading, 36)
+                    .padding(.bottom, 6)
+                }
                 if phase.id < Self.phases.count - 1 {
                     Rectangle()
                         .fill(connectorColor(after: phase))

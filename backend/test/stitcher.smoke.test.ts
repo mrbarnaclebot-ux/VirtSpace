@@ -57,11 +57,24 @@ json.dump(poses, open(${JSON.stringify(posesPath)}, 'w'))
       execFileSync(PY, ['-c', gen], { stdio: 'inherit' });
 
       const out = path.join(dir, 'pano.jpg');
-      execFileSync(
+      const stdout = execFileSync(
         PY,
         [script, '--frames-dir', framesDir, '--poses', posesPath, '--out', out, '--width', '512'],
-        { stdio: 'inherit' },
+        { encoding: 'utf8' },
       );
+
+      // Machine-readable progress stream: PROGRESS lines are monotonic 0→100.
+      const progress = stdout
+        .split('\n')
+        .map((l) => /^PROGRESS (\d+)$/.exec(l.trim()))
+        .filter((m): m is RegExpExecArray => m !== null)
+        .map((m) => Number(m[1]));
+      expect(progress.length).toBeGreaterThan(2);
+      expect(progress[0]).toBe(0);
+      expect(progress[progress.length - 1]).toBe(100);
+      for (let i = 1; i < progress.length; i++) {
+        expect(progress[i]).toBeGreaterThanOrEqual(progress[i - 1]!);
+      }
 
       expect(existsSync(out)).toBe(true);
       const shape = execFileSync(
@@ -70,6 +83,47 @@ json.dump(poses, open(${JSON.stringify(posesPath)}, 'w'))
         { encoding: 'utf8' },
       ).trim();
       expect(shape).toBe('512 256'); // 2:1 equirect
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // Regression: a legacy client uploaded poses with zeroed intrinsics and the
+  // stitcher hard-failed (`invalid pose (intrinsics fx/fy/cx/cy must be
+  // positive)`), burning every retry. Invalid poses must WARN + fall back to
+  // the nominal-angle path and still exit 0 with a pano.
+  it('invalid poses (zeroed intrinsics) → WARN + nominal fallback, exit 0', () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'stitch-badposes-'));
+    try {
+      const framesDir = path.join(dir, 'frames');
+      const posesPath = path.join(dir, 'poses.json');
+      const gen = `
+import cv2, numpy as np, json, os
+fd = ${JSON.stringify(framesDir)}
+os.makedirs(fd, exist_ok=True)
+for i, c in enumerate([(60,60,200),(60,200,60),(200,60,60)]):
+    img = np.zeros((480, 640, 3), np.uint8); img[:] = c
+    cv2.imwrite(os.path.join(fd, f'frame_{i}.jpg'), img)
+poses = [{'index': i, 'timestamp': i*0.1,
+          'transform': [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1],
+          'intrinsics': [0,0,0,0,0,0,0,0,0],  # zeroed — the legacy-client bug
+          'exposureLocked': True} for i in range(3)]
+json.dump(poses, open(${JSON.stringify(posesPath)}, 'w'))
+`;
+      execFileSync(PY, ['-c', gen], { stdio: 'inherit' });
+
+      const out = path.join(dir, 'pano.jpg');
+      // Must NOT throw (exit 0) despite the unusable poses.
+      const stdout = execFileSync(
+        PY,
+        [script, '--frames-dir', framesDir, '--poses', posesPath, '--out', out, '--width', '512'],
+        { encoding: 'utf8' },
+      );
+
+      expect(stdout).toContain('WARN poses invalid');
+      expect(stdout).toContain('non-positive intrinsics');
+      expect(stdout).toContain('mode=nominal-fallback');
+      expect(existsSync(out)).toBe(true);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

@@ -18,6 +18,17 @@ struct LibraryView: View {
     @State private var toast: Toast?
     @State private var pollTask: Task<Void, Never>?
 
+    /// Client-truth "Uploading i/N" per world id, read from pending capture
+    /// session manifests on each refresh tick (the server only knows the
+    /// world is `uploading`; the manifest knows how many frames landed).
+    @State private var uploadProgressByWorld: [String: UploadProgress] = [:]
+    private let captureStore = CaptureStore()
+
+    struct UploadProgress: Equatable {
+        let uploaded: Int
+        let total: Int
+    }
+
     @State private var showSettings = false
 
     // Debug log viewer entry (Stage B3 deliverable 3c).
@@ -99,7 +110,7 @@ struct LibraryView: View {
             LazyVStack(spacing: 14) {
                 ForEach(worlds) { world in
                     NavigationLink(value: world.id) {
-                        WorldCard(world: world)
+                        WorldCard(world: world, uploadProgress: uploadProgressByWorld[world.id])
                     }
                     .buttonStyle(.plain)
                 }
@@ -157,11 +168,24 @@ struct LibraryView: View {
         defer { isLoading = false }
         do {
             worlds = try await api.listWorlds()
+            refreshUploadProgress()
         } catch {
             if showErrors, !Task.isCancelled {
                 toast = Toast(error)
             }
         }
+    }
+
+    /// Consult pending capture-session manifests for every world the server
+    /// still reports as `uploading` — client truth for "Uploading i/N".
+    private func refreshUploadProgress() {
+        var byWorld: [String: UploadProgress] = [:]
+        for world in worlds where world.status == .uploading {
+            if let (uploaded, total) = captureStore.pendingSessionProgress(worldId: world.id) {
+                byWorld[world.id] = UploadProgress(uploaded: uploaded, total: total)
+            }
+        }
+        uploadProgressByWorld = byWorld
     }
 
     /// Polls listWorlds every 3 s while any world is in an active status.
@@ -184,29 +208,50 @@ struct LibraryView: View {
 
 struct WorldCard: View {
     let world: World
+    /// Client-truth "Uploading i/N" from the pending session manifest, when
+    /// this world is still uploading and its session is on this device.
+    var uploadProgress: LibraryView.UploadProgress?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             thumbnail
-            HStack(alignment: .center, spacing: 10) {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(world.title)
-                        .font(.headline)
-                        .foregroundStyle(.primary)
-                        .lineLimit(1)
-                    HStack(spacing: 6) {
-                        if let place = world.placeName, !place.isEmpty {
-                            Text(place)
-                                .lineLimit(1)
-                            Text("·")
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(alignment: .center, spacing: 10) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(world.title)
+                            .font(.headline)
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+                        HStack(spacing: 6) {
+                            if let place = world.placeName, !place.isEmpty {
+                                Text(place)
+                                    .lineLimit(1)
+                                Text("·")
+                            }
+                            Text(relativeTime)
                         }
-                        Text(relativeTime)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                     }
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                    Spacer()
+                    StatusChip(status: world.status)
                 }
-                Spacer()
-                StatusChip(status: world.status)
+                if world.status == .uploading, let up = uploadProgress {
+                    HStack(spacing: 8) {
+                        ProgressView(value: Double(up.uploaded), total: Double(max(up.total, 1)))
+                            .tint(world.status.tint)
+                        Text("Uploading \(up.uploaded)/\(up.total)")
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                            .fixedSize()
+                    }
+                } else {
+                    PipelineActivityView(
+                        status: world.status,
+                        progress: world.progress,
+                        heartbeatAt: world.heartbeatAt
+                    )
+                }
             }
             .padding(12)
         }
@@ -253,6 +298,61 @@ struct WorldCard: View {
     private var relativeTime: String {
         guard let created = world.createdAt else { return "Just now" }
         return created.formatted(.relative(presentation: .named))
+    }
+}
+
+// MARK: - PipelineActivityView
+
+/// Server-truth activity readout for a world in an active pipeline phase
+/// (stitching / generating): a determinate progress bar when the backend
+/// reports within-phase `progress`, plus a heartbeat-staleness caption —
+/// fresh (<~90 s since the pipeline last touched the row) reads as a subtle
+/// "working · updated Xs ago"; older turns amber "taking longer than usual".
+/// The Library/Detail 3 s polling keeps both current. Renders nothing for
+/// inactive statuses (and for uploading, whose truth is client-side).
+struct PipelineActivityView: View {
+    let status: WorldStatus
+    let progress: Int?
+    let heartbeatAt: Date?
+
+    /// Heartbeat age (seconds) past which the pipeline reads as stalled.
+    private static let staleAfterSeconds: TimeInterval = 90
+
+    private var isActivePipelinePhase: Bool {
+        switch status {
+        case .stitching, .generatingDraft, .generatingHq: return true
+        default: return false
+        }
+    }
+
+    var body: some View {
+        if isActivePipelinePhase, progress != nil || heartbeatCaption != nil {
+            VStack(alignment: .leading, spacing: 4) {
+                if let progress {
+                    HStack(spacing: 8) {
+                        ProgressView(value: Double(min(max(progress, 0), 100)), total: 100)
+                            .tint(status.tint)
+                        Text("\(progress)%")
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                if let caption = heartbeatCaption {
+                    Text(caption.text)
+                        .font(.caption2)
+                        .foregroundStyle(caption.isStale ? Color.orange : Color.secondary)
+                }
+            }
+        }
+    }
+
+    private var heartbeatCaption: (text: String, isStale: Bool)? {
+        guard let heartbeatAt else { return nil }
+        let age = Date().timeIntervalSince(heartbeatAt)
+        if age > Self.staleAfterSeconds {
+            return ("Taking longer than usual — still trying", true)
+        }
+        return ("working · updated \(max(0, Int(age)))s ago", false)
     }
 }
 

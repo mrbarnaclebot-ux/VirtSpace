@@ -55,10 +55,61 @@ final class CaptureUploader {
                     uploaded.append(world)
                 }
             } else if Date().timeIntervalSince(session.manifest.createdAt) > 86_400 {
+                // Permanently discarding the session — if it already minted a
+                // backend world, best-effort delete it so it doesn't linger as
+                // an orphan in `uploading` (the server-side 24 h reaper is the
+                // backstop if this delete never lands).
+                if let worldId = session.manifest.createdWorldId {
+                    try? await api.deleteWorld(id: worldId)
+                }
                 store.purge(id: session.id)
             }
         }
         return uploaded
+    }
+
+    // MARK: - Stranded-session completion
+
+    /// Cheap, idempotent recovery for the exact stranded state a cancelled
+    /// view-lifecycle flow used to leave behind: createdWorldId set AND every
+    /// frame flagged uploaded, but frames:done never sent (the world sits in
+    /// `uploading` forever server-side). Goes straight to frames:done (with
+    /// poses) and purges the session on success. Kicked by UploadManager at
+    /// launch and on every scenePhase → .active. Returns sessions completed.
+    @discardableResult
+    func completeStrandedSessions() async -> Int {
+        var completed = 0
+        for session in store.loadPending() {
+            let manifest = session.manifest
+            guard
+                let worldId = manifest.createdWorldId,
+                manifest.isComplete,
+                manifest.frames.count > 0,
+                manifest.uploadedFrameIndices.count >= manifest.frames.count
+            else { continue }
+            AppLog.upload.log("Stranded session \(session.id.uuidString, privacy: .public): \(manifest.uploadedFrameIndices.count)/\(manifest.frames.count) frames already uploaded, world \(worldId, privacy: .public) — going straight to frames:done")
+            do {
+                let poses = manifest.frames.map {
+                    FramePose(
+                        index: $0.index,
+                        timestamp: $0.timestamp,
+                        transform: $0.transform,
+                        intrinsics: $0.intrinsics,
+                        exposureLocked: $0.exposureLocked
+                    )
+                }
+                AppLog.upload.log("uploads complete, calling frames:done for \(worldId, privacy: .public)")
+                try await api.framesDone(worldId: worldId, poses: poses)
+                AppLog.upload.log("frames:done ok for \(worldId, privacy: .public) with \(poses.count) poses (stranded recovery)")
+                store.purge(id: session.id)
+                completed += 1
+            } catch is CancellationError {
+                AppLog.upload.fault("frames:done for stranded world \(worldId, privacy: .public) hit CancellationError — this flow must be app-scoped (UploadManager), investigate!")
+            } catch {
+                AppLog.upload.error("Stranded-session frames:done failed for \(worldId, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            }
+        }
+        return completed
     }
 
     // MARK: - Internals
@@ -88,6 +139,7 @@ final class CaptureUploader {
 
         // Count frames already confirmed uploaded (resume) toward progress.
         var done = manifest.uploadedFrameIndices.count
+        AppLog.upload.log("resume: \(done)/\(frameCount) already uploaded")
         progress(done)
         for slot in slots.sorted(by: { $0.index < $1.index }) {
             // Skip frames a previous (possibly killed) run already confirmed.
@@ -118,7 +170,17 @@ final class CaptureUploader {
                 exposureLocked: $0.exposureLocked
             )
         }
-        try await api.framesDone(worldId: world.id, poses: poses)
+        AppLog.upload.log("uploads complete, calling frames:done for \(world.id, privacy: .public)")
+        do {
+            try await api.framesDone(worldId: world.id, poses: poses)
+        } catch is CancellationError {
+            // Loud, never swallowed: a cancellation HERE means the flow ran in
+            // a cancellable (view-lifecycle) context — it must be app-scoped
+            // via UploadManager. The stranded-recovery kick will finish the
+            // world on next scene activation either way.
+            AppLog.upload.fault("frames:done for \(world.id, privacy: .public) CANCELLED mid-flow — upload flows must run app-scoped (UploadManager)!")
+            throw CancellationError()
+        }
         AppLog.upload.log("frames:done ok for \(world.id, privacy: .public) with \(poses.count) poses")
         store.purge(id: session.id)
         return world
