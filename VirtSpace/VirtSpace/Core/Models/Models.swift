@@ -285,6 +285,26 @@ struct WorldEnvelope: Decodable {
     let assets: WorldAssets?
 }
 
+// MARK: - Quota
+
+/// `GET /v1/me/quota` → the user's daily-scan allowance. Checked BEFORE a
+/// capture starts so a full session is never shot only to be rejected with a
+/// 429 at `POST /v1/worlds`. `quotaResetsAt` is nil when no window is active
+/// (the user has their full allowance).
+struct QuotaStatus: Decodable, Hashable {
+    let scansRemaining: Int
+    let quotaResetsAt: Date?
+    let dailyQuota: Int
+
+    enum CodingKeys: String, CodingKey {
+        case scansRemaining = "scans_remaining"
+        case quotaResetsAt = "quota_resets_at"
+        case dailyQuota = "daily_quota"
+    }
+
+    var isExhausted: Bool { scansRemaining <= 0 }
+}
+
 /// `POST /v1/worlds/:id/frames:done` → `{ world: {metadata}, job_id }`.
 struct FramesDoneResponse: Decodable {
     let world: World

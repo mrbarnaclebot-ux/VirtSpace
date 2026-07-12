@@ -5,6 +5,7 @@ import { healthRoutes } from './health.js';
 import { worldsRoutes } from './worlds.js';
 import { devicesRoutes } from './devices.js';
 import { accountRoutes } from './account.js';
+import { meRoutes } from './me.js';
 import type { RouteDeps } from './deps.js';
 
 export async function registerRoutes(
@@ -21,5 +22,6 @@ export async function registerRoutes(
     worldsRoutes(authed, deps);
     devicesRoutes(authed);
     accountRoutes(authed);
+    meRoutes(authed, deps);
   });
 }

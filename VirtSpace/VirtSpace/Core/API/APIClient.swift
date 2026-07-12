@@ -66,6 +66,13 @@ final class APIClient {
         return resp.worlds
     }
 
+    /// `GET /v1/me/quota` → the user's daily-scan allowance. Called before a
+    /// capture starts so quota is enforced up front, not after a full session.
+    func quota() async throws -> QuotaStatus {
+        let data = try await send(request("GET", "v1/me/quota"))
+        return try decode(data)
+    }
+
     func enhance(worldId: String) async throws {
         _ = try await send(request("POST", "v1/worlds/\(worldId):enhance"))
     }

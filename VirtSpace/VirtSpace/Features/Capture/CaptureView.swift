@@ -33,6 +33,12 @@ struct CaptureView: View {
     @State private var didResumePending = false
     /// True when a finished session is stranded on disk after a failed upload.
     @State private var hasPendingUpload = false
+    /// Scans left in today's window, from GET /v1/me/quota. nil = unknown (not
+    /// yet fetched, or the check failed — in which case we fail open and let
+    /// capture proceed). 0 = daily limit reached; capture is blocked up front.
+    @State private var scansRemaining: Int?
+    /// When today's quota window frees up (only meaningful once exhausted).
+    @State private var quotaResetsAt: Date?
     #if DEBUG
     /// Drives the DEBUG-only bundled-fixture explorer (no backend needed).
     @State private var showFixtureExplorer = false
@@ -155,6 +161,9 @@ struct CaptureView: View {
                     .multilineTextAlignment(.center)
                     .padding(.horizontal, 36)
             }
+            if isQuotaExhausted {
+                quotaLimitNotice
+            }
             Button {
                 Task { await startCapture() }
             } label: {
@@ -162,8 +171,16 @@ struct CaptureView: View {
                     .font(.headline)
                     .padding(.horizontal, 28)
                     .padding(.vertical, 14)
-                    .background(Color.cyan, in: Capsule())
+                    .background(isQuotaExhausted ? Color.gray.opacity(0.4) : Color.cyan, in: Capsule())
                     .foregroundStyle(.black)
+            }
+            .disabled(isQuotaExhausted)
+            // Subtle heads-up as the day's allowance runs low (not when it's 0 —
+            // the full-width notice covers that case).
+            if !isQuotaExhausted, let left = scansRemaining, left < 5 {
+                Text("\(left) scan\(left == 1 ? "" : "s") left today")
+                    .font(.footnote)
+                    .foregroundStyle(.white.opacity(0.5))
             }
             if hasPendingUpload {
                 Button {
@@ -183,6 +200,38 @@ struct CaptureView: View {
             .padding(.bottom, 24)
             #endif
         }
+        // Refresh the allowance each time the start screen appears so the
+        // remaining-scans hint / limit notice is current before a capture.
+        .task { await refreshQuota() }
+    }
+
+    /// True once we know the daily scan limit is spent (0 remaining). nil/unknown
+    /// (quota not fetched or the check failed) is NOT exhausted — we fail open.
+    private var isQuotaExhausted: Bool { scansRemaining == 0 }
+
+    /// Full-width, friendly heads-up shown when the day's scans are used up.
+    private var quotaLimitNotice: some View {
+        VStack(spacing: 6) {
+            Text("Daily scan limit reached\(quotaResetLabel)")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.white)
+            Text("Your captures are precious; so are the credits 🙂")
+                .font(.footnote)
+                .foregroundStyle(.white.opacity(0.65))
+        }
+        .multilineTextAlignment(.center)
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 14)
+        .padding(.horizontal, 20)
+        .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .padding(.horizontal, 24)
+    }
+
+    /// " — resets in about 5 hours" when a reset time is known; empty otherwise.
+    private var quotaResetLabel: String {
+        guard let resetsAt = quotaResetsAt else { return "" }
+        let relative = resetsAt.formatted(.relative(presentation: .named))
+        return " — resets \(relative)"
     }
 
     // MARK: - Uploading
@@ -234,9 +283,39 @@ struct CaptureView: View {
         }
     }
 
+    // MARK: - Quota
+
+    /// Pull the current daily-scan allowance. On failure we deliberately clear
+    /// to "unknown" (nil) rather than blocking: capture is offline-safe (frames
+    /// persist to disk and upload retries), so a flaky quota check must never
+    /// stop someone from capturing — see startCapture()'s fail-open branch.
+    private func refreshQuota() async {
+        do {
+            let q = try await api.quota()
+            scansRemaining = q.scansRemaining
+            quotaResetsAt = q.quotaResetsAt
+        } catch {
+            scansRemaining = nil
+            quotaResetsAt = nil
+        }
+    }
+
     // MARK: - Permission gate
 
     private func startCapture() async {
+        // Check quota BEFORE starting the engine — the whole point of this
+        // screen's guard. A real device test had a user shoot a full 28-shot
+        // session only to be rejected with 429 at POST /v1/worlds; enforcing up
+        // front means they learn the limit before spending the effort.
+        await refreshQuota()
+        if scansRemaining == 0 {
+            // Exhausted — the full-width notice is already shown; do not start.
+            return
+        }
+        // scansRemaining == nil means the quota check itself failed. Fail open:
+        // capture works offline (saved locally, upload retries later), so we let
+        // capture proceed rather than block on a transient network error.
+
         #if targetEnvironment(simulator)
         // Simulated source — no camera involved.
         engine.start()
