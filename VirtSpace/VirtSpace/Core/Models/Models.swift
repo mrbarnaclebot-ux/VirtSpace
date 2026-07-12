@@ -245,6 +245,14 @@ struct CreateWorldResponse: Decodable {
     let uploads: [FrameUpload]
 }
 
+/// `POST /v1/worlds/:id/uploads:refresh` → the same `uploads` array shape as
+/// create, re-issued so an interrupted upload can resume onto the identical R2
+/// keys with fresh (unexpired) presigned URLs. `world` rides along unused.
+struct RefreshUploadsResponse: Decodable {
+    let world: World?
+    let uploads: [FrameUpload]
+}
+
 // MARK: - Frame poses (capture → backend)
 
 /// One per-frame pose, mirroring a `poses.json` entry (see CaptureStore).

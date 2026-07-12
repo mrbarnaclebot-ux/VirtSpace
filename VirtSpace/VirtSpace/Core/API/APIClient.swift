@@ -18,7 +18,21 @@ final class APIClient {
     private let decoder: JSONDecoder
     private let encoder: JSONEncoder
 
-    init(baseURL: String = Secrets.apiBaseURL, session: URLSession = .shared) {
+    /// Resolve the backend base URL. In DEBUG a `VIRTSPACE_API_BASE_URL` launch
+    /// env var (e.g. a local mock backend) overrides the compiled-in default so
+    /// upload/resume flows can be exercised end-to-end off production. Never
+    /// consulted in release builds.
+    static var defaultBaseURL: String {
+        #if DEBUG
+        if let override = ProcessInfo.processInfo.environment["VIRTSPACE_API_BASE_URL"],
+           !override.isEmpty {
+            return override
+        }
+        #endif
+        return Secrets.apiBaseURL
+    }
+
+    init(baseURL: String = APIClient.defaultBaseURL, session: URLSession = .shared) {
         // Trim any trailing slash so path joins are clean.
         self.baseURL = baseURL.hasSuffix("/") ? String(baseURL.dropLast()) : baseURL
         self.session = session
@@ -37,6 +51,23 @@ final class APIClient {
         let data = try await send(request("POST", "v1/worlds", body: body))
         let resp: CreateWorldResponse = try decode(data)
         return (resp.world, resp.uploads)
+    }
+
+    /// Re-issue presigned frame PUT URLs for an in-progress capture (resume
+    /// path). Same keys/TTL/content-type as `createWorld`; the world is NOT
+    /// recreated. Called by `CaptureUploader` when resuming a session that
+    /// already has a `createdWorldId`, so a dropped/expired URL never orphans a
+    /// world by forcing a fresh `createWorld`.
+    func refreshUploads(worldId: String) async throws -> (World, [FrameUpload]) {
+        let data = try await send(request("POST", "v1/worlds/\(worldId)/uploads:refresh"))
+        let resp: RefreshUploadsResponse = try decode(data)
+        if let world = resp.world {
+            return (world, resp.uploads)
+        }
+        // Backend always echoes `world`; if a lenient/older shape omits it, fall
+        // back to a detail fetch so callers still get a valid World.
+        let world = try await getWorld(id: worldId).world
+        return (world, resp.uploads)
     }
 
     /// Signal all frames uploaded. `poses` (when present) is included in the

@@ -48,14 +48,53 @@ final class CaptureStore {
         let expectedFrameCount: Int
         let createdAt: Date
         var frames: [FramePose]
+        /// The backend world id minted by `createWorld` for this session. Set
+        /// once the world exists so a resumed upload REUSES it (re-presigning via
+        /// uploads:refresh) instead of creating a duplicate, orphaned world.
+        var createdWorldId: String?
+        /// Frame indices confirmed uploaded to R2. A resume skips these and only
+        /// re-PUTs the rest. Written after each confirmed upload → crash-safe.
+        var uploadedFrameIndices: [Int]
 
         var isComplete: Bool { frames.count >= expectedFrameCount }
+
+        func isUploaded(_ index: Int) -> Bool { uploadedFrameIndices.contains(index) }
+
+        init(
+            sessionID: UUID,
+            expectedFrameCount: Int,
+            createdAt: Date,
+            frames: [FramePose],
+            createdWorldId: String? = nil,
+            uploadedFrameIndices: [Int] = []
+        ) {
+            self.sessionID = sessionID
+            self.expectedFrameCount = expectedFrameCount
+            self.createdAt = createdAt
+            self.frames = frames
+            self.createdWorldId = createdWorldId
+            self.uploadedFrameIndices = uploadedFrameIndices
+        }
 
         enum CodingKeys: String, CodingKey {
             case sessionID = "session_id"
             case expectedFrameCount = "expected_frame_count"
             case createdAt = "created_at"
             case frames
+            case createdWorldId = "created_world_id"
+            case uploadedFrameIndices = "uploaded_frame_indices"
+        }
+
+        // Custom decode so manifests written before the resume fields existed
+        // (older sessions on disk) still load — the new fields default cleanly.
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            sessionID = try c.decode(UUID.self, forKey: .sessionID)
+            expectedFrameCount = try c.decode(Int.self, forKey: .expectedFrameCount)
+            createdAt = try c.decode(Date.self, forKey: .createdAt)
+            frames = try c.decode([FramePose].self, forKey: .frames)
+            createdWorldId = try c.decodeIfPresent(String.self, forKey: .createdWorldId)
+            uploadedFrameIndices = try c.decodeIfPresent([Int].self, forKey: .uploadedFrameIndices) ?? []
         }
     }
 
@@ -133,6 +172,34 @@ final class CaptureStore {
         manifest.frames.sort { $0.index < $1.index }
         manifests[session.id] = manifest
         try writeManifest(manifest, to: session.directory)
+    }
+
+    // MARK: - Resume state (world id + per-frame uploaded flags)
+
+    /// Persist the backend world id for a session so a later resume reuses it
+    /// (spec §6.1 crash-safe resume; never orphan a world). Idempotent.
+    func setCreatedWorldId(_ worldId: String, forSession id: UUID, in directory: URL) {
+        mutateManifest(id: id, in: directory) { $0.createdWorldId = worldId }
+    }
+
+    /// Mark one frame confirmed-uploaded (crash-safe). Called after each frame's
+    /// PUT succeeds so a resume re-PUTs only what's missing.
+    func markFrameUploaded(index: Int, forSession id: UUID, in directory: URL) {
+        mutateManifest(id: id, in: directory) { m in
+            guard !m.uploadedFrameIndices.contains(index) else { return }
+            m.uploadedFrameIndices.append(index)
+            m.uploadedFrameIndices.sort()
+        }
+    }
+
+    /// Read-modify-write poses.json atomically. Reads the on-disk manifest first
+    /// (resume sessions from a previous launch aren't in the in-memory cache),
+    /// falling back to the cache. Runs off the main actor from the upload flow.
+    private func mutateManifest(id: UUID, in directory: URL, _ body: (inout Manifest) -> Void) {
+        guard var manifest = (try? readManifest(in: directory)) ?? manifests[id] else { return }
+        body(&manifest)
+        manifests[id] = manifest
+        try? writeManifest(manifest, to: directory)
     }
 
     // MARK: - Reading back

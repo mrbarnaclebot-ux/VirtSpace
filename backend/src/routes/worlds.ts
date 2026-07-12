@@ -158,13 +158,7 @@ export function worldsRoutes(app: FastifyInstance, deps: RouteDeps): void {
       .where(eq(captures.id, capture!.id));
 
     // Presign one upload URL per frame.
-    const uploads = await Promise.all(
-      Array.from({ length: body.frame_count }, async (_v, i) => {
-        const key = `${prefix}/frame_${i}.heic`;
-        const presigned = await storage.presignUpload(key, 'image/heic', MAX_FRAME_BYTES);
-        return { index: i, key, ...presigned };
-      }),
-    );
+    const uploads = await presignFrameUploads(storage, prefix, body.frame_count);
 
     return reply.code(201).send({
       world: serializeWorld(world!),
@@ -172,6 +166,44 @@ export function worldsRoutes(app: FastifyInstance, deps: RouteDeps): void {
       uploads,
     });
   });
+
+  // POST /v1/worlds/:id/uploads:refresh — re-issue presigned frame PUT URLs so a
+  // client that lost its original (short-TTL) URLs mid-upload can resume without
+  // creating a duplicate world. Same keys, content-type and per-frame ceiling as
+  // create, so the client PUTs the remaining frames to the identical R2 objects.
+  // Owner-checked; a world with no capture row (or no frame prefix) is 404.
+  app.post<{ Params: { id: string } }>(
+    '/v1/worlds/:id/uploads:refresh',
+    async (req, reply) => {
+      const userId = requireUserId(req, reply);
+      if (!userId) return;
+      const db = getDb();
+      const world = await findOwnedWorld(db, req.params.id, userId);
+      if (!world) return reply.code(404).send({ error: 'world_not_found' });
+
+      // Latest capture row carries the frame-key prefix + count minted at create.
+      const [capture] = await db
+        .select()
+        .from(captures)
+        .where(eq(captures.worldId, world.id))
+        .orderBy(desc(captures.createdAt))
+        .limit(1);
+      if (!capture || !capture.r2FramesPrefix) {
+        return reply.code(404).send({ error: 'capture_not_found' });
+      }
+
+      const uploads = await presignFrameUploads(
+        storage,
+        capture.r2FramesPrefix,
+        capture.frameCount,
+      );
+      return reply.send({
+        world: serializeWorld(world),
+        capture_id: capture.id,
+        uploads,
+      });
+    },
+  );
 
   // POST /v1/worlds/:id/frames:done — all frames uploaded → enqueue stitch.
   // Optionally accepts { poses: [...] } (per-frame ARKit poses) which is stored
@@ -305,6 +337,28 @@ export function worldsRoutes(app: FastifyInstance, deps: RouteDeps): void {
     const jobId = await enqueue(db, 'purge', world.id);
     return reply.send({ ok: true, job_id: jobId });
   });
+}
+
+/**
+ * Presign one PUT upload URL per frame under `prefix`. Shared by world create
+ * and uploads:refresh so both mint byte-identical keys (`frame_<i>.heic`),
+ * content-type and per-frame ceiling — the resume path must land on the exact
+ * same R2 objects the original upload targeted.
+ */
+async function presignFrameUploads(
+  storage: StorageDriver,
+  prefix: string,
+  frameCount: number,
+): Promise<
+  Array<{ index: number; key: string } & Awaited<ReturnType<StorageDriver['presignUpload']>>>
+> {
+  return Promise.all(
+    Array.from({ length: frameCount }, async (_v, i) => {
+      const key = `${prefix}/frame_${i}.heic`;
+      const presigned = await storage.presignUpload(key, 'image/heic', MAX_FRAME_BYTES);
+      return { index: i, key, ...presigned };
+    }),
+  );
 }
 
 async function findOwnedWorld(

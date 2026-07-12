@@ -64,25 +64,45 @@ final class CaptureUploader {
     // MARK: - Internals
 
     private func upload(session: CaptureStore.PendingSession, progress: @escaping (Int) -> Void) async throws -> World {
-        let frameCount = session.manifest.frames.count
-        let title = "Scan \(Date().formatted(date: .abbreviated, time: .shortened))"
-        AppLog.upload.log("Upload start: session \(session.id.uuidString, privacy: .public), \(frameCount) frames")
+        let manifest = session.manifest
+        let frameCount = manifest.frames.count
 
-        let (world, slots) = try await api.createWorld(title: title, frameCount: frameCount)
-        AppLog.upload.log("World created: \(world.id, privacy: .public), \(slots.count) upload slots")
+        // World reuse (spec §6.1): if this session already minted a world, RESUME
+        // it — re-presign fresh URLs (the originals may have expired) rather than
+        // creating a second, orphaned world for the same capture.
+        let world: World
+        let slots: [FrameUpload]
+        if let existingWorldId = manifest.createdWorldId {
+            AppLog.upload.log("Resuming upload for world \(existingWorldId, privacy: .public), \(manifest.uploadedFrameIndices.count)/\(frameCount) already uploaded")
+            (world, slots) = try await api.refreshUploads(worldId: existingWorldId)
+            AppLog.upload.log("Refreshed \(slots.count) upload slots")
+        } else {
+            let title = "Scan \(Date().formatted(date: .abbreviated, time: .shortened))"
+            AppLog.upload.log("Upload start: session \(session.id.uuidString, privacy: .public), \(frameCount) frames")
+            (world, slots) = try await api.createWorld(title: title, frameCount: frameCount)
+            // Persist the world id BEFORE uploading any frame so a crash/kill
+            // mid-upload resumes onto this same world instead of orphaning it.
+            store.setCreatedWorldId(world.id, forSession: session.id, in: session.directory)
+            AppLog.upload.log("World created: \(world.id, privacy: .public), \(slots.count) upload slots")
+        }
 
-        progress(0)
-        var done = 0
+        // Count frames already confirmed uploaded (resume) toward progress.
+        var done = manifest.uploadedFrameIndices.count
+        progress(done)
         for slot in slots.sorted(by: { $0.index < $1.index }) {
-            // loadFrameData reads off the main actor: this method runs in a
-            // non-isolated async context (cooperative pool), never on MainActor.
-            let data = try store.loadFrameData(index: slot.index, in: session.directory)
+            // Skip frames a previous (possibly killed) run already confirmed.
+            if manifest.isUploaded(slot.index) { continue }
+            // Upload straight from the on-disk session file via the background
+            // session. This runs in a non-isolated async context, never MainActor.
+            let fileURL = store.frameURL(index: slot.index, in: session.directory)
             do {
-                try await frameUploader.upload(data, to: slot)
+                try await frameUploader.upload(fileURL: fileURL, to: slot)
             } catch {
                 AppLog.upload.error("Frame \(slot.index) upload failed: \(error.localizedDescription, privacy: .public)")
                 throw error
             }
+            // Mark uploaded immediately (crash-safe) so a later resume skips it.
+            store.markFrameUploaded(index: slot.index, forSession: session.id, in: session.directory)
             done += 1
             progress(done)
         }

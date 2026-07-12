@@ -14,9 +14,7 @@
 
 import AVFoundation
 import SwiftUI
-#if DEBUG
 import UIKit
-#endif
 
 struct CaptureView: View {
     @Environment(APIClient.self) private var api
@@ -73,9 +71,30 @@ struct CaptureView: View {
                 if case .finished(let result) = newState {
                     Task { await upload(result) }
                 }
+                updateScreenAwake()
+            }
+            .onChange(of: uploadedFrames) { _, _ in updateScreenAwake() }
+            .onDisappear {
+                // Belt-and-braces: always hand the screen back when we leave.
+                UIApplication.shared.isIdleTimerDisabled = false
             }
             .task { await resumePendingOnce() }
         }
+    }
+
+    /// Keep the screen awake for the full capture + upload arc (belt-and-braces
+    /// with the background session, which handles the app being suspended). The
+    /// idle timer is restored the moment we return to idle / the overlay clears.
+    private var shouldKeepScreenAwake: Bool {
+        if uploadedFrames != nil { return true }
+        switch engine.state {
+        case .idle, .failed: return false
+        default: return true // starting / ready / capturing / advancing / finished
+        }
+    }
+
+    private func updateScreenAwake() {
+        UIApplication.shared.isIdleTimerDisabled = shouldKeepScreenAwake
     }
 
     @ViewBuilder
