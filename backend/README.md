@@ -83,7 +83,11 @@ test/                vitest: config, storage, auth, quota/backoff
   presigned frame upload URLs (`captures/{captureId}/frame_{i}.heic`). Enforces
   the daily scan quota.
 - `POST /v1/worlds/:id/frames:done` — verify ownership, set `status=stitching`,
-  enqueue a `stitch` job.
+  enqueue a `stitch` job. Optionally accepts
+  `{ poses: [{ index, timestamp, transform[16], intrinsics[9], exposureLocked }] }`
+  (max 64 per-frame ARKit poses), stored verbatim into `captures.poses_json`.
+  No/empty body keeps the old behavior; an invalid shape 400s before any state
+  change (no status update, no job).
 - `GET  /v1/worlds/:id` — status/phase + signed download URLs for any asset
   columns that are set.
 - `GET  /v1/worlds` — owner's library, paginated (`limit`/`offset`), excludes

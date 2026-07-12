@@ -1,0 +1,212 @@
+import { describe, it, expect, vi } from 'vitest';
+import Fastify from 'fastify';
+
+// Mock the lazy DB module BEFORE importing the routes. The factory reads
+// `currentDb` at call time, so each test swaps in its own fake.
+let currentDb: unknown;
+vi.mock('../src/db/client.js', () => ({
+  getDb: () => currentDb,
+}));
+
+import { worldsRoutes } from '../src/routes/worlds.js';
+import { worlds, captures, jobs, type World } from '../src/db/schema.js';
+import { loadConfig } from '../src/config.js';
+import type { StorageDriver } from '../src/storage/index.js';
+
+// POST /v1/worlds/:id/frames:done — optional { poses } body contract.
+
+const config = loadConfig({
+  DATABASE_URL: 'postgres://u:p@localhost:5432/db',
+  DEV_AUTH_TOKEN: 't',
+} as NodeJS.ProcessEnv);
+
+const storage = {
+  kind: 'local',
+  presignUpload: vi.fn(),
+  presignDownload: vi.fn(async (key: string) => `https://signed.example/${key}`),
+  putObject: vi.fn(),
+  getObject: vi.fn(),
+  deleteObject: vi.fn(),
+} as unknown as StorageDriver;
+
+function fakeWorld(): World {
+  return {
+    id: 'w-1',
+    ownerId: 'user-1',
+    title: null,
+    caption: null,
+    lat: null,
+    lng: null,
+    placeName: null,
+    isPublic: false,
+    status: 'uploading',
+    phase: null,
+    panoUrl: null,
+    thumbnailUrl: null,
+    spz100kUrl: null,
+    spz500kUrl: null,
+    spzFullUrl: null,
+    colliderGlbUrl: null,
+    assetVersion: 1,
+    provider: null,
+    draftWorldId: null,
+    hqWorldId: null,
+    draftModel: null,
+    hqModel: null,
+    creditsSpent: 0,
+    createdAt: new Date('2026-07-12T10:00:00Z'),
+    deletedAt: null,
+  };
+}
+
+interface DbState {
+  world: World;
+  capture: { id: string } | null;
+  updates: { table: unknown; patch: Record<string, unknown> }[];
+  inserts: { table: unknown; vals: Record<string, unknown> }[];
+}
+
+/** Minimal chainable stand-in for the drizzle calls this route makes. */
+function makeFakeDb(state: DbState) {
+  return {
+    select: () => ({
+      from: (table: unknown) => {
+        const rows =
+          table === worlds
+            ? [state.world]
+            : table === captures && state.capture
+              ? [state.capture]
+              : [];
+        const chain = {
+          where: () => chain,
+          orderBy: () => chain,
+          limit: async () => rows,
+        };
+        return chain;
+      },
+    }),
+    update: (table: unknown) => ({
+      set: (patch: Record<string, unknown>) => ({
+        where: async () => {
+          state.updates.push({ table, patch });
+        },
+      }),
+    }),
+    insert: (table: unknown) => ({
+      values: (vals: Record<string, unknown>) => ({
+        returning: async () => {
+          state.inserts.push({ table, vals });
+          return [{ id: 'job-1' }];
+        },
+      }),
+    }),
+  };
+}
+
+async function makeApp(state: DbState) {
+  currentDb = makeFakeDb(state);
+  const app = Fastify();
+  // Stand-in for the auth preHandler: attach the owner's user id.
+  app.addHook('preHandler', async (req) => {
+    (req as { userId?: string }).userId = 'user-1';
+  });
+  worldsRoutes(app, { config, storage });
+  await app.ready();
+  return app;
+}
+
+function freshState(): DbState {
+  return { world: fakeWorld(), capture: { id: 'cap-1' }, updates: [], inserts: [] };
+}
+
+const validPose = {
+  index: 0,
+  timestamp: 1.25,
+  transform: Array.from({ length: 16 }, (_v, i) => i * 0.5),
+  intrinsics: Array.from({ length: 9 }, (_v, i) => i + 1),
+  exposureLocked: true,
+};
+
+describe('POST /v1/worlds/:id/frames:done', () => {
+  it('no body → unchanged behavior: status=stitching, stitch job, no capture write', async () => {
+    const state = freshState();
+    const app = await makeApp(state);
+    const res = await app.inject({ method: 'POST', url: '/v1/worlds/w-1/frames:done' });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().job_id).toBe('job-1');
+    // Exactly one update — the world's status. Captures untouched.
+    expect(state.updates).toHaveLength(1);
+    expect(state.updates[0]!.table).toBe(worlds);
+    expect(state.updates[0]!.patch).toEqual({ status: 'stitching' });
+    expect(state.inserts).toHaveLength(1);
+    expect(state.inserts[0]!.table).toBe(jobs);
+    expect(state.inserts[0]!.vals['kind']).toBe('stitch');
+    await app.close();
+  });
+
+  it('valid poses → stored verbatim (incl. extra keys) into captures.poses_json', async () => {
+    const state = freshState();
+    const app = await makeApp(state);
+    const pose = { ...validPose, arkitTrackingState: 'normal' }; // extra field kept.
+    const res = await app.inject({
+      method: 'POST',
+      url: '/v1/worlds/w-1/frames:done',
+      payload: { poses: [pose] },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const captureUpdate = state.updates.find((u) => u.table === captures);
+    expect(captureUpdate).toBeDefined();
+    expect(captureUpdate!.patch['posesJson']).toEqual([pose]);
+    // World/job flow still ran.
+    expect(state.updates.some((u) => u.table === worlds)).toBe(true);
+    expect(state.inserts[0]!.vals['kind']).toBe('stitch');
+    await app.close();
+  });
+
+  it('empty poses array → 200, no capture write', async () => {
+    const state = freshState();
+    const app = await makeApp(state);
+    const res = await app.inject({
+      method: 'POST',
+      url: '/v1/worlds/w-1/frames:done',
+      payload: { poses: [] },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(state.updates.some((u) => u.table === captures)).toBe(false);
+    expect(state.inserts).toHaveLength(1);
+    await app.close();
+  });
+
+  it('invalid poses shape → 400 and NO state change (no status update, no job)', async () => {
+    const state = freshState();
+    const app = await makeApp(state);
+    const res = await app.inject({
+      method: 'POST',
+      url: '/v1/worlds/w-1/frames:done',
+      payload: {
+        poses: [{ ...validPose, transform: validPose.transform.slice(0, 15) }],
+      },
+    });
+
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toBe('invalid_body');
+    expect(state.updates).toHaveLength(0); // world untouched…
+    expect(state.inserts).toHaveLength(0); // …and no stitch job enqueued.
+    await app.close();
+  });
+
+  it('rejects > 64 poses', async () => {
+    const state = freshState();
+    const app = await makeApp(state);
+    const res = await app.inject({
+      method: 'POST',
+      url: '/v1/worlds/w-1/frames:done',
+      payload: { poses: Array.from({ length: 65 }, (_v, i) => ({ ...validPose, index: i })) },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(state.updates).toHaveLength(0);
+    await app.close();
+  });
+});

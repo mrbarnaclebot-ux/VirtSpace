@@ -28,6 +28,30 @@ const createBody = z.object({
   frame_count: z.number().int().min(1).max(64),
 });
 
+// Per-frame ARKit pose sent by the capture app on frames:done. `.passthrough()`
+// keeps unknown extra fields so poses_json stores what the client sent
+// verbatim (forward-compatible with future ARKit metadata).
+const poseSchema = z
+  .object({
+    index: z.number().int().min(0),
+    timestamp: z.number(),
+    transform: z.array(z.number()).length(16), // 4x4 row-major.
+    intrinsics: z.array(z.number()).length(9), // 3x3 camera intrinsics.
+    exposureLocked: z.boolean(),
+  })
+  .passthrough();
+
+// frames:done body is OPTIONAL — the current app version sends nothing, and
+// absent/empty body must keep behaving exactly as before.
+export const framesDoneBody = z
+  .object({ poses: z.array(poseSchema).max(64).optional() })
+  .optional()
+  .nullable();
+
+// Generous ceiling for 64 poses (~25 numbers each); Fastify rejects anything
+// larger with a clean 413 instead of buffering unbounded JSON.
+const FRAMES_DONE_BODY_LIMIT = 256 * 1024;
+
 function requireUserId(req: FastifyRequest, reply: FastifyReply): string | null {
   if (!req.userId) {
     reply.code(401).send({ error: 'unauthenticated' });
@@ -150,14 +174,44 @@ export function worldsRoutes(app: FastifyInstance, deps: RouteDeps): void {
   });
 
   // POST /v1/worlds/:id/frames:done — all frames uploaded → enqueue stitch.
+  // Optionally accepts { poses: [...] } (per-frame ARKit poses) which is stored
+  // verbatim into captures.poses_json. No body / empty body = old behavior.
   app.post<{ Params: { id: string } }>(
     '/v1/worlds/:id/frames:done',
+    { bodyLimit: FRAMES_DONE_BODY_LIMIT },
     async (req, reply) => {
       const userId = requireUserId(req, reply);
       if (!userId) return;
+
+      // Validate BEFORE any DB write: an invalid poses shape 400s without
+      // touching world status or enqueuing a job.
+      const parsed = framesDoneBody.safeParse(req.body ?? undefined);
+      if (!parsed.success) {
+        return reply
+          .code(400)
+          .send({ error: 'invalid_body', issues: parsed.error.issues });
+      }
+      const poses = parsed.data?.poses;
+
       const db = getDb();
       const world = await findOwnedWorld(db, req.params.id, userId);
       if (!world) return reply.code(404).send({ error: 'world_not_found' });
+
+      // Store poses on the world's (latest) capture row when provided.
+      if (poses && poses.length > 0) {
+        const [capture] = await db
+          .select()
+          .from(captures)
+          .where(eq(captures.worldId, world.id))
+          .orderBy(desc(captures.createdAt))
+          .limit(1);
+        if (capture) {
+          await db
+            .update(captures)
+            .set({ posesJson: poses })
+            .where(eq(captures.id, capture.id));
+        }
+      }
 
       await db.update(worlds).set({ status: 'stitching' }).where(eq(worlds.id, world.id));
       const jobId = await enqueue(db, 'stitch', world.id);
