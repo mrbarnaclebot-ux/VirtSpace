@@ -7,9 +7,10 @@
 //  ARKit tracking) SimulatedCaptureSource drives a fake pose that slowly
 //  sweeps toward the current target so the whole capture flow is walkable.
 //  Deliberately minimal — the ARKit path is the product; the sim path only
-//  needs to exercise the engine's state machine.
+//  needs to exercise the engine's state machine (and, for B2, the HUD).
 //
 
+import CoreGraphics
 import Foundation
 import simd
 #if targetEnvironment(simulator)
@@ -22,6 +23,9 @@ struct CapturePose {
     var timestamp: TimeInterval
     var transform: simd_float4x4
     var intrinsics: simd_float3x3
+    /// Sensor image size in pixels (landscape, matching `intrinsics`) — the
+    /// HUD needs it to derive an on-screen focal length for dot projection.
+    var imageResolution: CGSize
     /// Non-nil while tracking is degraded ("Slow down", "Too dark…").
     var trackingWarning: String?
 }
@@ -77,6 +81,10 @@ protocol CaptureSource: AnyObject {
 /// slews toward `desiredDirection` (the engine points this at the current
 /// target), pausing when it arrives so steadiness + dwell fire naturally.
 /// Stills are solid-color JPEGs.
+///
+/// Transforms follow the ARKit *portrait* camera convention (camera +X =
+/// screen-down, +Y = screen-right, -Z = forward, right-handed) so the HUD's
+/// projection math is identical on device and simulator.
 final class SimulatedCaptureSource: CaptureSource {
     var onPose: ((CapturePose) -> Void)?
     var onError: ((String) -> Void)?
@@ -86,11 +94,18 @@ final class SimulatedCaptureSource: CaptureSource {
     private let queue: DispatchQueue
     private var timer: DispatchSourceTimer?
 
-    // Fake attitude, radians. Rotation convention matches transform(yaw:pitch:).
+    // Fake attitude, radians. yaw about +Y (math-positive = turning left in
+    // this parameterization), pitch positive = looking up.
     private var yaw: Float = 0.35 // start slightly off-target so target 1 needs a turn
     private var pitch: Float = -0.1
     private var lastTick: TimeInterval?
     private var shotCount = 0
+
+    /// SIM-ONLY scripted parallax: between shots 4 and 6 the fake user
+    /// "wanders" ~0.42 m off the pivot spot, then steps back — exercises the
+    /// drift-coaching banner in HUD walkthroughs. No device equivalent.
+    private var driftOffset: Float = 0
+    private let driftSlewRate: Float = 0.3 // m/s
 
     /// Slew rate, rad/s — fast enough to demo, slow enough to look like a turn.
     private let slewRate: Float = 1.0
@@ -129,10 +144,15 @@ final class SimulatedCaptureSource: CaptureSource {
             pitch += clampedStep(from: pitch, to: targetPitch, maxStep: slewRate * dt, wrap: false)
         }
 
+        // Scripted drift (sim-only, see declaration).
+        let driftTarget: Float = (4..<6).contains(shotCount) ? 0.42 : 0
+        driftOffset += clampedStep(from: driftOffset, to: driftTarget, maxStep: driftSlewRate * dt, wrap: false)
+
         let pose = CapturePose(
             timestamp: now,
-            transform: Self.transform(yaw: yaw, pitch: pitch),
+            transform: currentTransform(),
             intrinsics: Self.fakeIntrinsics,
+            imageResolution: Self.fakeResolution,
             trackingWarning: nil
         )
         onPose?(pose)
@@ -166,7 +186,7 @@ final class SimulatedCaptureSource: CaptureSource {
         completion(.success(CapturedStill(
             jpegData: data,
             timestamp: CACurrentMediaTime(),
-            transform: Self.transform(yaw: yaw, pitch: pitch),
+            transform: currentTransform(),
             intrinsics: Self.fakeIntrinsics
         )))
     }
@@ -175,18 +195,26 @@ final class SimulatedCaptureSource: CaptureSource {
 
     // MARK: Fake camera math
 
-    /// Camera-to-world transform for a yaw (about +Y) then pitch (about
-    /// camera X) attitude, positioned at eye height. Forward (-Z rotated) is
-    /// (-cos p · sin y, sin p, -cos p · cos y).
-    private static func transform(yaw: Float, pitch: Float) -> simd_float4x4 {
-        let qYaw = simd_quatf(angle: yaw, axis: simd_float3(0, 1, 0))
-        let qPitch = simd_quatf(angle: pitch, axis: simd_float3(1, 0, 0))
-        let rotation = simd_float3x3(qYaw * qPitch)
+    private func currentTransform() -> simd_float4x4 {
+        Self.transform(yaw: yaw, pitch: pitch, position: simd_float3(driftOffset, 1.5, 0))
+    }
+
+    /// Camera-to-world transform in ARKit portrait convention for a camera
+    /// that yaws about world +Y then pitches. Forward is
+    /// (-cos p · sin y, sin p, -cos p · cos y); screen-right stays horizontal.
+    /// Columns: camX = screen-down, camY = screen-right, camZ = -forward
+    /// (right-handed: camX × camY = camZ).
+    private static func transform(yaw: Float, pitch: Float, position: simd_float3) -> simd_float4x4 {
+        let forward = simd_float3(-cos(pitch) * sin(yaw), sin(pitch), -cos(pitch) * cos(yaw))
+        // Screen-right is horizontal and pitch-independent for a yaw-pitch rig.
+        let right = simd_float3(cos(yaw), 0, -sin(yaw))
+        let up = simd_normalize(simd_cross(right, forward)) // screen-up
+
         var m = matrix_identity_float4x4
-        m.columns.0 = simd_float4(rotation.columns.0, 0)
-        m.columns.1 = simd_float4(rotation.columns.1, 0)
-        m.columns.2 = simd_float4(rotation.columns.2, 0)
-        m.columns.3 = simd_float4(0, 1.5, 0, 1)
+        m.columns.0 = simd_float4(-up, 0)      // camera X = screen-down
+        m.columns.1 = simd_float4(right, 0)    // camera Y = screen-right
+        m.columns.2 = simd_float4(-forward, 0) // camera Z = backward
+        m.columns.3 = simd_float4(position, 1)
         return m
     }
 
@@ -195,6 +223,8 @@ final class SimulatedCaptureSource: CaptureSource {
         simd_float3(0, 1500, 0),
         simd_float3(720, 540, 1)
     )
+
+    private static let fakeResolution = CGSize(width: 1440, height: 1080)
 }
 
 #endif

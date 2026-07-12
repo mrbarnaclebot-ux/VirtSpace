@@ -16,6 +16,7 @@
 //  mutated on the main queue via `publish`.
 //
 
+import ARKit
 import Foundation
 import Observation
 import simd
@@ -63,6 +64,20 @@ final class CaptureEngine {
     /// Tracking/thermal warning to surface, or nil.
     private(set) var warning: String?
 
+    // MARK: HUD state (Stage B2)
+
+    /// Latest camera-to-world transform (ARKit portrait camera convention).
+    private(set) var cameraTransform: simd_float4x4 = matrix_identity_float4x4
+    /// Latest camera intrinsics + the sensor resolution they refer to.
+    private(set) var cameraIntrinsics: simd_float3x3 = matrix_identity_float3x3
+    private(set) var imageResolution: CGSize = .zero
+    /// World-space direction per target (empty until the heading basis locks).
+    private(set) var targetDirections: [simd_float3] = []
+    /// Dwell completion [0, 1] for the reticle's ring fill.
+    private(set) var dwellProgress: Double = 0
+    /// The live ARSession for the camera preview (device only, nil in sim).
+    private(set) var previewSession: ARSession?
+
     var capturedCount: Int { capturedFlags.lazy.filter { $0 }.count }
 
     var currentTarget: CaptureTarget? {
@@ -108,6 +123,8 @@ final class CaptureEngine {
     @ObservationIgnored private var dwell = DwellTracker()
     @ObservationIgnored private var firstShotPosition: simd_float3?
     @ObservationIgnored private var exposureLockedInternal = false
+    /// Transient (non-pose) warnings stay visible this long (engine queue).
+    @ObservationIgnored private var transientWarning: (text: String, until: TimeInterval)?
 
     init(store: CaptureStore = CaptureStore()) {
         self.store = store
@@ -186,6 +203,12 @@ final class CaptureEngine {
         running = true
         currentIndex = 0
         source?.start()
+
+        // Hand the live session to the HUD's camera preview (device only).
+        if let arSource = source as? ARKitCaptureSource {
+            let arSession = arSource.arSession
+            publish { $0.previewSession = arSession }
+        }
     }
 
     private func resetOnQueue() {
@@ -201,6 +224,7 @@ final class CaptureEngine {
         dwell.reset()
         firstShotPosition = nil
         exposureLockedInternal = false
+        transientWarning = nil
     }
 
     private func fail(_ message: String) {
@@ -224,7 +248,11 @@ final class CaptureEngine {
             }
             let basis = Self.headingBasis(fromCameraForward: AlignmentMath.forward(of: pose.transform))
             worldTargets = targets.map { simd_normalize(basis * $0.direction) }
-            publish { $0.state = .ready(targetIndex: 0) }
+            let directions = worldTargets
+            publish {
+                $0.targetDirections = directions
+                $0.state = .ready(targetIndex: 0)
+            }
         }
 
         let forward = AlignmentMath.forward(of: pose.transform)
@@ -251,7 +279,30 @@ final class CaptureEngine {
         if warningText == nil, thermal == .serious || thermal == .critical {
             warningText = "iPhone is getting hot — capture may slow down"
         }
+        // Transient warnings (e.g. a failed shot) hold for a few seconds
+        // instead of being wiped by the very next pose frame.
+        if warningText == nil, let transient = transientWarning {
+            if pose.timestamp < transient.until {
+                warningText = transient.text
+            } else {
+                transientWarning = nil
+            }
+        }
 
+        // Auto-fire: aligned + steady, continuously, with trustworthy tracking.
+        var progress: Double = 0
+        let aligned = AlignmentMath.isAligned(angularDistanceDegrees: distance)
+        if !isTakingStill {
+            if dwell.update(aligned: aligned, steady: steady && pose.trackingWarning == nil, at: pose.timestamp) {
+                progress = 1
+            } else {
+                progress = dwell.progress(at: pose.timestamp)
+            }
+        }
+
+        let transform = pose.transform
+        let intrinsics = pose.intrinsics
+        let resolution = pose.imageResolution
         publish {
             $0.angularDistanceDegrees = distance
             $0.yawDeltaDegrees = deltas.yaw
@@ -259,12 +310,13 @@ final class CaptureEngine {
             $0.isSteady = steady
             $0.driftMeters = drift
             $0.warning = warningText
+            $0.cameraTransform = transform
+            $0.cameraIntrinsics = intrinsics
+            $0.imageResolution = resolution
+            $0.dwellProgress = progress
         }
 
-        // Auto-fire: aligned + steady, continuously, with trustworthy tracking.
-        guard !isTakingStill else { return }
-        let aligned = AlignmentMath.isAligned(angularDistanceDegrees: distance)
-        if dwell.update(aligned: aligned, steady: steady && pose.trackingWarning == nil, at: pose.timestamp) {
+        if progress >= 1 {
             takeStill()
         }
     }
@@ -307,8 +359,10 @@ final class CaptureEngine {
             // and let the dwell re-fire on the same target.
             isTakingStill = false
             dwell.reset()
+            let text = "Shot failed — hold on the target again (\(error.localizedDescription))"
+            transientWarning = (text, (previousTimestamp ?? 0) + 3.0)
             publish {
-                $0.warning = "Shot failed — hold on the target again (\(error.localizedDescription))"
+                $0.warning = text
                 $0.state = .ready(targetIndex: index)
             }
 
@@ -338,6 +392,14 @@ final class CaptureEngine {
 
             Task { @MainActor in
                 UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+            }
+            // Ring-completion celebrations: horizon ring (index 7), upper
+            // ring (11), down pair (13). The final shot's success haptic
+            // fires below with `.finished`.
+            if index == 7 || index == 11 || index == 13 {
+                Task { @MainActor in
+                    UINotificationFeedbackGenerator().notificationOccurred(.success)
+                }
             }
 
             currentIndex += 1
@@ -396,6 +458,12 @@ final class CaptureEngine {
         driftMeters = 0
         exposureLocked = false
         warning = nil
+        cameraTransform = matrix_identity_float4x4
+        cameraIntrinsics = matrix_identity_float3x3
+        imageResolution = .zero
+        targetDirections = []
+        dwellProgress = 0
+        previewSession = nil
     }
 }
 
@@ -435,12 +503,41 @@ extension CaptureEngine {
         )
         assert(abs(deltas.yaw - 90) < 0.01, "right target should be yaw +90, got \(deltas.yaw)")
 
-        // Dwell: fires only after 300 ms of continuous aligned+steady.
+        // Dwell: fires only after 300 ms of continuous aligned+steady, and
+        // reports fractional progress for the HUD ring.
         var dwell = DwellTracker()
         assert(!dwell.update(aligned: true, steady: true, at: 0))
-        assert(!dwell.update(aligned: true, steady: true, at: 0.2))
+        assert(!dwell.update(aligned: true, steady: true, at: 0.15))
+        let progress = dwell.progress(at: 0.15)
+        assert(abs(progress - 0.5) < 0.01, "dwell progress at 150 ms should be 0.5, got \(progress)")
         assert(dwell.update(aligned: true, steady: true, at: 0.31), "dwell should fire at 310 ms")
         assert(!dwell.update(aligned: false, steady: true, at: 0.4), "dwell must re-arm after firing")
+
+        // HUD projection (Stage B2): identity camera, portrait mapping.
+        let fakeIntrinsics = simd_float3x3(
+            simd_float3(1500, 0, 0), simd_float3(0, 1500, 0), simd_float3(720, 540, 1)
+        )
+        let viewSize = CGSize(width: 400, height: 800)
+        let resolution = CGSize(width: 1440, height: 1080)
+        let ahead = TargetProjection.project(
+            worldDirection: simd_float3(0, 0, -1), cameraTransform: matrix_identity_float4x4,
+            intrinsics: fakeIntrinsics, imageResolution: resolution, viewSize: viewSize
+        )
+        assert(ahead.isInFront && ahead.isOnScreen, "straight-ahead target must be on screen")
+        assert(abs(ahead.point.x - 200) < 0.5 && abs(ahead.point.y - 400) < 0.5,
+               "straight-ahead target must project to screen center, got \(ahead.point)")
+        // Camera +Y is screen-right in portrait → a +Y-ish direction lands right of center.
+        let rightish = TargetProjection.project(
+            worldDirection: simd_normalize(simd_float3(0, 0.25, -1)), cameraTransform: matrix_identity_float4x4,
+            intrinsics: fakeIntrinsics, imageResolution: resolution, viewSize: viewSize
+        )
+        assert(rightish.point.x > 200 && abs(rightish.point.y - 400) < 0.5,
+               "camera+Y direction must land screen-right, got \(rightish.point)")
+        let behind = TargetProjection.project(
+            worldDirection: simd_float3(0, 0, 1), cameraTransform: matrix_identity_float4x4,
+            intrinsics: fakeIntrinsics, imageResolution: resolution, viewSize: viewSize
+        )
+        assert(!behind.isInFront && !behind.isOnScreen, "behind-camera target must be off screen")
     }()
 }
 #endif

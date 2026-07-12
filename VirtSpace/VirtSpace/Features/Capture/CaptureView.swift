@@ -2,11 +2,12 @@
 //  CaptureView.swift
 //  VirtSpace
 //
-//  Stage B1: functional-but-plain guided capture flow driven by
-//  CaptureEngine (Stage B2 adds the polished HUD). Start → camera
-//  permission → live readout (target label, angle, steady dot, n/16,
-//  drift warning) with a crosshair + text direction hint → on finish the
-//  session uploads via CaptureUploader and routes to Library.
+//  Stage B2: the polished guided-capture experience (spec §6.1). Start →
+//  camera permission → live camera feed (ARSCNView on device, animated
+//  stand-in in the simulator) under CaptureHUDView's world-locked dots,
+//  snapping reticle, filling-sphere progress and coaching banners → on
+//  finish, a full-screen upload overlay driven by CaptureUploader, then
+//  route to Library.
 //
 //  Keeps the DEBUG-only "Run test scan" harness from Stage A.
 //
@@ -26,16 +27,23 @@ struct CaptureView: View {
     @State private var engine = CaptureEngine()
     @State private var toast: Toast?
     @State private var isRunningTestScan = false
-    /// Non-nil while a finished capture is uploading (frames done so far).
+    /// Non-nil while an upload is in flight (frames done so far) — drives the
+    /// full-screen upload overlay.
     @State private var uploadedFrames: Int?
     @State private var didResumePending = false
+    /// True when a finished session is stranded on disk after a failed upload.
+    @State private var hasPendingUpload = false
 
     var body: some View {
         NavigationStack {
             ZStack {
                 backdrop
                 content
+                if let uploadedFrames {
+                    UploadOverlayView(uploaded: uploadedFrames, total: engine.targets.count)
+                }
             }
+            .animation(.easeOut(duration: 0.25), value: uploadedFrames == nil)
             .navigationBarHidden(true)
             .toast($toast)
             .onChange(of: engine.state) { _, newState in
@@ -62,10 +70,31 @@ struct CaptureView: View {
                     .foregroundStyle(.white.opacity(0.7))
             }
         case .ready, .capturing, .advancing:
-            liveCapture
+            ZStack {
+                cameraLayer
+                CaptureHUDView(engine: engine, onCancel: { engine.cancel() })
+            }
         case .finished:
-            uploadingScreen
+            // The upload overlay (top-level ZStack) covers this state.
+            cameraLayer
         }
+    }
+
+    /// Live camera feed behind the HUD. On device: the engine's ARSession
+    /// rendered by a bare ARSCNView (see CameraPreviewView for the rationale).
+    /// Simulator: stylized animated placeholder.
+    @ViewBuilder
+    private var cameraLayer: some View {
+        #if targetEnvironment(simulator)
+        SimulatedCameraBackdrop()
+        #else
+        if let session = engine.previewSession {
+            CameraPreviewView(session: session)
+                .ignoresSafeArea()
+        } else {
+            Color.black.ignoresSafeArea()
+        }
+        #endif
     }
 
     // MARK: - Idle / failed
@@ -103,6 +132,15 @@ struct CaptureView: View {
                     .background(Color.cyan, in: Capsule())
                     .foregroundStyle(.black)
             }
+            if hasPendingUpload {
+                Button {
+                    Task { await retryPendingUpload() }
+                } label: {
+                    Label("Retry upload", systemImage: "arrow.up.circle")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.cyan)
+                }
+            }
             Spacer()
             #if DEBUG
             testScanButton
@@ -111,133 +149,7 @@ struct CaptureView: View {
         }
     }
 
-    // MARK: - Live capture readout (plain; B2 replaces with the real HUD)
-
-    private var liveCapture: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Button("Cancel") { engine.cancel() }
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(.white.opacity(0.7))
-                Spacer()
-                Text("\(engine.capturedCount)/\(engine.targets.count)")
-                    .font(.headline.monospacedDigit())
-                    .foregroundStyle(.white)
-            }
-            .padding(.horizontal, 24)
-            .padding(.top, 8)
-
-            Spacer()
-
-            // Crosshair that reflects alignment state.
-            ZStack {
-                Circle()
-                    .strokeBorder(
-                        engine.isAligned ? Color.green : Color.white.opacity(0.4),
-                        lineWidth: engine.isAligned ? 3 : 1.5
-                    )
-                    .frame(width: 84, height: 84)
-                Image(systemName: "plus")
-                    .font(.system(size: 22, weight: .light))
-                    .foregroundStyle(engine.isAligned ? .green : .white.opacity(0.7))
-            }
-            .padding(.bottom, 22)
-
-            VStack(spacing: 10) {
-                if let target = engine.currentTarget {
-                    Text(target.label)
-                        .font(.title3.weight(.bold))
-                        .foregroundStyle(.white)
-                }
-
-                if case .capturing = engine.state {
-                    Text("Capturing…")
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(.cyan)
-                } else if case .advancing = engine.state {
-                    Text("Got it")
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(.green)
-                } else {
-                    Text(directionHint)
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(engine.isAligned ? .green : .cyan)
-                        .monospacedDigit()
-                }
-
-                HStack(spacing: 14) {
-                    HStack(spacing: 6) {
-                        Circle()
-                            .fill(engine.isSteady ? Color.green : Color.orange)
-                            .frame(width: 8, height: 8)
-                        Text(engine.isSteady ? "Steady" : "Hold still")
-                            .font(.footnote)
-                            .foregroundStyle(.white.opacity(0.7))
-                    }
-                    Text(String(format: "%.0f° off", engine.angularDistanceDegrees))
-                        .font(.footnote.monospacedDigit())
-                        .foregroundStyle(.white.opacity(0.5))
-                }
-
-                if let driftWarning = engine.driftWarning {
-                    Text(driftWarning)
-                        .font(.footnote.weight(.semibold))
-                        .foregroundStyle(.orange)
-                }
-                if let warning = engine.warning {
-                    Text(warning)
-                        .font(.footnote)
-                        .foregroundStyle(.yellow)
-                }
-                if engine.capturedCount > 0 && !engine.exposureLocked {
-                    Text("Exposure lock unavailable — seams may vary")
-                        .font(.caption2)
-                        .foregroundStyle(.white.opacity(0.4))
-                }
-            }
-            .multilineTextAlignment(.center)
-            .padding(.horizontal, 30)
-
-            Spacer()
-        }
-    }
-
-    /// Plain-text aim hint ("→ turn right 34°"); the B2 HUD replaces this.
-    private var directionHint: String {
-        let yaw = engine.yawDeltaDegrees
-        let pitch = engine.pitchDeltaDegrees
-        if engine.isAligned { return "Hold still…" }
-        // Lead with whichever correction is larger.
-        if abs(yaw) >= abs(pitch), abs(yaw) > 4 {
-            return yaw > 0
-                ? "→ turn right \(Int(abs(yaw).rounded()))°"
-                : "← turn left \(Int(abs(yaw).rounded()))°"
-        }
-        if abs(pitch) > 4 {
-            return pitch > 0
-                ? "↑ look up \(Int(abs(pitch).rounded()))°"
-                : "↓ look down \(Int(abs(pitch).rounded()))°"
-        }
-        return "Almost there…"
-    }
-
     // MARK: - Uploading
-
-    private var uploadingScreen: some View {
-        VStack(spacing: 16) {
-            ProgressView(
-                value: Double(uploadedFrames ?? 0),
-                total: Double(engine.targets.count)
-            )
-            .tint(.cyan)
-            .padding(.horizontal, 60)
-            Text(uploadedFrames == nil
-                 ? "Preparing upload…"
-                 : "Uploading \(uploadedFrames ?? 0)/\(engine.targets.count)")
-                .font(.subheadline.monospacedDigit())
-                .foregroundStyle(.white.opacity(0.8))
-        }
-    }
 
     private func upload(_ result: CaptureResult) async {
         uploadedFrames = 0
@@ -247,13 +159,32 @@ struct CaptureView: View {
             _ = try await uploader.upload(result: result) { done in
                 Task { @MainActor in uploadedFrames = done }
             }
+            hasPendingUpload = false
             engine.reset()
             toast = Toast(message: "Scan uploaded — watch it build in Library.", style: .success)
             try? await Task.sleep(for: .milliseconds(700))
             switchToLibrary()
         } catch {
+            hasPendingUpload = true
             engine.reset()
-            toast = Toast(message: "Upload failed — your scan is saved and will retry. (\((error as? LocalizedError)?.errorDescription ?? error.localizedDescription))", style: .error)
+            toast = Toast(message: "Upload failed — your scan is saved. Retry from here or relaunch. (\((error as? LocalizedError)?.errorDescription ?? error.localizedDescription))", style: .error)
+        }
+    }
+
+    /// Manual retry of a stranded session (wired to CaptureUploader.resumePending).
+    private func retryPendingUpload() async {
+        uploadedFrames = 0
+        defer { uploadedFrames = nil }
+        let uploaded = await CaptureUploader(api: api).resumePending { done in
+            Task { @MainActor in uploadedFrames = done }
+        }
+        if uploaded.isEmpty {
+            toast = Toast(message: "Upload failed again — check your connection and retry.", style: .error)
+        } else {
+            hasPendingUpload = false
+            toast = Toast(message: "Scan uploaded — watch it build in Library.", style: .success)
+            try? await Task.sleep(for: .milliseconds(700))
+            switchToLibrary()
         }
     }
 

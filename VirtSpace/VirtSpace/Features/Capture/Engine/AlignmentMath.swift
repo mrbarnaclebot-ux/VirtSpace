@@ -141,4 +141,10 @@ struct DwellTracker {
     mutating func reset() {
         satisfiedSince = nil
     }
+
+    /// Fraction of the dwell completed, [0, 1] — drives the HUD's ring fill.
+    func progress(at timestamp: TimeInterval) -> Double {
+        guard let since = satisfiedSince else { return 0 }
+        return min(1, max(0, (timestamp - since) / AlignmentMath.dwellSeconds))
+    }
 }

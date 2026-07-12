@@ -28,6 +28,11 @@ final class ARKitCaptureSource: NSObject, CaptureSource, ARSessionDelegate {
     var onPose: ((CapturePose) -> Void)?
     var onError: ((String) -> Void)?
 
+    /// Exposed so the HUD's camera preview (ARSCNView) can render this
+    /// session's feed. The engine remains the sole owner: only this class
+    /// runs/pauses the session, and the delegate stays here.
+    var arSession: ARSession { session }
+
     /// JPEG pixel cap (~12 MP): native 4032×3024 high-res frames pass
     /// untouched; anything larger (48 MP-class formats) is Lanczos-downscaled
     /// so uploads stay in the size range the backend/stitcher expects.
@@ -197,6 +202,7 @@ final class ARKitCaptureSource: NSObject, CaptureSource, ARSessionDelegate {
             timestamp: frame.timestamp,
             transform: frame.camera.transform,
             intrinsics: frame.camera.intrinsics,
+            imageResolution: frame.camera.imageResolution,
             trackingWarning: Self.warning(for: frame.camera.trackingState)
         ))
     }
