@@ -202,7 +202,8 @@ database connection. `npm run db:migrate` applies pending files to
 `credit_events` ledger for the Stage-2 budget guard), `0002_*.sql` (pipeline
 progress + heartbeat columns), `0003_heavy_maddog.sql`
 (`worlds.client_request_id` + its per-owner unique index — idempotent create,
-spec §10 R4).
+spec §10 R4) and `0004_moaning_silvermane.sql` (a `(world_id, created_at)` index
+on `captures`).
 
 ### Applying migrations in production (spec §10 R10)
 

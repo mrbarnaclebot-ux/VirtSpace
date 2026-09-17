@@ -115,17 +115,25 @@ export const worlds = pgTable(
   ],
 );
 
-export const captures = pgTable('captures', {
-  id: uuid('id').primaryKey().defaultRandom(),
-  worldId: uuid('world_id')
-    .notNull()
-    .references(() => worlds.id),
-  frameCount: integer('frame_count').notNull(),
-  // Per-frame ARKit attitude/pose payload.
-  posesJson: jsonb('poses_json'),
-  r2FramesPrefix: text('r2_frames_prefix'),
-  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
-});
+export const captures = pgTable(
+  'captures',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    worldId: uuid('world_id')
+      .notNull()
+      .references(() => worlds.id),
+    frameCount: integer('frame_count').notNull(),
+    // Per-frame ARKit attitude/pose payload.
+    posesJson: jsonb('poses_json'),
+    r2FramesPrefix: text('r2_frames_prefix'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  // Every hot path looks a capture up BY WORLD, newest first — the stitch and
+  // purge handlers, uploads:refresh, frames:done and replayCreate all run
+  // `where world_id = $1 order by created_at desc limit 1`. Postgres does not
+  // index a foreign key automatically, so each of those was a sequential scan.
+  (t) => [index('captures_world_created_idx').on(t.worldId, t.createdAt)],
+);
 
 export const jobs = pgTable(
   'jobs',
