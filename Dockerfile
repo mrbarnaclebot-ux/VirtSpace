@@ -11,7 +11,11 @@
 # Node 24 matches package.json `engines: >=24`. The image shipped Node 22 while
 # the app declared 24, so nothing ever ran on the version we claim to target.
 
-FROM node:24-slim
+# Pinned to the trixie variant ON PURPOSE: plain `node:24-slim` is Debian bookworm
+# (python 3.11), and the stitcher's pinned numpy 2.5.x requires python >= 3.12 —
+# the first Railway build failed on exactly that. trixie ships python 3.13, which
+# is what stitcher/requirements.txt's cp313 wheels assume.
+FROM node:24-trixie-slim
 
 # --- OS deps: Python + pip (opencv-headless needs libGL/libglib at runtime) ---
 RUN apt-get update && apt-get install -y --no-install-recommends \

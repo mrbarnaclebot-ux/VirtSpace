@@ -459,7 +459,7 @@ installs Python 3 + `stitcher/requirements.txt` (numpy, opencv-python-headless)
 into a venv on `PATH` alongside the Node build, so the worker's `python3`
 resolves to the bundled interpreter.
 
-> **Wheel availability is load-bearing.** The base image is `node:24-slim`
+> **Wheel availability is load-bearing.** The base image is `node:24-trixie-slim`
 > (Debian trixie), whose `python3` is **3.13**. `opencv-python-headless` did not
 > publish a cp313 wheel until **4.13.0.92** — pin anything older and pip falls
 > back to building OpenCV from source, which fails the image build. Check for a
