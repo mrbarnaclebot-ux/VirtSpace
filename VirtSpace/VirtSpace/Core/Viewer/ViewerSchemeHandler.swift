@@ -39,6 +39,21 @@ final class ViewerSchemeHandler: NSObject, WKURLSchemeHandler {
         "Pass.js": "text/javascript; charset=utf-8",
     ]
 
+    /// Memory-mapped SPZ bytes, kept across range requests. Spark issues many
+    /// Range reads while loading a world and each one used to re-read the WHOLE
+    /// file with `Data(contentsOf:)` — tens of megabytes copied per request
+    /// (spec §10 R12). Mapped once, the OS pages in only the requested slice.
+    private var cachedSplat: Data?
+    /// Identity of the file `cachedSplat` was mapped from; when the file on
+    /// disk changes (a re-download replaced it), the map is dropped and retaken.
+    private var cachedSplatSignature: FileSignature?
+
+    /// Cheap on-disk identity: size + modification date.
+    private struct FileSignature: Equatable {
+        let size: Int
+        let modified: Date?
+    }
+
     init(splatURL: URL) {
         self.splatURL = splatURL
     }
@@ -79,7 +94,7 @@ final class ViewerSchemeHandler: NSObject, WKURLSchemeHandler {
     /// SPZ bytes. Supports a single trivial `bytes=start-end` Range (206);
     /// otherwise a full 200 response.
     private func serveSplat(_ task: WKURLSchemeTask, url: URL) {
-        guard let data = try? Data(contentsOf: splatURL) else { fail(task, status: 404); return }
+        guard let data = splatData() else { fail(task, status: 404); return }
         let mime = "application/octet-stream"
 
         if let range = task.request.value(forHTTPHeaderField: "Range"),
@@ -99,6 +114,31 @@ final class ViewerSchemeHandler: NSObject, WKURLSchemeHandler {
             return
         }
         respond(task, url: url, data: data, mime: mime, extraHeaders: ["Accept-Ranges": "bytes"])
+    }
+
+    /// The SPZ bytes, memory-mapped once and reused for every range request.
+    /// Re-maps when the file on disk changed. No locking needed: WebKit calls
+    /// the handler on its own (main) thread and every request is served
+    /// synchronously — see the file header.
+    private func splatData() -> Data? {
+        let signature = currentSplatSignature()
+        if let cachedSplat, cachedSplatSignature == signature {
+            return cachedSplat
+        }
+        guard let data = try? Data(contentsOf: splatURL, options: .mappedIfSafe) else {
+            cachedSplat = nil
+            cachedSplatSignature = nil
+            return nil
+        }
+        cachedSplat = data
+        cachedSplatSignature = signature
+        return data
+    }
+
+    private func currentSplatSignature() -> FileSignature? {
+        guard let values = try? splatURL.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]),
+              let size = values.fileSize else { return nil }
+        return FileSignature(size: size, modified: values.contentModificationDate)
     }
 
     private func respond(_ task: WKURLSchemeTask, url: URL, data: Data, mime: String, extraHeaders: [String: String] = [:]) {

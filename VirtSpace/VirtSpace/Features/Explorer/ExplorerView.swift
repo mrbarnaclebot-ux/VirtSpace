@@ -13,6 +13,7 @@
 //  bridge at 60 fps is too laggy (spec §3.1, §9).
 //
 
+import OSLog
 import SwiftUI
 import WebKit
 
@@ -346,6 +347,29 @@ private struct ExplorerWebView: UIViewRepresentable {
             case "error": onError((body["message"] as? String) ?? "Unknown error")
             case "interaction": onInteraction()
             default: break
+            }
+        }
+
+        /// Navigation allowlist (spec §10 R12). The viewer is a fully local
+        /// page: the only navigations it can legitimately make are within the
+        /// `virtspace-viewer` scheme (its page, its pinned modules, the SPZ).
+        /// Anything else — an http(s) link, a data:/file: URL, a redirect out
+        /// of a world's caption text — is a navigation we never intend, so it
+        /// is cancelled rather than loaded into the explorer.
+        func webView(
+            _ webView: WKWebView,
+            decidePolicyFor navigationAction: WKNavigationAction,
+            decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
+        ) {
+            let url = navigationAction.request.url
+            let scheme = url?.scheme?.lowercased()
+            // about:blank is WebKit's own initial/empty document, not a
+            // navigation away from the viewer.
+            if scheme == ViewerSchemeHandler.scheme || url?.absoluteString == "about:blank" {
+                decisionHandler(.allow)
+            } else {
+                AppLog.viewer.log("Blocked viewer navigation to \(AppLog.redact(url), privacy: .public)")
+                decisionHandler(.cancel)
             }
         }
 

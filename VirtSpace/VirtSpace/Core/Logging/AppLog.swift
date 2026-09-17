@@ -28,6 +28,7 @@ enum AppLog {
     static let upload = Logger(subsystem: subsystem, category: "upload")
     static let api = Logger(subsystem: subsystem, category: "api")
     static let engine = Logger(subsystem: subsystem, category: "engine")
+    static let viewer = Logger(subsystem: subsystem, category: "viewer")
 
     /// Strip everything from `?` onward so presigned-URL signatures and query
     /// tokens never reach the log. Returns just scheme://host/path.
