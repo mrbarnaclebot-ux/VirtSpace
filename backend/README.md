@@ -101,8 +101,27 @@ test/                vitest: config, storage, auth, quota/backoff
   `thumbnail_url` (when set) for the iOS Library grid — heavy asset URLs are
   signed exclusively by the detail route. Response:
   `{ worlds: [{ ...world, assets: { thumbnail_url? } }], has_more, next_offset }`.
-- `POST /v1/worlds/:id/enhance` — enqueue `generate_hq` if `status=draft_ready`
-  (else 409).
+- `POST /v1/worlds/{id}:enhance` — **canonical** (spec §7.1, literal colon; this
+  is the path the iOS client calls). Enqueues `generate_hq` if
+  `status=draft_ready`, else `409 not_enhanceable` with the current status. The
+  `draft_ready → generating_hq` flip and the check are ONE conditional
+  `UPDATE … WHERE status='draft_ready' … RETURNING`, and the job is enqueued only
+  when that row was actually flipped — a double-tap or a client retry gets the
+  409 and cannot buy a second `marble-1.1` generation (1500 credits). Carries the
+  `RATE_LIMIT_CREATE_MAX` bucket under its own `enhance:<user>` key (see
+  [Rate limiting](#rate-limiting-spec-10-r10)). `POST /v1/worlds/:id/enhance`
+  (slash) is kept as a **legacy alias** on the same handler.
+  - Route string: `'/v1/worlds/:id(^[^:]+)::enhance'`. find-my-way's `::` escape
+    for a literal colon only works in a *static* segment — written straight after
+    a param, `'/v1/worlds/:id::enhance'` parses the param NAME as `id::enhance`,
+    so `req.params.id` is `undefined`. The regex constraint terminates the param
+    name and makes `::enhance` the static suffix it looks like. Verified by
+    `test/worlds.enhance.test.ts`, which also covers the percent-encoded
+    `…%3Aenhance` spelling (find-my-way decodes the parametric segment first).
+  - A `:id` that is not a uuid (e.g. `GET /v1/worlds/<uuid>:enhance`, which the
+    router hands to `GET /v1/worlds/:id` as a garbage id) answers
+    `404 world_not_found` — Postgres' `22P02` on the uuid cast is caught in
+    `findOwnedWorld` instead of escaping as a `500`.
 - `DELETE /v1/worlds/:id` — soft delete + enqueue `purge`.
 - `POST /v1/devices` — upsert an APNs token.
 - `DELETE /v1/account` — soft-delete the user's worlds (+ enqueue purges), delete
@@ -250,6 +269,7 @@ limiter picks a key — Fastify runs every `onRequest` hook before any
 | General | `user:<id>` when authenticated | 300 / min | `RATE_LIMIT_MAX` |
 | General (anonymous) | `ip:<addr>` | 600 / min | `RATE_LIMIT_IP_MAX` |
 | `POST /v1/worlds` | `create:<user>` | 12 / min | `RATE_LIMIT_CREATE_MAX` |
+| `POST /v1/worlds/{id}:enhance` (+ slash alias) | `enhance:<user>` | 12 / min | `RATE_LIMIT_CREATE_MAX` |
 | Failed authentications | `<ip>` | 20 / min | `AUTH_FAIL_MAX` |
 
 Window: `RATE_LIMIT_WINDOW_MS` (default `60000`).
@@ -268,6 +288,15 @@ billable generation and `DAILY_SCAN_QUOTA` is 10/day, so a minute's worth of
 creates is small by definition. Quota is the correctness guard; this is the cost
 guard sitting in front of it, refusing a runaway client before it reaches the
 credit ledger at all.
+
+**Enhance shares that cap but not that key.** One accepted enhance is a
+`marble-1.1` generation — 1500 credits, ~10× a draft — which makes it the most
+expensive single call in the API, so it belongs in the tight bucket rather than
+the 300/min general one. It gets a *separate* `enhance:<user>` key because create
+and enhance are different user actions: coupling them would make an enhance fail
+because of unrelated capture activity. The real correctness guards behind both
+remain `DAILY_CREDIT_BUDGET` (§14) and, for enhance specifically, the atomic
+`draft_ready → generating_hq` flip that makes a second submit a 409.
 
 **Failed auth gets its own counter** (`src/throttle.ts`), not a share of the
 general bucket: it counts only requests that *failed* authentication, which is

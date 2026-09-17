@@ -10,6 +10,32 @@ import type { RouteDeps } from './deps.js';
 
 const DOWNLOAD_TTL_SECONDS = 3600;
 
+/**
+ * `POST /v1/worlds/{id}:enhance` — the custom-method form from spec §7.1, and
+ * the path the iOS client actually calls (APIClient.swift builds the URL by
+ * string concatenation, so the colon stays literal on the wire).
+ *
+ * The route string looks odd on purpose. find-my-way's documented `::` escape
+ * for a literal colon only works in a STATIC segment: written directly after a
+ * parameter, `'/v1/worlds/:id::enhance'` parses the parameter NAME as
+ * `id::enhance`, so the handler receives
+ * `req.params['id::enhance'] === '<uuid>:enhance'` and `req.params.id` is
+ * `undefined` — verified empirically against find-my-way 9.9.0 (Fastify 5.12.5).
+ * Constraining the parameter with a regex terminates the name, after which the
+ * trailing `::enhance` really is the static suffix it looks like and
+ * `req.params.id` is the bare world id. `[^:]+` is the constraint because a
+ * world id is a uuid and can never contain a colon.
+ *
+ * This also matches a percent-encoded colon (`…%3Aenhance`) — find-my-way
+ * decodes the parametric segment before applying the static suffix — so a client
+ * that URL-encodes the path segment reaches the same handler.
+ */
+const ENHANCE_PATH = '/v1/worlds/:id(^[^:]+)::enhance';
+
+/** Legacy slash form. Kept as an alias on the same handler so anything already
+ * pointed at it (the pre-fix backend README, curl snippets) keeps working. */
+const ENHANCE_LEGACY_PATH = '/v1/worlds/:id/enhance';
+
 // Asset columns that hold a storage key → the JSON field name we sign into.
 const ASSET_FIELDS = [
   ['panoUrl', 'pano_url'],
@@ -402,8 +428,34 @@ export function worldsRoutes(app: FastifyInstance, deps: RouteDeps): void {
     });
   });
 
-  // POST /v1/worlds/:id/enhance — trigger HQ generation if draft is ready.
-  app.post<{ Params: { id: string } }>('/v1/worlds/:id/enhance', async (req, reply) => {
+  // POST /v1/worlds/{id}:enhance — trigger HQ generation if the draft is ready.
+  //
+  // Registered TWICE against one handler: the spec'd custom-method form with the
+  // literal colon (what the iOS client calls) and the legacy slash form the
+  // backend used to serve alone. See ENHANCE_PATH for why the colon form needs a
+  // regex-constrained param.
+  //
+  // Both carry the SAME bucket as POST /v1/worlds (RATE_LIMIT_CREATE_MAX), under
+  // an `enhance:` key of their own. Rationale: this is the most expensive single
+  // call in the API — one accepted enhance is a `marble-1.1` generation (1500
+  // credits, ~10x a draft) — so it belongs in the tight cost bucket, not the
+  // 300/min general one. The key is separate rather than shared with `create:`
+  // because create and enhance are different user actions; coupling them would
+  // make an enhance fail because of unrelated capture activity, and the daily
+  // credit budget (§14) is the actual correctness guard behind both.
+  const enhanceOpts = {
+    config: {
+      rateLimit: {
+        max: config.RATE_LIMIT_CREATE_MAX,
+        timeWindow: config.RATE_LIMIT_WINDOW_MS,
+        keyGenerator: (req: FastifyRequest) => `enhance:${req.userId ?? req.ip}`,
+      },
+    },
+  };
+  const enhanceHandler = async (
+    req: FastifyRequest<{ Params: { id: string } }>,
+    reply: FastifyReply,
+  ) => {
     const userId = requireUserId(req, reply);
     if (!userId) return;
     const db = getDb();
@@ -414,14 +466,42 @@ export function worldsRoutes(app: FastifyInstance, deps: RouteDeps): void {
         .code(409)
         .send({ error: 'not_enhanceable', status: world.status });
     }
-    await db
+
+    // The status flip IS the admission control, so it must be the same statement
+    // as the check (same pattern as chargeScanQuota / finalizeStitch). The old
+    // read-then-write let a double-tap or a client retry through the `draft_ready`
+    // gate twice and enqueue TWO `generate_hq` jobs — two marble-1.1 generations,
+    // 3000 credits, real money. Postgres serializes the two writers on the row
+    // lock; the loser matches no row, enqueues nothing, and gets the same 409 as
+    // any other non-enhanceable world. `deleted_at IS NULL` is re-asserted here
+    // too: a delete landing between the read and the write must not start a
+    // billable generation for a world that is on its way to the purge job.
+    const flipped = await db
       .update(worlds)
       .set({ status: 'generating_hq', progress: null, updatedAt: new Date() })
-      .where(eq(worlds.id, world.id));
+      .where(
+        and(
+          eq(worlds.id, world.id),
+          eq(worlds.status, 'draft_ready'),
+          isNull(worlds.deletedAt),
+        ),
+      )
+      .returning();
+    const updated = flipped[0];
+    if (!updated) {
+      const current = await findOwnedWorld(db, world.id, userId);
+      return reply.code(409).send({
+        error: 'not_enhanceable',
+        status: current?.status ?? world.status,
+      });
+    }
+
+    // Only reached by the request that actually won the flip → exactly one job.
     const jobId = await enqueue(db, 'generate_hq', world.id);
-    const [updated] = await db.select().from(worlds).where(eq(worlds.id, world.id)).limit(1);
-    return reply.send({ world: serializeWorld(updated!), job_id: jobId });
-  });
+    return reply.send({ world: serializeWorld(updated), job_id: jobId });
+  };
+  app.post<{ Params: { id: string } }>(ENHANCE_PATH, enhanceOpts, enhanceHandler);
+  app.post<{ Params: { id: string } }>(ENHANCE_LEGACY_PATH, enhanceOpts, enhanceHandler);
 
   // DELETE /v1/worlds/:id — soft delete + enqueue purge.
   app.delete<{ Params: { id: string } }>('/v1/worlds/:id', async (req, reply) => {
@@ -473,9 +553,32 @@ async function presignFrameUploads(
  * Drizzle may wrap the driver error, so the whole `cause` chain is inspected.
  */
 export function isUniqueViolation(err: unknown): boolean {
+  return hasPgCode(err, '23505');
+}
+
+/**
+ * SQLSTATE 22P02 — `invalid_text_representation`, i.e. Postgres was handed
+ * something that is not a uuid for `worlds.id`.
+ *
+ * This is reachable from the router: `GET /v1/worlds/<uuid>:enhance` matches
+ * `GET /v1/worlds/:id` (the colon is an ordinary path character) with
+ * `id = '<uuid>:enhance'`, and the same is true of any hand-typed garbage id.
+ * Without this the query throws, the last-resort handler logs it as an unhandled
+ * error and answers `500 internal_error` — for what is simply a URL naming a
+ * world that cannot exist. A malformed id is a 404, not a server fault.
+ */
+export function isInvalidTextRepresentation(err: unknown): boolean {
+  return hasPgCode(err, '22P02');
+}
+
+/**
+ * True when `err` — or anything in its `cause` chain, since Drizzle may wrap the
+ * driver error — carries the given Postgres SQLSTATE.
+ */
+function hasPgCode(err: unknown, code: string): boolean {
   let cur: unknown = err;
   for (let depth = 0; cur && depth < 5; depth++) {
-    if (typeof cur === 'object' && (cur as { code?: unknown }).code === '23505') return true;
+    if (typeof cur === 'object' && (cur as { code?: unknown }).code === code) return true;
     cur = (cur as { cause?: unknown }).cause;
   }
   return false;
@@ -551,15 +654,25 @@ async function replayCreate(
   });
 }
 
+/**
+ * The world `id` names a row this user owns, or nothing. A `:id` that is not a
+ * uuid is "nothing" too (see isInvalidTextRepresentation) rather than a 500 —
+ * every caller already answers `404 world_not_found` on undefined.
+ */
 async function findOwnedWorld(
   db: ReturnType<typeof getDb>,
   id: string,
   userId: string,
 ): Promise<World | undefined> {
-  const [world] = await db
-    .select()
-    .from(worlds)
-    .where(and(eq(worlds.id, id), eq(worlds.ownerId, userId), isNull(worlds.deletedAt)))
-    .limit(1);
-  return world;
+  try {
+    const [world] = await db
+      .select()
+      .from(worlds)
+      .where(and(eq(worlds.id, id), eq(worlds.ownerId, userId), isNull(worlds.deletedAt)))
+      .limit(1);
+    return world;
+  } catch (err) {
+    if (isInvalidTextRepresentation(err)) return undefined;
+    throw err;
+  }
 }
