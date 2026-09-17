@@ -16,12 +16,21 @@ Two orientation modes:
                        with the winning parameters (pitch_sign=-1, hfov=52),
                        exactly as the spike did.
 
-Coordinate conventions (see derive_pose_rotation for the full derivation):
+Coordinate conventions (derived in full in ARKIT_TO_PROJ and build()):
   Equirect world  : right-handed, +Y up (gravity), +Z at lon=0/lat=0.
+                    Longitude increases with image-x and is measured as a
+                    RIGHTWARD turn, so the ray at lon>0 leans toward -X: the
+                    pano is viewed from INSIDE the sphere, and in a
+                    right-handed +Y-up world a viewer facing +Z has -X on their
+                    right (right x up = -forward). Getting that sign wrong
+                    mirrors the entire pano — it shipped that way until
+                    2026-09-17.
   ARKit camera    : right-handed, +X image-right, +Y image-up, optical axis
                     -Z (camera looks down -Z) in the landscape sensor frame.
-  Projection cam  : left-handed pinhole used by the reprojection equations,
-                    +X right, +Y up, forward +Z, image +y downward.
+  Projection cam  : the pinhole used by the reprojection equations: +X to the
+                    image's right, +Y image-up, +Z forward, image +y downward.
+                    (right, up, forward) is a LEFT-handed triple in this
+                    right-handed world, so every R_proj below has det = -1.
 
 Usage:
   reproject.py --frames-dir DIR --out pano.jpg [--poses poses.json]
@@ -58,10 +67,25 @@ import numpy as np
 #       Y_proj (up)    = -X_ak
 #       Z_proj (fwd)   = -Z_ak
 #   Rows of M are those projection axes expressed in ARKit-camera coordinates.
-#   det(M) = -1 is EXPECTED: it converts the right-handed ARKit camera into the
-#   left-handed projection convention (forward = +Z), not a bug.
+#   det(M) = -1 is EXPECTED and REQUIRED, not a bug: the rows of the resulting
+#   R_proj are the camera's (right, up, forward) axes in WORLD coordinates, and
+#   for a right-handed world those three are always a left-handed triple
+#   (right x up = -forward). Every pose in a real device capture has
+#   det(R_proj) = -1; it is the equirect ray grid's longitude sign, not this
+#   matrix, that has to agree with it (see build()).
 ARKIT_TO_PROJ = np.array(
     [[0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, -1.0]], dtype=np.float64
+)
+
+# The same rebasing for the pose-less nominal path. rmat() returns a PROPER
+# rotation whose columns are the nominal orientation's rotated world axes
+# (column 2 = camera forward, column 1 = camera up); the projection camera's
+# RIGHT axis is the negative of column 0, because "right" in a right-handed
+# +Y-up world is -X for a camera looking along +Z. Applying FLIP_RIGHT gives the
+# nominal path the same det(R_proj) = -1 as the ARKit path, so both agree with
+# the ray grid.
+FLIP_RIGHT = np.array(
+    [[-1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64
 )
 
 # Winning fallback parameters (spike Phase 0.5 gate).
@@ -154,7 +178,8 @@ def detect_image_format(path):
 
 
 # --- nominal capture geometry (fallback, no poses) --------------------------
-# yaw about world up(+Y), pitch about world +X, roll about +Z. degrees.
+# Degrees. yaw = a RIGHTWARD turn about world up (see rmat), pitch about world
+# +X (positive looks down), roll about the forward axis.
 # horizon ring 0-7 at 45 deg apart, +45 pitch ring 8-11 at 90, -45 pitch 12-13
 # at 0/180, 14 zenith (up), 15 nadir (down).
 def nominal_pose(i, yaw_dir, pitch_sign):
@@ -208,12 +233,23 @@ def nominal_angles(frame_count, yaw_dir, pitch_sign):
 
 
 def rmat(yaw, pitch, roll):
-    """Camera->world rotation for nominal yaw/pitch/roll (degrees)."""
+    """World rotation of a nominal yaw/pitch/roll orientation (degrees).
+
+    Columns are the rotated world axes; column 2 is the camera FORWARD and
+    column 1 the camera UP. `yaw` is a RIGHTWARD turn (clockwise seen from
+    above, i.e. about -Y), matching how the guided capture asks the user to
+    turn and how the equirect's longitude is measured — yaw +90 looks along -X.
+    `pitch` is about world +X (positive looks DOWN), `roll` about the forward
+    axis (always 0 in the nominal tables).
+
+    This is NOT yet a projection-camera rotation: the projection camera's right
+    axis is the negative of column 0, so callers use FLIP_RIGHT @ rmat(...).T.
+    """
     y, p, r = map(math.radians, (yaw, pitch, roll))
     cy, sy = math.cos(y), math.sin(y)
     cp, sp = math.cos(p), math.sin(p)
     cr, sr = math.cos(r), math.sin(r)
-    ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
+    ry = np.array([[cy, 0, -sy], [0, 1, 0], [sy, 0, cy]])
     rx = np.array([[1, 0, 0], [0, cp, -sp], [0, sp, cp]])
     rz = np.array([[cr, -sr, 0], [sr, cr, 0], [0, 0, 1]])
     return ry @ rx @ rz
@@ -348,7 +384,10 @@ def frame_orientation(i, img_shape, pose_by_index, angles, hfov_deg):
         return r_proj, focal_x, focal_y, is_pole, f"pose(lat={fwd_lat:.0f})"
 
     yaw, pitch, roll = angles[i]
-    r_proj = rmat(yaw, pitch, roll).T  # world -> camera
+    # world -> projection camera. FLIP_RIGHT turns rmat's proper rotation into
+    # the (right, up, forward) basis the reprojection equations expect, giving
+    # the same det = -1 the ARKit path derives from ARKIT_TO_PROJ.
+    r_proj = FLIP_RIGHT @ rmat(yaw, pitch, roll).T
     focal_x = focal_y = (wf / 2.0) / math.tan(math.radians(hfov_deg) / 2.0)
     # Pattern-independent pole detection (zenith/nadir at +/-90).
     is_pole = abs(pitch) > POLE_LAT_DEG
@@ -402,7 +441,7 @@ def build(width, frames_dir, poses, yaw_dir, pitch_sign, hfov_deg, power=2.0,
 
     # Longitude terms are band-independent — compute them once.
     u = (np.arange(w) + 0.5) / w
-    lon = (u * 2 - 1) * math.pi  # -pi..pi
+    lon = (u * 2 - 1) * math.pi  # -pi..pi, increasing with image-x
     sin_lon = np.sin(lon)
     cos_lon = np.cos(lon)
 
@@ -425,10 +464,20 @@ def build(width, frames_dir, poses, yaw_dir, pitch_sign, hfov_deg, power=2.0,
 
         # equirect ray grid (world directions) for THIS band, +Y up, +Z at
         # lon=lat=0. Identical values to the full grid's rows r0..r1.
+        #
+        # The MINUS on dx is the panorama's handedness and is load-bearing. The
+        # pano is meant to be viewed from INSIDE the sphere, so increasing
+        # image-x must swing the ray to the VIEWER's right; facing +Z with +Y up
+        # in this right-handed world, the viewer's right is -X (right x up =
+        # -forward — the very left-handedness ARKIT_TO_PROJ encodes). With
+        # +sin(lon) the grid disagrees with every det = -1 R_proj, which
+        # mirrors each frame's sampling AND reverses the order the frames are
+        # laid out in: the horizontally-mirrored pano that shipped until
+        # 2026-09-17 (text in the scene came out mirror-written).
         v = (np.arange(r0, r1) + 0.5) / h
         lat = (0.5 - v) * math.pi  # +pi/2..-pi/2
         clat = np.cos(lat)
-        dx = (clat[:, None] * sin_lon[None, :]).astype(np.float32)
+        dx = (-clat[:, None] * sin_lon[None, :]).astype(np.float32)
         dy = np.repeat(np.sin(lat).astype(np.float32), w)
         dz = (clat[:, None] * cos_lon[None, :]).astype(np.float32)
         d = np.stack([dx.ravel(), dy, dz.ravel()], 0)  # 3 x n

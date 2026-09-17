@@ -9,6 +9,13 @@ being the OLD code. Everything it needs (load_frame, upright, rmat,
 derive_pose_rotation, focals_from_intrinsics, nominal_angles, count_frames, die,
 progress, log and the tuning constants) is imported from the live module, so the
 comparison isolates the one thing that changed: how the equirect is traversed.
+
+ONE documented exception to that rule: the two lines that carry a COORDINATE
+CONVENTION — the ray grid's `dx` sign and the nominal path's FLIP_RIGHT — were
+re-synced with production on 2026-09-17 when the horizontal-mirror bug was
+fixed. They are inputs to the comparison, not part of the traversal being
+compared; leaving them stale would turn this equivalence proof into a (failing)
+assertion about the projection convention instead.
 """
 
 import math
@@ -21,6 +28,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "stitcher"))
 
 from reproject import (  # noqa: E402
+    FLIP_RIGHT,
     POLE_BOOST,
     POLE_LAT_DEG,
     REMAP_CHUNK,
@@ -49,7 +57,7 @@ def build(width, frames_dir, poses, yaw_dir, pitch_sign, hfov_deg, power=2.0):
     lat = (0.5 - v) * math.pi  # +pi/2..-pi/2
     lon2, lat2 = np.meshgrid(lon, lat)
     clat = np.cos(lat2)
-    dx = (clat * np.sin(lon2)).astype(np.float32)
+    dx = (-clat * np.sin(lon2)).astype(np.float32)  # convention, re-synced 2026-09-17
     dy = (np.sin(lat2)).astype(np.float32)
     dz = (clat * np.cos(lon2)).astype(np.float32)
     d = np.stack([dx.ravel(), dy.ravel(), dz.ravel()], 0)  # 3 x N
@@ -103,7 +111,8 @@ def build(width, frames_dir, poses, yaw_dir, pitch_sign, hfov_deg, power=2.0):
             label = f"pose(lat={fwd_lat:.0f})"
         else:
             yaw, pitch, roll = angles[i]
-            r_proj = rmat(yaw, pitch, roll).T  # world -> camera
+            # world -> projection camera (convention, re-synced 2026-09-17).
+            r_proj = FLIP_RIGHT @ rmat(yaw, pitch, roll).T
             focal_x = focal_y = (wf / 2.0) / math.tan(math.radians(hfov_deg) / 2.0)
             # Pattern-independent pole detection (zenith/nadir at +/-90).
             is_pole = abs(pitch) > POLE_LAT_DEG
