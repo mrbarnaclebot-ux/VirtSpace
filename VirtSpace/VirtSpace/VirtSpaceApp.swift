@@ -17,6 +17,9 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
+        // Never under XCTest: a hosted test run launches this app, and a test
+        // must not reclaim (or start) real upload traffic — see TestEnvironment.
+        guard !TestEnvironment.isRunningUnderXCTest else { return true }
         // Reconnect to the background session at launch so tasks that completed
         // out-of-process (app was suspended/killed mid-upload) are reclaimed.
         BackgroundUploadCoordinator.shared.activate()
@@ -55,8 +58,10 @@ struct VirtSpaceApp: App {
         // flagged uploaded by going straight to frames:done — recovery for
         // flows that died between the last frame PUT and frames:done. The
         // flow is app-scoped (UploadManager), never tied to a view.
+        // Skipped entirely under XCTest: the hosted test bundle launches this
+        // app, and this kick mints/completes REAL worlds (TestEnvironment).
         .onChange(of: scenePhase, initial: true) { _, phase in
-            if phase == .active {
+            if phase == .active, !TestEnvironment.isRunningUnderXCTest {
                 UploadManager.shared.kickStrandedRecovery(api: apiClient)
             }
         }

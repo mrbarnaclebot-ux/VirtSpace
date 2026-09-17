@@ -163,6 +163,8 @@ struct LibraryView: View {
     // MARK: - Data
 
     private func refresh(showErrors: Bool) async {
+        // No backend calls from a hosted test run (TestEnvironment).
+        guard !TestEnvironment.isRunningUnderXCTest else { return }
         if isLoading { return }
         isLoading = true
         defer { isLoading = false }

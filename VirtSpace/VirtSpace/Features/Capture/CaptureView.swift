@@ -371,6 +371,8 @@ struct CaptureView: View {
     /// Retry any capture sessions stranded on disk by a crash or failed upload.
     /// The flow itself is app-scoped (UploadManager); this await is UI-only.
     private func resumePendingOnce() async {
+        // A hosted test run launches this app; resuming would upload for real.
+        guard !TestEnvironment.isRunningUnderXCTest else { return }
         guard !didResumePending else { return }
         didResumePending = true
         let outcome = await UploadManager.shared.kickResume(api: api).value
@@ -393,6 +395,8 @@ struct CaptureView: View {
     /// persist to disk and upload retries), so a flaky quota check must never
     /// stop someone from capturing — see startCapture()'s fail-open branch.
     private func refreshQuota() async {
+        // No backend calls from a hosted test run (TestEnvironment).
+        guard !TestEnvironment.isRunningUnderXCTest else { return }
         do {
             let q = try await api.quota()
             scansRemaining = q.scansRemaining

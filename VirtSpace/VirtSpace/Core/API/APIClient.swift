@@ -36,7 +36,7 @@ final class APIClient {
         // Hosted unit tests launch the real app process. Pin them to localhost
         // so nothing a test does can reach a deployed backend, and so the
         // production guard below can never fatalError the test host.
-        if isRunningUnderXCTest { return localBaseURL }
+        if TestEnvironment.isRunningUnderXCTest { return localBaseURL }
         if let override = ProcessInfo.processInfo.environment["VIRTSPACE_API_BASE_URL"],
            !override.isEmpty {
             return guardAgainstProduction(override)
@@ -48,11 +48,6 @@ final class APIClient {
     }
 
     #if DEBUG
-    /// True when the process was launched by XCTest (hosted test bundle).
-    static var isRunningUnderXCTest: Bool {
-        ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
-    }
-
     /// Production-data guard (spec §10 R5). A DEBUG **simulator** run that
     /// resolves to the production host is an accident in nearly every case —
     /// agent/QA sim runs have previously written real frames into the owner's
