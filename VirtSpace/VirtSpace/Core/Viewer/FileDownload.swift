@@ -48,7 +48,9 @@ enum FileDownload {
 
 /// Per-download delegate. One session per download, invalidated on completion
 /// (a URLSession strongly retains its delegate until then).
-private final class DownloadDelegate: NSObject, URLSessionDownloadDelegate {
+/// Delegate callbacks land on the session's own `delegateQueue`; `continuation`
+/// and `session` are guarded by `lock`, and the rest is immutable.
+private nonisolated final class DownloadDelegate: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
     private let destination: URL
     private let progress: @Sendable (Double) -> Void
     private let lock = NSLock()
