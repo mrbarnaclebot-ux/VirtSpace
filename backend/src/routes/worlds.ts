@@ -77,6 +77,12 @@ export const framesDoneBody = z
 // larger with a clean 413 instead of buffering unbounded JSON.
 const FRAMES_DONE_BODY_LIMIT = 256 * 1024;
 
+/** GET /v1/worlds pagination. Exported so the 400 contract is directly testable. */
+export const listQuery = z.object({
+  limit: z.coerce.number().int().min(1).max(100).default(20),
+  offset: z.coerce.number().int().min(0).default(0),
+});
+
 function requireUserId(req: FastifyRequest, reply: FastifyReply): string | null {
   if (!req.userId) {
     reply.code(401).send({ error: 'unauthenticated' });
@@ -347,12 +353,16 @@ export function worldsRoutes(app: FastifyInstance, deps: RouteDeps): void {
   app.get('/v1/worlds', async (req, reply) => {
     const userId = requireUserId(req, reply);
     if (!userId) return;
-    const q = z
-      .object({
-        limit: z.coerce.number().int().min(1).max(100).default(20),
-        offset: z.coerce.number().int().min(0).default(0),
-      })
-      .parse(req.query);
+    // safeParse, not parse: `?limit=abc` used to throw a ZodError out of the
+    // handler and surface as a 500 (spec §10 R10). A malformed query string is
+    // the client's mistake, and the 3 s Library poll must see a clean 400.
+    const parsedQuery = listQuery.safeParse(req.query);
+    if (!parsedQuery.success) {
+      return reply
+        .code(400)
+        .send({ error: 'invalid_query', issues: parsedQuery.error.issues });
+    }
+    const q = parsedQuery.data;
     const db = getDb();
     const rows = await db
       .select()

@@ -1,5 +1,5 @@
 import { pathToFileURL } from 'node:url';
-import Fastify, { type FastifyInstance } from 'fastify';
+import Fastify, { type FastifyError, type FastifyInstance } from 'fastify';
 import { getConfig } from './config.js';
 import { closeDb } from './db/client.js';
 import { createStorage } from './storage/index.js';
@@ -11,9 +11,48 @@ import { registerRoutes } from './routes/index.js';
 export async function buildServer(): Promise<FastifyInstance> {
   const config = getConfig();
   const app = Fastify({ logger: true });
+  installErrorHandler(app);
   const storage = createStorage(config);
   await registerRoutes(app, { config, storage });
   return app;
+}
+
+/**
+ * Last-resort error handler (spec §10 R10).
+ *
+ * Anything that escapes a handler used to be serialized by Fastify's default,
+ * which echoes `err.message` to the client — a Postgres error carries table and
+ * column names, a ZodError carries the whole issue tree. Those describe our
+ * schema to anyone who can provoke a 500.
+ *
+ * So: log the real error server-side, return a generic body. Client errors
+ * (4xx) are the caller's own mistake and their messages are Fastify's, not the
+ * database's, so they keep their status and a safe message — a 413 that says
+ * only "internal_error" would be actively unhelpful.
+ *
+ * Exported for tests.
+ */
+export function installErrorHandler(app: FastifyInstance): void {
+  app.setErrorHandler((rawErr: unknown, req, reply) => {
+    const err = rawErr as FastifyError;
+    const status = err.statusCode ?? 500;
+
+    if (status >= 500) {
+      req.log.error({ err, url: req.url, method: req.method }, 'unhandled request error');
+      return reply.code(500).send({ error: 'internal_error' });
+    }
+
+    req.log.warn(
+      { code: err.code, status, url: req.url, method: req.method },
+      'request rejected',
+    );
+    return reply.code(status).send({
+      // Fastify's own machine-readable code (FST_ERR_CTP_BODY_TOO_LARGE, …),
+      // falling back to the generic label the routes already use.
+      error: err.code ?? 'bad_request',
+      message: err.message,
+    });
+  });
 }
 
 /**
