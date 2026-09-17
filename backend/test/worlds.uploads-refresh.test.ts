@@ -154,10 +154,12 @@ describe('POST /v1/worlds/:id/uploads:refresh', () => {
     expect(body.uploads[0].url).toBe('https://signed.example/captures/cap-1/frame_0.heic');
     // Presigned with the same content-type + ceiling as create.
     expect(storage.presignUpload).toHaveBeenCalledTimes(3);
+    // No `frames` declaration in the body → no exact size to bind (§10 R7).
     expect(storage.presignUpload).toHaveBeenCalledWith(
       'captures/cap-1/frame_0.heic',
       'image/heic',
       12 * 1024 * 1024,
+      undefined,
     );
     await app.close();
   });

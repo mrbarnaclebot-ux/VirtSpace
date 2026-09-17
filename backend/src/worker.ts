@@ -17,7 +17,7 @@ import {
   setProviderOperationId,
 } from './queue.js';
 import { reserveCredits, BudgetExceededError } from './budget.js';
-import { createStorage, type StorageDriver } from './storage/index.js';
+import { createStorage, MAX_FRAME_BYTES, type StorageDriver } from './storage/index.js';
 import {
   createProvider,
   ProviderError,
@@ -552,6 +552,33 @@ async function stillHoldsLease(deps: WorkerDeps, jobId: string): Promise<boolean
   }
 }
 
+/**
+ * Mandatory server-side frame size guard (spec §10 R7). Presigning can only bind
+ * a size when the client declared one, and a bucket policy may or may not exist,
+ * so the worker ALWAYS HEADs a frame before reading it: an oversized object
+ * would otherwise be pulled into worker memory in full (frames are read into RAM
+ * and an 8192-wide stitch already peaks >1.5 GB, §10 R8). Oversize is
+ * non-retryable — the object will not shrink on a retry.
+ */
+async function readFrameWithinCap(storage: StorageDriver, key: string): Promise<Buffer> {
+  let size: number;
+  try {
+    size = await storage.objectSize(key);
+  } catch (err) {
+    // Missing/unreadable frame: the capture is unusable, and retrying a HEAD
+    // that failed because the object isn't there cannot help.
+    throw new NonRetryableJobError(
+      `frame ${key} could not be sized (missing or unreadable): ${String(err)}`,
+    );
+  }
+  if (size > MAX_FRAME_BYTES) {
+    throw new NonRetryableJobError(
+      `frame ${key} is ${size} bytes, over the ${MAX_FRAME_BYTES}-byte cap; refusing to read it`,
+    );
+  }
+  return storage.getObject(key);
+}
+
 async function loadWorld(db: Db, worldId: string): Promise<World> {
   const [world] = await db.select().from(worlds).where(eq(worlds.id, worldId)).limit(1);
   if (!world) throw new NonRetryableJobError(`world not found: ${worldId}`);
@@ -650,7 +677,7 @@ export async function handleStitch(deps: WorkerDeps, job: Job): Promise<void> {
 
   if (plan.type === 'passthrough') {
     // Passthrough: the lone frame IS the pano. NOTE v0 limitation — no transcode.
-    const frameBytes = await storage.getObject(`${framePrefix}/frame_0.heic`);
+    const frameBytes = await readFrameWithinCap(storage, `${framePrefix}/frame_0.heic`);
     await storage.putObject(panoKey, frameBytes);
     await finalizeStitch(db, world.id, panoKey);
     await completeJob(db, job.id);
@@ -664,7 +691,7 @@ export async function handleStitch(deps: WorkerDeps, job: Job): Promise<void> {
     const framesDir = path.join(workDir, 'frames');
     await mkdir(framesDir, { recursive: true });
     for (let i = 0; i < capture.frameCount; i++) {
-      const bytes = await storage.getObject(`${framePrefix}/frame_${i}.heic`);
+      const bytes = await readFrameWithinCap(storage, `${framePrefix}/frame_${i}.heic`);
       await writeFile(path.join(framesDir, `frame_${i}.jpg`), bytes);
     }
 

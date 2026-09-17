@@ -5,10 +5,9 @@ import { getDb } from '../db/client.js';
 import { captures, users, worlds, type World } from '../db/schema.js';
 import { enqueue } from '../queue.js';
 import { evaluateQuota } from '../quota.js';
-import type { StorageDriver } from '../storage/index.js';
+import { MAX_FRAME_BYTES, type StorageDriver } from '../storage/index.js';
 import type { RouteDeps } from './deps.js';
 
-const MAX_FRAME_BYTES = 12 * 1024 * 1024; // per-frame ceiling (spec §8).
 const DOWNLOAD_TTL_SECONDS = 3600;
 
 // Asset columns that hold a storage key → the JSON field name we sign into.
@@ -21,12 +20,38 @@ const ASSET_FIELDS = [
   ['colliderGlbUrl', 'collider_glb_url'],
 ] as const;
 
+/**
+ * Optional per-frame size declaration (spec §10 R7). The capture app knows each
+ * frame's exact byte length at create time (the files are already on disk), so
+ * declaring it lets the backend SIGN Content-Length into that frame's presigned
+ * URL — the object store then rejects anything larger. The field is optional so
+ * the shipped client keeps working; the worker-side guard covers it either way.
+ */
+const frameSizeSchema = z.object({
+  index: z.number().int().min(0).max(63),
+  bytes: z.number().int().positive().max(MAX_FRAME_BYTES),
+});
+
 const createBody = z.object({
   title: z.string().max(200).optional(),
   lat: z.number().min(-90).max(90).optional(),
   lng: z.number().min(-180).max(180).optional(),
   frame_count: z.number().int().min(1).max(64),
+  frames: z.array(frameSizeSchema).max(64).optional(),
 });
+
+/** Same optional declaration on the resume path. Body may be absent entirely. */
+export const refreshUploadsBody = z
+  .object({ frames: z.array(frameSizeSchema).max(64).optional() })
+  .optional()
+  .nullable();
+
+/** index → exact byte size, from an optional `frames` declaration. */
+export function frameSizeMap(
+  frames?: { index: number; bytes: number }[],
+): Map<number, number> {
+  return new Map((frames ?? []).map((f) => [f.index, f.bytes]));
+}
 
 // Per-frame ARKit pose sent by the capture app on frames:done. `.passthrough()`
 // keeps unknown extra fields so poses_json stores what the client sent
@@ -162,8 +187,14 @@ export function worldsRoutes(app: FastifyInstance, deps: RouteDeps): void {
       .set({ r2FramesPrefix: prefix })
       .where(eq(captures.id, capture!.id));
 
-    // Presign one upload URL per frame.
-    const uploads = await presignFrameUploads(storage, prefix, body.frame_count);
+    // Presign one upload URL per frame, binding Content-Length for every frame
+    // whose exact size the client declared (spec §10 R7).
+    const uploads = await presignFrameUploads(
+      storage,
+      prefix,
+      body.frame_count,
+      frameSizeMap(body.frames),
+    );
 
     return reply.code(201).send({
       world: serializeWorld(world!),
@@ -182,6 +213,15 @@ export function worldsRoutes(app: FastifyInstance, deps: RouteDeps): void {
     async (req, reply) => {
       const userId = requireUserId(req, reply);
       if (!userId) return;
+
+      // Optional per-frame size declaration, same contract as create (§10 R7).
+      const parsedBody = refreshUploadsBody.safeParse(req.body ?? undefined);
+      if (!parsedBody.success) {
+        return reply
+          .code(400)
+          .send({ error: 'invalid_body', issues: parsedBody.error.issues });
+      }
+
       const db = getDb();
       const world = await findOwnedWorld(db, req.params.id, userId);
       if (!world) return reply.code(404).send({ error: 'world_not_found' });
@@ -201,6 +241,7 @@ export function worldsRoutes(app: FastifyInstance, deps: RouteDeps): void {
         storage,
         capture.r2FramesPrefix,
         capture.frameCount,
+        frameSizeMap(parsedBody.data?.frames),
       );
       return reply.send({
         world: serializeWorld(world),
@@ -361,13 +402,19 @@ async function presignFrameUploads(
   storage: StorageDriver,
   prefix: string,
   frameCount: number,
+  sizes: Map<number, number> = new Map(),
 ): Promise<
   Array<{ index: number; key: string } & Awaited<ReturnType<StorageDriver['presignUpload']>>>
 > {
   return Promise.all(
     Array.from({ length: frameCount }, async (_v, i) => {
       const key = `${prefix}/frame_${i}.heic`;
-      const presigned = await storage.presignUpload(key, 'image/heic', MAX_FRAME_BYTES);
+      const presigned = await storage.presignUpload(
+        key,
+        'image/heic',
+        MAX_FRAME_BYTES,
+        sizes.get(i),
+      );
       return { index: i, key, ...presigned };
     }),
   );

@@ -37,12 +37,20 @@ export function createLocalStorage(config: Config): LocalStorage {
     resolvePath,
     maxBytesFor: (key) => limits.get(key),
 
-    async presignUpload(key, _contentType, maxBytes): Promise<PresignedUpload> {
-      limits.set(key, maxBytes);
+    async presignUpload(key, _contentType, maxBytes, exactBytes): Promise<PresignedUpload> {
+      // Mirror the S3 driver's ceiling semantics (spec §10 R7): a declared exact
+      // size is the tighter limit the /dev-storage PUT route enforces.
+      const limit =
+        typeof exactBytes === 'number' && exactBytes > 0 && exactBytes <= maxBytes
+          ? exactBytes
+          : maxBytes;
+      limits.set(key, limit);
+      const headers: Record<string, string> = { 'content-type': _contentType };
+      if (limit === exactBytes) headers['content-length'] = String(exactBytes);
       return {
         url: `${base}/dev-storage/${key}`,
         method: 'PUT',
-        headers: { 'content-type': _contentType },
+        headers,
       };
     },
 
@@ -62,6 +70,11 @@ export function createLocalStorage(config: Config): LocalStorage {
 
     async deleteObject(key): Promise<void> {
       await fs.rm(resolvePath(key), { force: true });
+    },
+
+    async objectSize(key): Promise<number> {
+      const st = await fs.stat(resolvePath(key));
+      return st.size;
     },
   };
 }

@@ -328,6 +328,7 @@ function fakeStorage() {
     putObject: vi.fn(async (key: string) => { puts.push(key); }),
     getObject: vi.fn(async (key: string) => { gets.push(key); return Buffer.from(`bytes:${key}`); }),
     deleteObject: vi.fn(),
+    objectSize: vi.fn(async () => 1024),
   } as unknown as StorageDriver;
   return { storage, puts, gets };
 }

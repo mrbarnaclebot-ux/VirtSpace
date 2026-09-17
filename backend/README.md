@@ -81,7 +81,8 @@ test/                vitest: config, storage, auth, quota/backoff
 - `GET  /healthz` — liveness, no auth, no DB.
 - `POST /v1/worlds` — create world (`status=uploading`) + capture; returns N
   presigned frame upload URLs (`captures/{captureId}/frame_{i}.heic`). Enforces
-  the daily scan quota.
+  the daily scan quota. Optional `frames: [{ index, bytes }]` declares each
+  frame's exact size (see [Upload size caps](#upload-size-caps-spec-10-r7)).
 - `POST /v1/worlds/:id/frames:done` — verify ownership, set `status=stitching`,
   enqueue a `stitch` job. Optionally accepts
   `{ poses: [{ index, timestamp, transform[16], intrinsics[9], exposureLocked }] }`
@@ -102,6 +103,29 @@ test/                vitest: config, storage, auth, quota/backoff
 - `DELETE /v1/account` — soft-delete the user's worlds (+ enqueue purges), delete
   devices, mark the user deleted. **After deletion every authenticated request
   from that identity is `403 {"error":"account_deleted"}`** — see below.
+
+### Upload size caps (spec §10 R7)
+
+`s3.presignUpload` used to take a `_maxBytes` argument and ignore it, so a
+presigned frame URL accepted an object of any size. Enforcement is now layered:
+
+1. **Request validation** — `POST /v1/worlds` and `POST /v1/worlds/:id/uploads:refresh`
+   accept an optional `frames: [{ index, bytes }]` array. Any `bytes` above the
+   12 MB `MAX_FRAME_BYTES` ceiling is rejected with `400 invalid_body`.
+2. **Signed Content-Length** — for every frame whose exact size was declared, the
+   S3/R2 driver signs `ContentLength` into the presigned URL (`signableHeaders`
+   includes `content-length`) and returns a `content-length` response header
+   beside `content-type`; the object store then rejects a payload of any other
+   length. SigV4 can bind only an *exact* length, never a ceiling, which is why
+   the declaration is needed. The local dev driver mirrors this by tightening its
+   per-key PUT limit. Undeclared frames sign exactly as before.
+3. **Worker-side guard (always on)** — `handleStitch` HEADs every frame
+   (`storage.objectSize`) before reading it and fails **non-retryably** if it is
+   over the cap or unsizeable, so an oversized object is never pulled into worker
+   memory even when the client declared nothing.
+
+The `frames` field is optional, so the shipped iOS client keeps working
+unchanged; layer 3 is the guarantee.
 
 ### Account deletion semantics (spec §13 / §10 R3)
 

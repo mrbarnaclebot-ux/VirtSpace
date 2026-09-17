@@ -3,6 +3,7 @@ import {
   PutObjectCommand,
   GetObjectCommand,
   DeleteObjectCommand,
+  HeadObjectCommand,
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import type { Config } from '../config.js';
@@ -26,16 +27,30 @@ export function createS3Storage(config: Config): StorageDriver {
   return {
     kind: 's3',
 
-    async presignUpload(key, contentType, _maxBytes): Promise<PresignedUpload> {
-      // Note: byte-size ceilings are enforced with a bucket policy in prod;
-      // the presigner does not bind Content-Length here.
+    async presignUpload(key, contentType, maxBytes, exactBytes): Promise<PresignedUpload> {
+      // Size enforcement (spec §10 R7). SigV4 can only bind an EXACT
+      // Content-Length, not a ceiling, so:
+      //  - client declared its size → sign Content-Length into the URL; R2/S3
+      //    then rejects any payload of a different length outright.
+      //  - it didn't → nothing can be bound here, and the worker's mandatory
+      //    pre-read size check (handleStitch) is the backstop.
+      // `maxBytes` is validated by the route before we ever get here.
+      const signExact = typeof exactBytes === 'number' && exactBytes > 0 && exactBytes <= maxBytes;
       const cmd = new PutObjectCommand({
         Bucket: bucket,
         Key: key,
         ContentType: contentType,
+        ...(signExact ? { ContentLength: exactBytes } : {}),
       });
-      const url = await getSignedUrl(client, cmd, { expiresIn: 900 });
-      return { url, method: 'PUT', headers: { 'content-type': contentType } };
+      const url = await getSignedUrl(client, cmd, {
+        expiresIn: 900,
+        // content-length must be named explicitly: the presigner signs only
+        // `host` by default, so an unlisted header is not bound to the URL.
+        ...(signExact ? { signableHeaders: new Set(['content-length']) } : {}),
+      });
+      const headers: Record<string, string> = { 'content-type': contentType };
+      if (signExact) headers['content-length'] = String(exactBytes);
+      return { url, method: 'PUT', headers };
     },
 
     async presignDownload(key, ttlSeconds): Promise<string> {
@@ -62,6 +77,18 @@ export function createS3Storage(config: Config): StorageDriver {
       await client.send(
         new DeleteObjectCommand({ Bucket: bucket, Key: key }),
       );
+    },
+
+    async objectSize(key): Promise<number> {
+      // HEAD, not GET — the caller is deciding whether the object is safe to
+      // read into memory at all (spec §10 R7).
+      const res = await client.send(
+        new HeadObjectCommand({ Bucket: bucket, Key: key }),
+      );
+      if (typeof res.ContentLength !== 'number') {
+        throw new Error(`HEAD ${key} returned no ContentLength`);
+      }
+      return res.ContentLength;
     },
   };
 }
