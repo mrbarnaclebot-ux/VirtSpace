@@ -129,14 +129,22 @@ struct CaptureView: View {
                     .font(.subheadline)
                     .foregroundStyle(.white.opacity(0.7))
             }
-        case .ready, .capturing, .advancing:
+        case .ready, .capturing, .advancing, .finished:
+            // ONE structural identity for the camera layer across all four
+            // live states. Splitting `.finished` into its own branch used to
+            // give the camera layer a different position in the view tree, so
+            // the `.advancing → .finished` transition made SwiftUI tear down
+            // the ARSCNView and build a fresh one — against an ARSession the
+            // engine is pausing at that very moment (crash, see
+            // CameraPreviewView) — and threw away the painted quads with the
+            // old coordinator. The HUD is still hidden in `.finished`; the
+            // upload overlay (top-level ZStack) covers that state.
             ZStack {
                 cameraLayer
-                CaptureHUDView(hud: hud, onCancel: { engine.cancel() })
+                if !hud.state.isFinished {
+                    CaptureHUDView(hud: hud, onCancel: { engine.cancel() })
+                }
             }
-        case .finished:
-            // The upload overlay (top-level ZStack) covers this state.
-            cameraLayer
         }
     }
 

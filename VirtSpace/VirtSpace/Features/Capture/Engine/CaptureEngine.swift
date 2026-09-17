@@ -36,6 +36,14 @@ enum CaptureEngineState: Equatable {
     case advancing
     case finished(CaptureResult)
     case failed(String)
+
+    /// Payload-free `.finished` test, for view code that has to branch on the
+    /// state without binding the result (`if case` doesn't compose inside a
+    /// ViewBuilder condition).
+    var isFinished: Bool {
+        if case .finished = self { return true }
+        return false
+    }
 }
 
 /// A completed full-sphere capture (28 frames), persisted on disk and ready to upload.
