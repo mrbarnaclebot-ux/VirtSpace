@@ -7,8 +7,11 @@
 # The worker shells out to stitcher/reproject.py, so this image ships Python 3 +
 # numpy + opencv-python-headless alongside Node. The API service never invokes
 # Python but shares the same image for operational simplicity.
+#
+# Node 24 matches package.json `engines: >=24`. The image shipped Node 22 while
+# the app declared 24, so nothing ever ran on the version we claim to target.
 
-FROM node:22-slim
+FROM node:24-slim
 
 # --- OS deps: Python + pip (opencv-headless needs libGL/libglib at runtime) ---
 RUN apt-get update && apt-get install -y --no-install-recommends \
