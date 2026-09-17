@@ -23,3 +23,6 @@ __pycache__/
 
 # iOS local secrets (template: Secrets.swift.example)
 VirtSpace/VirtSpace/**/Secrets.swift
+
+# graphify knowledge-graph output (regenerate with /graphify)
+graphify-out/
