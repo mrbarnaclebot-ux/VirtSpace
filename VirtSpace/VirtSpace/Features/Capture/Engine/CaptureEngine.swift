@@ -173,12 +173,12 @@ final class CaptureEngine {
     @ObservationIgnored private var smoothedRate: Double = 0
     @ObservationIgnored private var dwell = DwellTracker()
     @ObservationIgnored private var firstShotPosition: simd_float3?
-    @ObservationIgnored private var exposureLockedInternal = false
     /// Transient (non-pose) warnings stay visible this long (engine queue).
     @ObservationIgnored private var transientWarning: (text: String, until: TimeInterval)?
 
-    /// Background queue for downscaling paint thumbnails — never the main actor.
-    @ObservationIgnored private let thumbnailQueue = DispatchQueue(label: "com.virtspace.capture-thumbnails", qos: .utility)
+    /// Takes, persists and post-processes one still per fired dwell, and
+    /// reports the outcome back here (see ShotPipeline).
+    @ObservationIgnored private let shots: ShotPipeline
 
     /// Thermal mitigation: owns the thermal observer, the cool-down pause and
     /// the pure state→policy mapping (see ThermalGovernor).
@@ -193,6 +193,22 @@ final class CaptureEngine {
         self.queue = queue
         self.store = store
         self.thermal = ThermalGovernor(queue: queue)
+        self.shots = ShotPipeline(store: store, queue: queue)
+
+        // Wire the shot pipeline to this engine's session. `onPaintedShot`
+        // lands on the pipeline's thumbnail queue; the rest is engine queue.
+        shots.isCapturing = { [weak self] in self?.running ?? false }
+        shots.lockCameraSettings = { [weak self] in self?.source?.lockCameraSettings() ?? false }
+        shots.onExposureLock = { [weak self] locked in
+            self?.publish { $0.exposureLocked = locked }
+        }
+        shots.onPaintedShot = { [weak self] shot in
+            self?.publish { hud in
+                if !hud.paintedShots.contains(where: { $0.index == shot.index }) {
+                    hud.paintedShots.append(shot)
+                }
+            }
+        }
 
         // Wire the governor to this engine's session. Every hook below is
         // invoked on `queue`, where the engine's own state already lives.
@@ -313,7 +329,7 @@ final class CaptureEngine {
         smoothedRate = 0
         dwell.reset()
         firstShotPosition = nil
-        exposureLockedInternal = false
+        shots.reset()
         transientWarning = nil
         thermal.reset()
         throttle.reset()
@@ -458,83 +474,33 @@ final class CaptureEngine {
         let index = currentIndex
         publish { $0.state = .capturing(targetIndex: index) }
 
-        source.captureStill { [weak self] result in
-            guard let self else { return }
-            self.queue.async { self.handleStill(result, index: index, session: session) }
+        shots.take(index: index, from: source, into: session, totalTargets: targets.count) { [weak self] outcome in
+            self?.handleShot(outcome, session: session)
         }
     }
 
-    private func handleStill(_ result: Result<CapturedStill, Error>, index: Int, session: CaptureStore.Session) {
-        guard running else { return }
+    /// Engine queue: fold one shot's outcome back into the walk-around.
+    private func handleShot(_ outcome: ShotOutcome, session: CaptureStore.Session) {
+        switch outcome {
+        case .saveFailed(_, let message):
+            fail(message)
 
-        switch result {
-        case .failure(let error):
+        case .failed(let index, let message):
             // One missed shot shouldn't kill a 28-shot walk-around: surface it
             // and let the dwell re-fire on the same target.
             isTakingStill = false
             dwell.reset()
-            let text = "Shot failed — hold on the target again (\(error.localizedDescription))"
-            transientWarning = (text, (previousTimestamp ?? 0) + 3.0)
+            transientWarning = (message, (previousTimestamp ?? 0) + 3.0)
             publish {
-                $0.warning = text
+                $0.warning = message
                 $0.state = .ready(targetIndex: index)
             }
 
-        case .success(let still):
-            let pose = CaptureStore.FramePose(
-                index: index,
-                timestamp: still.timestamp,
-                transform: still.transform,
-                intrinsics: still.intrinsics,
-                exposureLocked: exposureLockedInternal
-            )
-            do {
-                try store.saveFrame(still.jpegData, pose: pose, in: session)
-            } catch {
-                fail("Couldn't save frame \(index + 1): \(error.localizedDescription)")
-                return
-            }
-            AppLog.capture.log("Shot \(index + 1)/\(self.targets.count) saved")
-
-            // Paint the sphere (Stage B3 deliverable 1): downscale the JPEG to a
-            // ~512 px thumbnail off the main actor, then publish a PaintedShot
-            // carrying the CAPTURED transform + intrinsics for the camera layer
-            // to hang a quad in that direction.
-            let jpeg = still.jpegData
-            let paintTransform = still.transform
-            let paintIntrinsics = still.intrinsics
-            thumbnailQueue.async { [weak self] in
-                guard let self, let thumb = Self.makePaintThumbnail(from: jpeg, maxDimension: 512) else { return }
-                let shot = PaintedShot(index: index, transform: paintTransform, intrinsics: paintIntrinsics, thumbnail: thumb)
-                self.publish { engine in
-                    if !engine.paintedShots.contains(where: { $0.index == index }) {
-                        engine.paintedShots.append(shot)
-                    }
-                }
-            }
-
-            // First shot: pin the pivot origin and lock AE/AWB/AF so the
-            // remaining 15 frames match (spec §9: exposure/WB seams).
+        case .saved(let index, let transform):
+            // First shot pins the pivot origin for parallax coaching (the
+            // exposure lock is the pipeline's half of the same rule).
             if index == 0 {
-                firstShotPosition = AlignmentMath.position(of: still.transform)
-                exposureLockedInternal = source?.lockCameraSettings() ?? false
-                let locked = exposureLockedInternal
-                publish { $0.exposureLocked = locked }
-            }
-
-            Task { @MainActor in
-                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-            }
-            // Ring-completion celebrations, derived from TargetLayout's ring
-            // sizes (11 / 19 / 25 in today's 28-target pattern). These used to
-            // be the literals 7/11/13 from the dead 16-target layout, so two
-            // of the three fired mid-ring and the horizon ring never
-            // celebrated at all. The final shot's success haptic fires below
-            // with `.finished`.
-            if TargetLayout.ringCompletionIndices.contains(index) {
-                Task { @MainActor in
-                    UINotificationFeedbackGenerator().notificationOccurred(.success)
-                }
+                firstShotPosition = AlignmentMath.position(of: transform)
             }
 
             currentIndex += 1
@@ -555,9 +521,7 @@ final class CaptureEngine {
                     $0.capturedFlags[index] = true
                     $0.state = .finished(result)
                 }
-                Task { @MainActor in
-                    UINotificationFeedbackGenerator().notificationOccurred(.success)
-                }
+                ShotPipeline.celebrationHaptic()
             } else {
                 publish {
                     $0.capturedFlags[index] = true
@@ -572,23 +536,6 @@ final class CaptureEngine {
                 }
             }
         }
-    }
-
-    // MARK: - Paint thumbnails
-
-    /// Downscale JPEG data to a thumbnail no larger than `maxDimension` on its
-    /// long edge, using ImageIO so we never fully decode the full-res image.
-    /// Runs on `thumbnailQueue` (utility QoS) — never the main actor.
-    private static func makePaintThumbnail(from data: Data, maxDimension: CGFloat) -> UIImage? {
-        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
-        let options: [CFString: Any] = [
-            kCGImageSourceCreateThumbnailFromImageAlways: true,
-            kCGImageSourceCreateThumbnailWithTransform: true,
-            kCGImageSourceThumbnailMaxPixelSize: maxDimension,
-            kCGImageSourceShouldCacheImmediately: true
-        ]
-        guard let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
-        return UIImage(cgImage: cg)
     }
 
     // MARK: - Publishing
