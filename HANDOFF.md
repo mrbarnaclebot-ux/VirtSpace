@@ -45,6 +45,8 @@ Everything through R17 is live. Verified: image builds (first ever), `/healthz` 
 - **Incident (orchestrator error, no data lost):** `DATABASE_URL` is Neon's **pgbouncer pooler**. A "safety" `SET default_transaction_read_only = on` in an ad-hoc inspection script leaked onto the shared pooled backend, so from ~23:35 to ~00:12 IST production writes on that backend failed (worker logged 27 `claim error`s; no jobs were queued in the window, nothing was lost). Fixed with `RESET`. **Never issue session-level `SET` through the pooler** — use `BEGIN READ ONLY` … `ROLLBACK`, or the direct (non-`-pooler`) host. Same caveat applies to `migrate.ts`'s session-scoped advisory lock: it is only reliable over the direct host.
 - The Railway project is linked from the session scratchpad only, not from the repo dir: pass `-p 1690518b-f063-41df-8839-19c0b00a33a1 -e production -s api|worker` to `railway up`.
 
+- **00:40 IST redeploy — R18 enhance fix live** (see spec §10 R18/R19): `POST /v1/worlds/{id}:enhance` now reaches the handler (probed with a non-existent id → `world_not_found`, no credits spent). A real HQ run (1500 credits) has not been done yet; watch `asset_version` going 1→2 and the app refetching the splat.
+
 The checklist below is kept for reference.
 
 ## NOT deployed — deploy checklist (owner's go-ahead required)
