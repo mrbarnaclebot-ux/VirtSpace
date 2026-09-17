@@ -1270,10 +1270,41 @@ async function main(): Promise<void> {
   };
   const handle = startWorker(deps);
 
+  // Graceful drain (spec §10 R10): stop CLAIMING, let the in-flight job finish.
+  //
+  // We explicitly do NOT try to hold the process open for a full generation.
+  // Railway's SIGTERM→SIGKILL window is short (tens of seconds) and a draft
+  // generation runs minutes, so outliving it is not on the table. Losing a job
+  // mid-flight is already safe: the operation id is persisted before the money
+  // call (§10 R1) and the lease expires so another worker re-claims and resumes
+  // (§10 R6). The grace window is for the cheap tail — a stitch about to upload,
+  // a finalize about to commit — not for the long poll.
+  let stopping = false;
   const shutdown = (sig: string) => {
-    console.log(`[worker] received ${sig}, draining...`);
+    if (stopping) return;
+    stopping = true;
+    console.log(
+      `[worker] received ${sig}: no longer claiming jobs, ` +
+        `finishing the in-flight one (grace ${config.SHUTDOWN_GRACE_MS}ms)`,
+    );
     handle.stop();
-    handle.done.then(() => closeDb()).finally(() => process.exit(0));
+
+    const hard = setTimeout(() => {
+      console.warn(
+        `[worker] grace deadline hit with a job still running; exiting. ` +
+          'Its lease will expire and another worker will resume it (§10 R6).',
+      );
+      process.exit(0);
+    }, config.SHUTDOWN_GRACE_MS);
+    hard.unref();
+
+    void handle.done
+      .then(() => closeDb())
+      .catch((err: unknown) => console.error(`[worker] drain error: ${String(err)}`))
+      .finally(() => {
+        clearTimeout(hard);
+        process.exit(0);
+      });
   };
   process.on('SIGINT', () => shutdown('SIGINT'));
   process.on('SIGTERM', () => shutdown('SIGTERM'));

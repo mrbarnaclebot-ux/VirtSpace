@@ -237,6 +237,26 @@ rollout, which is the point.
 > shipped idempotent-create path (spec §10 R4) reads. Set the pre-deploy command
 > **before** the next deploy so it lands.
 
+## Graceful shutdown (spec §10 R10)
+
+Both services handle `SIGTERM`/`SIGINT`, bounded by `SHUTDOWN_GRACE_MS`
+(default `20000`). Keep it **below** the platform's own SIGTERM→SIGKILL window.
+
+- **API** — `app.close()` (stop accepting, finish in-flight requests), *then*
+  the `pg` pool. That order matters: closing the pool first turns a request
+  that was about to succeed into a 500. A hard timer exits `1` if the drain
+  wedges, because a deploy that hangs forever is worse than a dropped straggler.
+- **Worker** — stops *claiming* immediately and lets the in-flight job run to
+  completion, exiting early once it finishes.
+
+The worker deliberately does **not** try to outlive `SIGKILL`. Railway's grace
+period is tens of seconds and a draft generation runs minutes, so a redeploy
+*will* interrupt live generations. That is safe by design rather than by luck:
+the provider operation id is persisted **before** the billable call (§10 R1) and
+the job lease expires so another worker re-claims and resumes it (§10 R6) — it
+never re-generates and never double-bills. The grace window exists for the cheap
+tail (a stitch about to upload, a finalize about to commit), not the long poll.
+
 ## Dev storage (`STORAGE_DRIVER=local`)
 
 The local driver mimics presigned object storage without any cloud dependency:

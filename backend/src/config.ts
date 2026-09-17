@@ -46,6 +46,12 @@ const baseSchema = z.object({
   // Worker loop poll interval (ms) between empty claim attempts (Stage 2).
   WORKER_POLL_MS: numberFromEnv(2000),
 
+  // Graceful shutdown budget (spec §10 R10). The API uses it as a hard ceiling
+  // on draining in-flight HTTP requests; the worker as the deadline it gives the
+  // in-flight job before exiting anyway. Keep it UNDER the platform's own
+  // SIGTERM→SIGKILL window — this cannot outlive SIGKILL and must not try.
+  SHUTDOWN_GRACE_MS: numberFromEnv(20000),
+
   // --- Pipeline progress + reaper --------------------------------------------
   // Expected wall-clock durations for generation pseudo-progress (the provider
   // exposes no real progress; progress = min(95, elapsed/expected*100)).
