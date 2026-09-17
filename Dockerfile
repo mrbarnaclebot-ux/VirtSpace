@@ -43,6 +43,16 @@ COPY backend/stitcher ./stitcher
 COPY backend/drizzle ./drizzle
 RUN npm run build && npm prune --omit=dev
 
+# --- Runtime user -------------------------------------------------------------
+# Drop root. The image ran as root purely by default, which is a free privilege
+# to give up: the API writes nothing to disk, and the worker only ever writes to
+# mkdtemp() directories under /tmp (world-writable), so nothing under /app needs
+# to be writable at runtime. `node` is the stock unprivileged user in the base
+# image. Ownership is fixed up so a future `npm` invocation can still read the
+# tree it inherits.
+RUN chown -R node:node /app
+USER node
+
 ENV NODE_ENV=production
 # SERVICE_ENTRY selects the entrypoint at runtime (server | worker).
 CMD ["npm", "start"]
