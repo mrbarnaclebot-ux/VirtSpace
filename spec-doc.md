@@ -309,6 +309,7 @@ Everything else scales cheaply: Neon scale-to-zero, serverless workers (jobs are
 | R11 | Stale pins: `jose` 5 (EOL), Docker `node:22` vs engines `>=24`, opencv/numpy, fastify/drizzle-kit patches | Upgrade |
 | R12 | iOS: ring haptics use the dead 16-target indices; one stuck background upload wedges all flows; byte-at-a-time asset downloads; SPZ re-read per range request; no WKWebView navigation policy; swallowed resume errors | Fix each (derive ring boundaries from `TargetLayout`; resource timeout + per-session chain; download tasks; cached mapped data; scheme allowlist) |
 | R13 | No iOS test target | Swift Testing target; move `CaptureEngine.debugValidation` into it; cover the uploader resume state machine, `APIError.isWorldGone`, manifest round-trip, range parsing |
+| — | **Status 2026-09-17:** ✅ landed on `main` with tests: R1, R2, R3, R4, R5, R6, R7, R9, R12, R13. ⏳ in progress: R8, R10, R11, R14. **Not yet deployed** — deploy prerequisites: set `ALLOW_DEV_AUTH=1` on Railway (api + worker) while production still runs dev auth, and apply migration `0003` (`worlds.client_request_id`) before the new API serves traffic. R1 caveat: the live `findWorldByDisplayName` listing endpoint shape is unverified against World Labs — a wrong guess degrades to a parked job, never a double bill. | |
 | R14 | Swift 5 language mode + default `MainActor` isolation while capture code runs on private queues — isolation is unchecked | Migrate to Swift 6 language mode; split `CaptureEngine` (HUD state, publish throttle, thermal governor, shot pipeline) |
 
 ---
