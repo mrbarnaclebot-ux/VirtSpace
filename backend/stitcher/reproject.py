@@ -28,7 +28,15 @@ Usage:
                [--width 8192] [--preview-out pano_preview.jpg]
 
 On success: prints progress lines to stdout and exits 0.
-On failure: prints a message to stderr and exits non-zero.
+On failure: prints a message to stderr and exits one of the EXIT_* codes below.
+The worker (src/worker.ts) classifies retryability from the CODE, never from the
+message text:
+
+  2 (EXIT_INPUT_ERROR)    the capture itself is unusable (undecodable/HEIC
+                          frames, no usable frames, bad args). Retrying the same
+                          payload can only fail again -> park the job dead.
+  1 (EXIT_INTERNAL_ERROR) anything else (failed write, unexpected exception).
+                          Possibly transient -> normal retry/backoff.
 """
 
 import argparse
@@ -65,6 +73,31 @@ REMAP_CHUNK = 8192  # cv2.remap 2D grid width cap (stay under SHRT_MAX).
 POLE_LAT_DEG = 60.0  # frames looking steeper than this get the pole weight boost.
 POLE_BOOST = 8.0
 
+# Hard ceiling on --width. 8192 is the product's pano width (spec §5); anything
+# larger is a misconfiguration that would blow the worker's memory budget, so we
+# refuse it up front instead of discovering it via an OOM-kill.
+MAX_WIDTH = 8192
+
+# Peak-RSS control. The equirect is filled in horizontal row BANDS: the ray grid
+# and the accumulators are sized per band instead of per sphere, so memory is
+# O(band) not O(width^2). 1 Mpx per band (128 rows at 8192 wide) keeps the
+# transient per-band arrays near 170 MB on top of the ~135 MB output pano +
+# coverage mask; measured whole-process peak at 8192x4096 is ~430 MB, against
+# ~4.5 GB for the pre-banding full-frame version.
+BAND_TARGET_PIXELS = 1024 * 1024
+
+# --- Exit codes (see the module docstring; mirrored in src/worker.ts) ---------
+EXIT_INTERNAL_ERROR = 1
+EXIT_INPUT_ERROR = 2
+
+# ISO-BMFF `ftyp` brands that mean "this really is a HEIF/HEIC (or AVIF) file".
+HEIF_BRANDS = frozenset(
+    (
+        b"heic", b"heix", b"heim", b"heis", b"hevc", b"hevx", b"hevm", b"hevs",
+        b"mif1", b"msf1", b"avif", b"avis",
+    )
+)
+
 
 def log(msg):
     print(msg, flush=True)
@@ -80,9 +113,44 @@ def progress(pct):
     print(f"PROGRESS {int(max(0, min(100, pct)))}", flush=True)
 
 
-def die(msg, code=1):
+def die(msg, code=EXIT_INTERNAL_ERROR):
     print(f"reproject: error: {msg}", file=sys.stderr, flush=True)
     sys.exit(code)
+
+
+def die_input(msg):
+    """Fail with EXIT_INPUT_ERROR — the payload is bad, a retry cannot help."""
+    die(msg, EXIT_INPUT_ERROR)
+
+
+def band_rows(width, height, target_pixels=BAND_TARGET_PIXELS):
+    """Rows per reprojection band for an equirect of `width` x `height`."""
+    rows = max(1, int(target_pixels) // max(1, int(width)))
+    return max(1, min(int(height), rows))
+
+
+def detect_image_format(path):
+    """Container sniff from the leading magic bytes.
+
+    Returns 'jpeg' | 'png' | 'heif' | 'iso-bmff' | 'unknown'. Used only to turn a
+    decode failure into a precise, actionable message: the iOS client uploads
+    JPEG bytes under `.heic` object keys with an `image/heic` content-type (a
+    client contract we deliberately do NOT rename), so the file extension and the
+    stored content-type say nothing about the real format.
+    """
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(32)
+    except OSError:
+        return "unknown"
+    if head[:3] == b"\xff\xd8\xff":
+        return "jpeg"
+    if head[:8] == b"\x89PNG\r\n\x1a\n":
+        return "png"
+    # ISO base media file format: [4-byte big-endian box size]['ftyp'][brand].
+    if len(head) >= 12 and head[4:8] == b"ftyp":
+        return "heif" if head[8:12] in HEIF_BRANDS else "iso-bmff"
+    return "unknown"
 
 
 # --- nominal capture geometry (fallback, no poses) --------------------------
@@ -233,7 +301,19 @@ def load_frame(frames_dir, i):
         if os.path.exists(path):
             img = cv2.imread(path)
             if img is None:
-                die(f"failed to decode frame: {path}")
+                # Sniff the REAL container so the failure is actionable. OpenCV
+                # builds with HEIF support decode it and never reach here.
+                fmt = detect_image_format(path)
+                if fmt == "heif":
+                    die_input(
+                        f"frame {path} is a genuine HEIF/HEIC image; this stitcher "
+                        "decodes JPEG/PNG only. The capture client is expected to "
+                        "upload JPEG bytes (the `.heic` object key and "
+                        "`image/heic` content-type are a legacy client contract, "
+                        "not the real format) — re-capture with a client that "
+                        "encodes JPEG."
+                    )
+                die_input(f"failed to decode frame: {path} (sniffed format: {fmt})")
             return img
     return None
 
@@ -243,27 +323,65 @@ def upright(img):
     return cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
 
 
-def build(width, frames_dir, poses, yaw_dir, pitch_sign, hfov_deg, power=2.0):
-    """Reproject all frames into an equirect pano. Returns (pano, coverage%, mask)."""
+def frame_orientation(i, img_shape, pose_by_index, angles, hfov_deg):
+    """(r_proj, focal_x, focal_y, is_pole, label) for frame `i`.
+
+    Pure given the frame's UPRIGHT (hf, wf) shape — recomputed identically for
+    every band, so band-chunking cannot drift a frame's geometry mid-pano.
+    """
+    hf, wf = img_shape[:2]
+    if pose_by_index is not None:
+        p = pose_by_index[i]
+        try:
+            r_proj = derive_pose_rotation(p["transform"])
+            intr = p.get("intrinsics")
+            if intr is not None:
+                focal_x, focal_y = focals_from_intrinsics(intr, wf, hf)
+            else:
+                focal_x = focal_y = (wf / 2.0) / math.tan(math.radians(hfov_deg) / 2.0)
+        except (KeyError, ValueError, TypeError) as exc:
+            die_input(f"frame {i}: invalid pose ({exc})")
+        # forward direction in world = row 2 of R_proj; its latitude tells
+        # us whether this is a pole (zenith/nadir) frame.
+        fwd_lat = math.degrees(math.asin(max(-1.0, min(1.0, float(r_proj[2, 1])))))
+        is_pole = abs(fwd_lat) > POLE_LAT_DEG
+        return r_proj, focal_x, focal_y, is_pole, f"pose(lat={fwd_lat:.0f})"
+
+    yaw, pitch, roll = angles[i]
+    r_proj = rmat(yaw, pitch, roll).T  # world -> camera
+    focal_x = focal_y = (wf / 2.0) / math.tan(math.radians(hfov_deg) / 2.0)
+    # Pattern-independent pole detection (zenith/nadir at +/-90).
+    is_pole = abs(pitch) > POLE_LAT_DEG
+    return r_proj, focal_x, focal_y, is_pole, f"pose(y={yaw:.0f},p={pitch:.0f})"
+
+
+def build(width, frames_dir, poses, yaw_dir, pitch_sign, hfov_deg, power=2.0,
+          band_height=None):
+    """Reproject all frames into an equirect pano. Returns (pano, coverage%, mask).
+
+    MEMORY (spec §10 R8). The pano is filled in horizontal row BANDS of
+    `band_height` rows. The full-frame version allocated the ray grid (3 x N
+    float32), its rotated copy (3 x N float64), the accumulator (N x 3 float32),
+    the weight sum and the normalized output at SPHERE resolution — >1.3 GB
+    before a single frame was decoded at 8192x4096. Banding makes every one of
+    those O(band_height x width); only the uint8 output pano and the coverage
+    mask stay full size (~135 MB combined at 8192).
+
+    Output is BIT-IDENTICAL to a single-band run: each equirect pixel's value
+    depends only on its own ray and the frames, accumulated in the same frame
+    order, so splitting the pixel set changes nothing. `band_height=h` reproduces
+    the original allocation pattern exactly and is what the equivalence test
+    compares against.
+
+    The trade is decode work: each frame is re-read once per band. That is
+    bounded (JPEG decode of a ~12 MP frame is tens of ms) and buys a ~4-5x lower
+    peak RSS, which is what actually kills the worker.
+    """
     w = width
     h = width // 2
-
-    # equirect ray grid (world directions), +Y up, +Z at lon=lat=0.
-    u = (np.arange(w) + 0.5) / w
-    v = (np.arange(h) + 0.5) / h
-    lon = (u * 2 - 1) * math.pi  # -pi..pi
-    lat = (0.5 - v) * math.pi  # +pi/2..-pi/2
-    lon2, lat2 = np.meshgrid(lon, lat)
-    clat = np.cos(lat2)
-    dx = (clat * np.sin(lon2)).astype(np.float32)
-    dy = (np.sin(lat2)).astype(np.float32)
-    dz = (clat * np.cos(lon2)).astype(np.float32)
-    d = np.stack([dx.ravel(), dy.ravel(), dz.ravel()], 0)  # 3 x N
-
-    n = h * w
-    accum = np.zeros((n, 3), np.float32)
-    wsum = np.zeros((n,), np.float32)
-    cover = np.zeros((n,), np.uint8)
+    if band_height is None:
+        band_height = band_rows(w, h)
+    band_height = max(1, min(h, int(band_height)))
 
     # Determine which frame indices to process.
     if poses is not None:
@@ -278,106 +396,182 @@ def build(width, frames_dir, poses, yaw_dir, pitch_sign, hfov_deg, power=2.0):
         indices = list(range(len(angles)))
         pose_by_index = None
 
-    processed = 0
+    # Full-size outputs (uint8): everything else is per band.
+    pano = np.zeros((h, w, 3), np.uint8)
+    cover = np.zeros((h, w), np.uint8)
+
+    # Longitude terms are band-independent — compute them once.
+    u = (np.arange(w) + 0.5) / w
+    lon = (u * 2 - 1) * math.pi  # -pi..pi
+    sin_lon = np.sin(lon)
+    cos_lon = np.cos(lon)
+
     total = len(indices)
-    for k, i in enumerate(indices):
-        # Per-frame reprojection spans PROGRESS 5..70 (blend/inpaint/write take
-        # the rest — see main()).
-        progress(5 + 65 * k / total)
-        img = load_frame(frames_dir, i)
-        if img is None:
-            log(f"frame {i}: missing, skipped")
+    n_bands = (h + band_height - 1) // band_height
+    steps = max(1, total * n_bands)
+    step = 0
+    covered_px = {i: 0 for i in indices}
+    labels = {}
+    # index -> (r_proj, focal_x, focal_y, is_pole, hf, wf), or None when the
+    # frame is missing. Populated on the first band (the only one that must
+    # decode every frame to learn its dimensions) and reused afterwards so later
+    # bands can decide whether a frame touches them BEFORE paying for a decode.
+    meta = {}
+
+    for band, r0 in enumerate(range(0, h, band_height)):
+        r1 = min(h, r0 + band_height)
+        bh = r1 - r0
+        n = bh * w
+
+        # equirect ray grid (world directions) for THIS band, +Y up, +Z at
+        # lon=lat=0. Identical values to the full grid's rows r0..r1.
+        v = (np.arange(r0, r1) + 0.5) / h
+        lat = (0.5 - v) * math.pi  # +pi/2..-pi/2
+        clat = np.cos(lat)
+        dx = (clat[:, None] * sin_lon[None, :]).astype(np.float32)
+        dy = np.repeat(np.sin(lat).astype(np.float32), w)
+        dz = (clat[:, None] * cos_lon[None, :]).astype(np.float32)
+        d = np.stack([dx.ravel(), dy, dz.ravel()], 0)  # 3 x n
+        del dx, dz
+
+        accum = np.zeros((n, 3), np.float32)
+        wsum = np.zeros((n,), np.float32)
+        cover_band = cover[r0:r1].reshape(n)
+
+        for k, i in enumerate(indices):
+            # Per-frame reprojection spans PROGRESS 5..70 across ALL bands
+            # (blend/inpaint/write take the rest — see main()).
+            progress(5 + 65 * step / steps)
+            step += 1
+
+            img = None
+            if i not in meta:
+                # First band: decode to learn the frame's upright dimensions,
+                # which the focal-length derivation needs.
+                raw = load_frame(frames_dir, i)
+                if raw is None:
+                    log(f"frame {i}: missing, skipped")
+                    meta[i] = None
+                    continue
+                img = upright(raw)
+                del raw
+                r_proj, focal_x, focal_y, is_pole, label = frame_orientation(
+                    i, img.shape, pose_by_index, angles, hfov_deg
+                )
+                labels[i] = label
+                meta[i] = (r_proj, focal_x, focal_y, is_pole) + img.shape[:2]
+            elif meta[i] is None:
+                continue
+            r_proj, focal_x, focal_y, is_pole, hf, wf = meta[i]
+
+            # Projection-camera-frame rays. Written as an explicit 3-term
+            # combination per row rather than `r_proj @ d`: matmul would promote
+            # the whole float32 grid to a float64 CAST BUFFER *and* a float64
+            # 3 x n result (100 MB per band at 8192) where this needs one row at
+            # a time. Verified bit-identical to the matmul — that equality is
+            # what test/stitcher.banding.test.ts pins.
+            zc = r_proj[2, 0] * d[0] + r_proj[2, 1] * d[1] + r_proj[2, 2] * d[2]
+            valid = zc > 1e-6
+            px = np.full(n, -1.0, np.float32)
+            py = np.full(n, -1.0, np.float32)
+            dc_row = r_proj[0, 0] * d[0] + r_proj[0, 1] * d[1] + r_proj[0, 2] * d[2]
+            px[valid] = focal_x * dc_row[valid] / zc[valid] + wf / 2.0
+            dc_row = r_proj[1, 0] * d[0] + r_proj[1, 1] * d[1] + r_proj[1, 2] * d[2]
+            py[valid] = hf / 2.0 - focal_y * dc_row[valid] / zc[valid]
+            del dc_row, zc
+            inb = valid & (px >= 0) & (px < wf - 1) & (py >= 0) & (py < hf - 1)
+            del valid
+            hits = int(inb.sum())
+            covered_px[i] += hits
+            if hits == 0:
+                continue
+
+            # This band is actually covered, so the pixels are needed: decode now
+            # if an earlier band already learned this frame's geometry.
+            if img is None:
+                img = upright(load_frame(frames_dir, i))
+
+            # bilinear sample via remap on the in-bounds subset (reshaped to 2D).
+            mx = px[inb].astype(np.float32)
+            my = py[inb].astype(np.float32)
+            m = mx.shape[0]
+            pad = (-m) % REMAP_CHUNK
+            mxp = np.concatenate([mx, np.zeros(pad, np.float32)]).reshape(-1, REMAP_CHUNK)
+            myp = np.concatenate([my, np.zeros(pad, np.float32)]).reshape(-1, REMAP_CHUNK)
+            sampg = cv2.remap(img, mxp, myp, cv2.INTER_LINEAR)
+            samp = sampg.reshape(-1, 3)[:m]
+
+            # feather weight: center falloff in normalized image coords.
+            nx = (px[inb] - wf / 2.0) / (wf / 2.0)
+            ny = (py[inb] - hf / 2.0) / (hf / 2.0)
+            wc = np.clip(1 - np.abs(nx), 0, 1) * np.clip(1 - np.abs(ny), 0, 1)
+            weight = (wc ** power).astype(np.float32)
+            if is_pole:  # pole frames dominate their caps to avoid smeared bleed.
+                weight *= POLE_BOOST
+
+            idx = np.nonzero(inb)[0]
+            accum[idx] += samp.astype(np.float32) * weight[:, None]
+            wsum[idx] += weight
+            cover_band[idx] = 1
+            del img, sampg, samp, px, py, inb, idx, weight
+
+        # Feather-blend normalization for this band, in place (identical to
+        # `out[nz] = accum[nz] / wsum[nz, None]` — untouched pixels are 0 in both).
+        nz = wsum > 0
+        accum[nz] /= wsum[nz, None]
+        pano[r0:r1] = accum.reshape(bh, w, 3).astype(np.uint8)
+        del d, accum, wsum, nz
+
+    # Per-frame coverage totals, reported once (not once per band).
+    processed = 0
+    for i in indices:
+        if meta.get(i) is None:
             continue
-        img = upright(img)
-        hf, wf = img.shape[:2]
-
-        if pose_by_index is not None:
-            p = pose_by_index[i]
-            try:
-                r_proj = derive_pose_rotation(p["transform"])
-                intr = p.get("intrinsics")
-                if intr is not None:
-                    focal_x, focal_y = focals_from_intrinsics(intr, wf, hf)
-                else:
-                    focal_x = focal_y = (wf / 2.0) / math.tan(math.radians(hfov_deg) / 2.0)
-            except (KeyError, ValueError, TypeError) as exc:
-                die(f"frame {i}: invalid pose ({exc})")
-            # forward direction in world = row 2 of R_proj; its latitude tells
-            # us whether this is a pole (zenith/nadir) frame.
-            fwd_lat = math.degrees(math.asin(max(-1.0, min(1.0, float(r_proj[2, 1])))))
-            is_pole = abs(fwd_lat) > POLE_LAT_DEG
-            label = f"pose(lat={fwd_lat:.0f})"
-        else:
-            yaw, pitch, roll = angles[i]
-            r_proj = rmat(yaw, pitch, roll).T  # world -> camera
-            focal_x = focal_y = (wf / 2.0) / math.tan(math.radians(hfov_deg) / 2.0)
-            # Pattern-independent pole detection (zenith/nadir at +/-90).
-            is_pole = abs(pitch) > POLE_LAT_DEG
-            label = f"pose(y={yaw:.0f},p={pitch:.0f})"
-
-        dc = r_proj @ d  # projection-camera-frame rays, 3xN
-        zc = dc[2]
-        valid = zc > 1e-6
-        px = np.full(d.shape[1], -1.0, np.float32)
-        py = np.full(d.shape[1], -1.0, np.float32)
-        px[valid] = focal_x * dc[0, valid] / zc[valid] + wf / 2.0
-        py[valid] = hf / 2.0 - focal_y * dc[1, valid] / zc[valid]
-        inb = valid & (px >= 0) & (px < wf - 1) & (py >= 0) & (py < hf - 1)
-        if inb.sum() == 0:
+        if covered_px[i] == 0:
             log(f"frame {i}: 0 px")
             continue
-
-        # bilinear sample via remap on the in-bounds subset (reshaped to 2D).
-        mx = px[inb].astype(np.float32)
-        my = py[inb].astype(np.float32)
-        m = mx.shape[0]
-        pad = (-m) % REMAP_CHUNK
-        mxp = np.concatenate([mx, np.zeros(pad, np.float32)]).reshape(-1, REMAP_CHUNK)
-        myp = np.concatenate([my, np.zeros(pad, np.float32)]).reshape(-1, REMAP_CHUNK)
-        sampg = cv2.remap(img, mxp, myp, cv2.INTER_LINEAR)
-        samp = sampg.reshape(-1, 3)[:m]
-
-        # feather weight: center falloff in normalized image coords.
-        nx = (px[inb] - wf / 2.0) / (wf / 2.0)
-        ny = (py[inb] - hf / 2.0) / (hf / 2.0)
-        wc = np.clip(1 - np.abs(nx), 0, 1) * np.clip(1 - np.abs(ny), 0, 1)
-        weight = (wc ** power).astype(np.float32)
-        if is_pole:  # pole frames dominate their caps to avoid smeared bleed.
-            weight *= POLE_BOOST
-
-        idx = np.nonzero(inb)[0]
-        accum[idx] += samp.astype(np.float32) * weight[:, None]
-        wsum[idx] += weight
-        cover[idx] = 1
         processed += 1
-        log(f"frame {i}: {label} covered {int(inb.sum())} px")
+        log(f"frame {i}: {labels[i]} covered {covered_px[i]} px")
 
     if processed == 0:
-        die(f"no usable frames found in {frames_dir}")
+        die_input(f"no usable frames found in {frames_dir}")
 
-    progress(70)  # reprojection done; feather-blend normalization next.
-    out = np.zeros((n, 3), np.float32)
-    nz = wsum > 0
-    out[nz] = accum[nz] / wsum[nz, None]
-    pano = out.reshape(h, w, 3).astype(np.uint8)
+    progress(70)  # reprojection done.
     covpct = 100.0 * cover.mean()
-    mask = (cover.reshape(h, w) == 0).astype(np.uint8) * 255
+    # Reuse the coverage buffer as the hole mask (covered 1 -> 0, hole 0 -> 255)
+    # instead of allocating a bool temp + a uint8 temp + the scaled result: three
+    # more full-size arrays (100 MB at 8192) for a value we already have.
+    mask = cover
+    np.subtract(1, mask, out=mask)
+    mask *= 255
     return pano, covpct, mask
 
 
 def fill_holes(pano, mask):
     """Inpaint residual holes at reduced res (holes are large plain surfaces),
-    then composite the filled pixels back into the full-res pano."""
+    then composite the filled pixels back into the full-res pano.
+
+    Composites with `np.copyto(..., where=)` rather than `np.where(...)`: the
+    latter allocates a THIRD full-res image (100 MB at 8192x4096) while both
+    inputs are still live. The `where=` mask is materialised one row band at a
+    time for the same reason. `pano` is updated in place and also returned."""
     h, w = pano.shape[:2]
+    if not mask.any():
+        # Full coverage — every pixel would composite back to itself. Skips a
+        # 2048-wide Telea inpaint and a full-res upscale for nothing.
+        return pano
     sw = 2048
     sh = sw * h // w
     ps = cv2.resize(pano, (sw, sh))
     ms = cv2.resize(mask, (sw, sh), interpolation=cv2.INTER_NEAREST)
     ms = cv2.dilate(ms, np.ones((5, 5), np.uint8), iterations=1)
     filled = cv2.inpaint(ps, ms, 7, cv2.INPAINT_TELEA)
+    del ps, ms
     fu = cv2.resize(filled, (w, h))
-    m3 = (mask > 0)[:, :, None]
-    return np.where(m3, fu, pano)
+    for r0 in range(0, h, band_rows(w, h)):
+        r1 = min(h, r0 + band_rows(w, h))
+        np.copyto(pano[r0:r1], fu[r0:r1], where=(mask[r0:r1] > 0)[:, :, None])
+    return pano
 
 
 FRAME_NAME_RE = re.compile(r"^frame_\d+\.(jpg|jpeg|png)$", re.IGNORECASE)
@@ -454,8 +648,15 @@ def main(argv=None):
     ap.add_argument("--frames-dir", required=True, help="dir of ARKit-native landscape frame_N.jpg")
     ap.add_argument("--out", required=True, help="output pano.jpg path")
     ap.add_argument("--poses", default=None, help="optional poses.json (captures.poses_json array)")
-    ap.add_argument("--width", type=int, default=8192, help="pano width (height = width/2)")
+    ap.add_argument(
+        "--width", type=int, default=MAX_WIDTH,
+        help=f"pano width (height = width/2), even, max {MAX_WIDTH}",
+    )
     ap.add_argument("--preview-out", default=None, help="optional 2000x1000 preview jpg path")
+    ap.add_argument(
+        "--band-rows", type=int, default=None,
+        help="rows per reprojection band (default: sized from BAND_TARGET_PIXELS)",
+    )
     # Nominal-fallback tuning (defaults are the Phase 0.5 winning parameters).
     ap.add_argument("--hfov", type=float, default=DEFAULT_HFOV)
     ap.add_argument("--yaw-dir", type=int, default=DEFAULT_YAW_DIR)
@@ -463,9 +664,13 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     if args.width < 2 or args.width % 2 != 0:
-        die("--width must be a positive even integer")
+        die_input("--width must be a positive even integer")
+    if args.width > MAX_WIDTH:
+        # A caller asking for more than the product's pano width is a
+        # misconfiguration; honouring it would OOM the worker (spec §10 R8).
+        die_input(f"--width {args.width} exceeds the maximum {MAX_WIDTH}")
     if not os.path.isdir(args.frames_dir):
-        die(f"frames dir not found: {args.frames_dir}")
+        die_input(f"frames dir not found: {args.frames_dir}")
 
     # Pose problems are never fatal: WARN and fall back to the nominal-angle
     # path rather than exit non-zero (a hard fail here burns every job retry
@@ -480,12 +685,17 @@ def main(argv=None):
         poses = None
 
     mode = "poses" if poses is not None else "nominal-fallback"
-    log(f"reproject: mode={mode} width={args.width} frames_dir={args.frames_dir}")
+    bh = args.band_rows or band_rows(args.width, args.width // 2)
+    log(
+        f"reproject: mode={mode} width={args.width} band_rows={bh} "
+        f"frames_dir={args.frames_dir}"
+    )
     progress(0)
 
     pano, cov, mask = build(
         args.width, args.frames_dir, poses,
         args.yaw_dir, args.pitch_sign, args.hfov,
+        band_height=bh,
     )
     log(f"coverage {cov:.1f}% before inpaint")
     progress(75)  # blend done; inpainting residual holes next.
