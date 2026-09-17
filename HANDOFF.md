@@ -30,6 +30,13 @@ Read this first next session, then `CLAUDE.md` and `spec-doc.md` §10 (hardening
 
 **Last verified test state:** backend `tsc` clean, vitest **283 passed / 19 skipped** (+13 stitcher tests pass when `STITCHER_TEST_PYTHON` points at a venv with the pinned numpy/opencv); iOS **53/53**, 0 warnings (run before the simulator runtime vanished — see Environment).
 
+## Addendum — 2026-09-17 late session (first iOS 27 / Xcode 27 device run)
+
+- **R16 — crash at shot 28 on iOS 27, fixed** (`92fbdf4`, `7f9bb86`): `.finished` rebuilt the `ARSCNView` while the session was pausing; iOS 27 ARKit re-enters SwiftUI under `-[ARSession setViewLayer:]`'s unfair lock. Camera layer now has one identity across ready→finished and `CameraPreviewHost` attaches the session off the SwiftUI update pass. Device build clean (0 warnings). **Not yet re-run on device; unit tests not run (no simulator runtime installed after the Xcode 27 update).** Crash logs can be pulled with `xcrun devicectl device info files --domain-type systemCrashLogs` / `device copy from`.
+- **The device capture itself worked end-to-end** (world `2e3d5479`, 28 frames, stitch + `generate_draft` first attempt, 150 credits): ring angles within ~2° of nominal, exposure locked on 27/28 (shot 0 unlocked — the flagged first-shot issue is real), up to 52 cm translation drift → parallax ghosting on near objects.
+- **R17 — stitched panos were MIRRORED, fixed, not deployed** (`8ffa6b7`): ray-grid longitude sign. All previously generated worlds came from mirrored panos; regenerate any that matter after deploy (150 credits each — owner's call). Backend now: tsc clean, vitest **296 passed / 11 skipped** with `STITCHER_TEST_PYTHON` set (the 283/19 figure below was without the stitcher venv).
+- Cosmetic, open: `PanoPreviewView` opens facing lon ≈ 180° (behind the capture's first shot).
+
 ## NOT deployed — deploy checklist (owner's go-ahead required)
 
 Railway services are **not** GitHub-linked; pushing does not deploy. In order:
