@@ -37,6 +37,16 @@ Read this first next session, then `CLAUDE.md` and `spec-doc.md` §10 (hardening
 - **R17 — stitched panos were MIRRORED, fixed, not deployed** (`8ffa6b7`): ray-grid longitude sign. All previously generated worlds came from mirrored panos; regenerate any that matter after deploy (150 credits each — owner's call). Backend now: tsc clean, vitest **296 passed / 11 skipped** with `STITCHER_TEST_PYTHON` set (the 283/19 figure below was without the stitcher venv).
 - Cosmetic, open: `PanoPreviewView` opens facing lon ≈ 180° (behind the capture's first shot).
 
+## DEPLOYED 2026-09-18 00:06–00:14 IST (api `cc182d5a`, worker `957542a2`)
+
+Everything through R17 is live. Verified: image builds (first ever), `/healthz` 200, authed `GET /v1/worlds` 200, worker claims cleanly, migrations `0003`+`0004` applied.
+- **Base image is `node:24-trixie-slim`.** Plain `node:24-slim` is bookworm/python 3.11 and the pinned numpy needs ≥3.12 — the first build failed on it.
+- **The pre-deploy migration step did NOT run.** The Railway CLI (5.57.7) silently ignores `deploy.preDeployCommand` edits, and the `railway.json` added for it had no visible effect on `railway up`. Migrations were applied by hand with the repo migrator (`cd backend && DATABASE_URL=… npx tsx src/migrate.ts`). **Before the next migration-bearing deploy:** set the api service's Pre-deploy Command in the Railway dashboard (or confirm `railway.json` is honoured) — otherwise code ships ahead of schema again.
+- **Incident (orchestrator error, no data lost):** `DATABASE_URL` is Neon's **pgbouncer pooler**. A "safety" `SET default_transaction_read_only = on` in an ad-hoc inspection script leaked onto the shared pooled backend, so from ~23:35 to ~00:12 IST production writes on that backend failed (worker logged 27 `claim error`s; no jobs were queued in the window, nothing was lost). Fixed with `RESET`. **Never issue session-level `SET` through the pooler** — use `BEGIN READ ONLY` … `ROLLBACK`, or the direct (non-`-pooler`) host. Same caveat applies to `migrate.ts`'s session-scoped advisory lock: it is only reliable over the direct host.
+- The Railway project is linked from the session scratchpad only, not from the repo dir: pass `-p 1690518b-f063-41df-8839-19c0b00a33a1 -e production -s api|worker` to `railway up`.
+
+The checklist below is kept for reference.
+
 ## NOT deployed — deploy checklist (owner's go-ahead required)
 
 Railway services are **not** GitHub-linked; pushing does not deploy. In order:
