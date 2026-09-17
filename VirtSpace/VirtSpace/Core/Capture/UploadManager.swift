@@ -116,7 +116,14 @@ final class UploadManager {
     /// from the per-session claims taken inside `CaptureUploader`, and a global
     /// chain would just recreate the R12 wedge (one stuck session blocking the
     /// retry button).
-    private func enqueue<T>(_ op: @escaping () async -> T) -> Task<T, Never> {
+    /// `op` is explicitly @MainActor because that is what it already was:
+    /// these closures are written inside this @MainActor type, and an
+    /// unstructured `Task` formed here inherits that isolation. The flows below
+    /// therefore run their bookkeeping ON the main actor and suspend at each
+    /// `await` (the network and disk transfers themselves are off-main inside
+    /// URLSession). Spelling it out stops the next reader assuming otherwise —
+    /// and stops anyone silently moving it.
+    private func enqueue<T>(_ op: @escaping @MainActor () async -> T) -> Task<T, Never> {
         Task { await op() }
     }
 }

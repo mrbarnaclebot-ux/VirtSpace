@@ -19,7 +19,10 @@ import OSLog
 /// Owns the single app-lifetime background `URLSession` and bridges its
 /// delegate callbacks to async/await. Must be a singleton: a background session
 /// is keyed by its identifier and a second instance with the same id traps.
-final class BackgroundUploadCoordinator: NSObject, URLSessionDataDelegate {
+/// Delegate callbacks land on the session's own `delegateQueue`, never the
+/// main actor. Every mutable member (`continuations`, `storedSession`,
+/// `backgroundEventsCompletion`) is guarded by `lock`.
+nonisolated final class BackgroundUploadCoordinator: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     static let shared = BackgroundUploadCoordinator()
 
     /// Stable across launches so the OS can hand back tasks that finished while
@@ -39,7 +42,19 @@ final class BackgroundUploadCoordinator: NSObject, URLSessionDataDelegate {
     /// the transfer is dead: fail, let the session stay on disk, and retry.
     static let resourceTimeout: TimeInterval = 600
 
-    private lazy var session: URLSession = {
+    private let lock = NSLock()
+    private var continuations: [Int: CheckedContinuation<HTTPURLResponse, Error>] = [:]
+    private var storedSession: URLSession?
+
+    /// The one background session, created on first use under `lock`. This was
+    /// a `lazy var`, which has no synchronisation at all: two threads reaching
+    /// it together would each build a session with the same identifier, and a
+    /// duplicate background session traps.
+    private var session: URLSession {
+        lock.lock()
+        defer { lock.unlock() }
+        if let storedSession { return storedSession }
+
         let config = URLSessionConfiguration.background(withIdentifier: Self.sessionIdentifier)
         // Relaunch the app in the background to finish/deliver events even after
         // it's been suspended or terminated.
@@ -52,11 +67,10 @@ final class BackgroundUploadCoordinator: NSObject, URLSessionDataDelegate {
         config.timeoutIntervalForResource = Self.resourceTimeout
         let queue = OperationQueue()
         queue.maxConcurrentOperationCount = 1
-        return URLSession(configuration: config, delegate: self, delegateQueue: queue)
-    }()
-
-    private let lock = NSLock()
-    private var continuations: [Int: CheckedContinuation<HTTPURLResponse, Error>] = [:]
+        let created = URLSession(configuration: config, delegate: self, delegateQueue: queue)
+        storedSession = created
+        return created
+    }
 
     private override init() { super.init() }
 
