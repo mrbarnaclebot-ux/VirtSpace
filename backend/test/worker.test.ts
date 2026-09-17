@@ -300,7 +300,13 @@ function makeStitchDb(world: World, capture: Capture, sink: Sink) {
     }),
     update: (table: unknown) => ({
       set: (patch: Record<string, unknown>) => ({
-        where: async () => { sink.updates.push({ table, patch }); },
+        // `where()` is awaited directly by some call sites and chained with
+        // `.returning()` by the conditional (idempotent) finalizes — support both.
+        where: () => {
+          sink.updates.push({ table, patch });
+          const rows = [{ id: 'w-1' }];
+          return Object.assign(Promise.resolve(rows), { returning: async () => rows });
+        },
       }),
     }),
     insert: (table: unknown) => ({

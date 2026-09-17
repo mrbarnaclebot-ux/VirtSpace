@@ -199,6 +199,36 @@ export async function parkJobDead(
 }
 
 /**
+ * Refresh a claimed job's lease (spec §10 R6). LEASE_SECONDS (600) is shorter
+ * than a generation's in-process ceiling (900 s) and nothing used to touch
+ * `locked_at` while a job ran, so a second worker could re-claim a job that was
+ * very much alive — two workers finalizing the same world, two pushes, and (for
+ * a generate job without a persisted operation id) a second billable call.
+ *
+ * The UPDATE is conditional: it only bumps `locked_at` while the job is still
+ * `running` AND still leased to `workerId` (when given). Returning `false` means
+ * this worker NO LONGER OWNS the job — the caller must abort without finalizing
+ * and must not touch the job row (the new owner's lease would be clobbered).
+ */
+export async function heartbeatJob(
+  db: Db,
+  jobId: string,
+  workerId?: string,
+): Promise<boolean> {
+  const ownerClause = workerId ? sql` AND locked_by = ${workerId}` : sql``;
+  const result = await db.execute<{ id: string }>(sql`
+    UPDATE jobs
+    SET locked_at = now(), updated_at = now()
+    WHERE id = ${jobId}
+      AND phase = 'running'
+      AND locked_at IS NOT NULL${ownerClause}
+    RETURNING id
+  `);
+  const rows = (result as unknown as { rows: { id: string }[] }).rows;
+  return rows.length > 0;
+}
+
+/**
  * Persist the provider operation id atomically (spec §14) so a resumed worker
  * never blind-resubmits a credit-spending worlds:generate call.
  */

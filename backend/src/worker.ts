@@ -3,7 +3,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises';
 import { pathToFileURL, fileURLToPath } from 'node:url';
-import { and, desc, eq, lt, sql } from 'drizzle-orm';
+import { and, desc, eq, inArray, lt, sql } from 'drizzle-orm';
 import { getConfig, type Config } from './config.js';
 import { getDb, closeDb, type Db } from './db/client.js';
 import { captures, worlds, type Job, type JobKind, type World } from './db/schema.js';
@@ -12,6 +12,7 @@ import {
   completeJob,
   enqueue,
   failJob,
+  heartbeatJob,
   parkJobDead,
   setProviderOperationId,
 } from './queue.js';
@@ -42,6 +43,19 @@ export class NonRetryableJobError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'NonRetryableJobError';
+  }
+}
+
+/**
+ * This worker no longer holds the job's lease (spec §10 R6) — another worker
+ * re-claimed it and is running it now. The losing worker must abandon the job
+ * WITHOUT finalizing anything and WITHOUT touching the job row: failing or
+ * parking it would clobber the new owner's lease and its result.
+ */
+export class LeaseLostError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'LeaseLostError';
   }
 }
 
@@ -445,9 +459,12 @@ export async function runGeneration(
     await clock.sleep(pollIntervalMs);
     status = await provider.getOperation(operationId);
     // Progress tick — best-effort UI plumbing; never fail the money path on it.
+    // The ONE exception is a lost lease (§10 R6): that means another worker owns
+    // this job, so this worker must stop immediately rather than keep polling.
     try {
       await opts.onPoll?.(clock.now() - startedAt);
-    } catch {
+    } catch (err) {
+      if (err instanceof LeaseLostError) throw err;
       // ignore: progress reporting must not affect generation.
     }
   }
@@ -512,6 +529,27 @@ export interface WorkerDeps {
   clock?: GenerationClock;
   /** Injectable stitcher runner — defaults to spawning real Python. */
   stitcher?: StitcherSpawner;
+  /**
+   * Identity of the worker processing the job (`hostname:pid`). Set by
+   * startWorker; used to prove lease ownership on every heartbeat (§10 R6).
+   */
+  workerId?: string;
+}
+
+/**
+ * Lease keep-alive for a long-running phase (spec §10 R6). Returns false only
+ * when the conditional UPDATE proved this worker lost the job. A *failed*
+ * heartbeat (DB blip) returns true: a transient error is not evidence that
+ * someone else owns the job, and killing a live generation over it would be
+ * worse than the race it guards against.
+ */
+async function stillHoldsLease(deps: WorkerDeps, jobId: string): Promise<boolean> {
+  try {
+    return await heartbeatJob(deps.db, jobId, deps.workerId);
+  } catch (err) {
+    console.warn(`[worker] heartbeat failed for job ${jobId} (assuming held): ${String(err)}`);
+    return true;
+  }
 }
 
 async function loadWorld(db: Db, worldId: string): Promise<World> {
@@ -544,9 +582,14 @@ function makeProgressWriter(
 }
 
 /** Update the world row + enqueue draft generation after a pano lands.
- * progress resets to NULL on the status transition (new phase, new bar). */
+ * progress resets to NULL on the status transition (new phase, new bar).
+ *
+ * IDEMPOTENT (spec §10 R6): the transition is conditional on the world still
+ * being pre-generation. Two stitch runs for one world (lease expiry + re-claim)
+ * would otherwise enqueue two `generate_draft` jobs — i.e. two billable
+ * generations — so the loser of the race enqueues nothing. */
 async function finalizeStitch(db: Db, worldId: string, panoKey: string): Promise<void> {
-  await db
+  const advanced = await db
     .update(worlds)
     .set({
       panoUrl: panoKey,
@@ -555,7 +598,19 @@ async function finalizeStitch(db: Db, worldId: string, panoKey: string): Promise
       progress: null,
       updatedAt: sql`now()`,
     })
-    .where(eq(worlds.id, worldId));
+    .where(
+      and(
+        eq(worlds.id, worldId),
+        inArray(worlds.status, ['uploading', 'stitching', 'failed_stitch']),
+      ),
+    )
+    .returning({ id: worlds.id });
+  if (advanced.length === 0) {
+    console.log(
+      `[worker] world ${worldId} already past stitching; not enqueuing a second generate_draft`,
+    );
+    return;
+  }
   await enqueue(db, 'generate_draft', worldId);
 }
 
@@ -631,13 +686,30 @@ export async function handleStitch(deps: WorkerDeps, job: Job): Promise<void> {
     });
 
     // Stream the child's stdout for PROGRESS lines and mirror them (throttled)
-    // into worlds.progress while the stitch runs.
+    // into worlds.progress while the stitch runs. The same tick refreshes the
+    // job lease (§10 R6) — an 8192-wide stitch can outlive LEASE_SECONDS.
     const writeProgress = makeProgressWriter(db, world.id, deps.clock ?? realClock);
+    let leaseLost = false;
+    const pendingTicks: Promise<void>[] = [];
     const onStdout = createProgressLineStream((p) => {
-      void writeProgress(p);
+      pendingTicks.push(
+        (async () => {
+          await writeProgress(p);
+          if (!(await stillHoldsLease(deps, job.id))) leaseLost = true;
+        })(),
+      );
     });
 
     const run = await spawner(config.PYTHON_BIN, args, config.STITCHER_TIMEOUT_MS, onStdout);
+    await Promise.all(pendingTicks);
+    if (leaseLost) {
+      // Checked BEFORE publishing the pano or advancing the world: the worker
+      // that re-claimed this job owns the outcome now.
+      throw new LeaseLostError(
+        `job ${job.id} lost its lease while stitching world ${world.id}; ` +
+          'abandoning without finalizing',
+      );
+    }
     if (run.timedOut) {
       throw new Error(`stitcher timed out after ${config.STITCHER_TIMEOUT_MS}ms`);
     }
@@ -715,14 +787,30 @@ async function handleGenerate(
     },
     clock,
     {
-      onPoll: (elapsedMs) => writeProgress(pseudoProgress(elapsedMs, expectedMs)),
+      onPoll: async (elapsedMs) => {
+        await writeProgress(pseudoProgress(elapsedMs, expectedMs));
+        // Keep the lease alive across a generation that outlives it (§10 R6);
+        // if it is already gone, abort here rather than finalize a job someone
+        // else owns.
+        if (!(await stillHoldsLease(deps, job.id))) {
+          throw new LeaseLostError(
+            `job ${job.id} lost its lease while generating world ${world.id}; ` +
+              'abandoning without finalizing',
+          );
+        }
+      },
     },
   );
 
   // Finalize the world row: asset keys, provider world id, credits, status.
-  // credits_spent is bumped once per successful job (never on resume before
-  // finalize, since a resumed job crashed *before* this write ran).
-  await db
+  //
+  // IDEMPOTENT (spec §10 R6): the UPDATE is conditional on this generation's
+  // provider world id not already being recorded, so replaying the same job
+  // (lease expiry, re-claim, manual re-queue) cannot bump credits_spent twice or
+  // fire a second push. A *different* generation for the same world (a genuine
+  // re-run, or the HQ pass) has a different provider world id and still applies.
+  const providerWorldColumn = isDraft ? worlds.draftWorldId : worlds.hqWorldId;
+  const finalized = await db
     .update(worlds)
     .set({
       status: isDraft ? 'draft_ready' : 'complete',
@@ -737,8 +825,24 @@ async function handleGenerate(
         ? { draftWorldId: result.worldId, draftModel: model }
         : { hqWorldId: result.worldId, hqModel: model }),
     })
-    .where(eq(worlds.id, world.id));
+    .where(
+      and(
+        eq(worlds.id, world.id),
+        sql`${providerWorldColumn} IS DISTINCT FROM ${result.worldId}`,
+      ),
+    )
+    .returning({ id: worlds.id });
   await completeJob(db, job.id);
+
+  if (finalized.length === 0) {
+    // Already finalized for this exact provider world — credits and the push
+    // have been applied once and must not repeat. The job is still completed.
+    console.log(
+      `[worker] job ${job.id}: world ${world.id} already finalized for provider ` +
+        `world ${result.worldId}; skipping credits + push`,
+    );
+    return;
+  }
 
   // APNs push on draft_ready / complete (spec §4 "world ready").
   await push(
@@ -821,8 +925,17 @@ function failedStatusFor(kind: string): string | null {
   }
 }
 
-async function handleJobError(db: Db, job: Job, err: unknown): Promise<void> {
+export async function handleJobError(db: Db, job: Job, err: unknown): Promise<void> {
   const message = err instanceof Error ? err.message : String(err);
+
+  // Lost lease (§10 R6): another worker owns this job now. Touching the row —
+  // failJob would clear locked_at/locked_by, parkJobDead would kill it outright
+  // — would sabotage the owner mid-run. Log and walk away.
+  if (err instanceof LeaseLostError) {
+    console.warn(`[worker] job ${job.id} (${job.kind}) abandoned: ${message}`);
+    return;
+  }
+
   const nonRetryable =
     err instanceof BudgetExceededError || err instanceof NonRetryableJobError;
 
@@ -907,8 +1020,11 @@ export interface WorkerHandle {
  * `done` promise. Claim errors (e.g. an unreachable dummy DB) are logged and
  * the loop backs off and stays alive (task requirement 10).
  */
-export function startWorker(deps: WorkerDeps): WorkerHandle {
-  const workerId = makeWorkerId();
+export function startWorker(rawDeps: WorkerDeps): WorkerHandle {
+  const workerId = rawDeps.workerId ?? makeWorkerId();
+  // Every handler heartbeats with this identity, so the lease check can prove
+  // ownership (§10 R6).
+  const deps: WorkerDeps = { ...rawDeps, workerId };
   const pollMs = deps.config.WORKER_POLL_MS;
   const clock = deps.clock ?? realClock;
   const sleep = clock.sleep;

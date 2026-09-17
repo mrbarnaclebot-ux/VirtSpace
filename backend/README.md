@@ -183,6 +183,20 @@ app only ever calls the `StorageDriver` interface, so nothing else changes.
   as `phase='dead'` after 5 attempts (DLQ-equivalent).
 - `parkJobDead` parks a job dead **immediately**, bypassing retry — used for
   non-retryable failures (budget exceeded, un-implemented stitch).
+- **`heartbeatJob(db, jobId, workerId?)` (spec §10 R6)** — a conditional
+  `UPDATE … RETURNING` that refreshes `locked_at` only while the job is still
+  `running` **and** still leased to `workerId`. The lease (600 s) is shorter than
+  a generation's in-process ceiling (900 s), so long phases call it from the
+  generate poll tick and from the stitcher's progress stream. `false` means this
+  worker **lost** the job: it throws `LeaseLostError`, abandons the phase without
+  finalizing, and `handleJobError` deliberately leaves the job row alone (failing
+  or parking it would clobber the new owner's lease). A heartbeat that *errors*
+  (DB blip) is treated as "still held" — a transient error is not proof of loss.
+- **Idempotent finalizes** — the stitch transition only applies while the world
+  is still pre-generation (so a re-run cannot enqueue a second, billable
+  `generate_draft`), and the generation finalize is conditional on
+  `draft_world_id`/`hq_world_id` not already holding *this* provider world id, so
+  `credits_spent` and the APNs push can never double-apply on a replay.
 - `setProviderOperationId` persists the provider op id atomically so a resumed
   worker never blind-resubmits a credit-spending `worlds:generate` call.
 

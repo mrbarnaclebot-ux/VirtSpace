@@ -11,6 +11,7 @@ import {
   completeJob,
   enqueue,
   failJob,
+  heartbeatJob,
 } from '../../src/queue.js';
 
 // OPTIONAL integration test — runs ONLY when TEST_DATABASE_URL is set, so CI
@@ -168,6 +169,45 @@ describe.skipIf(!url)('queue against real Postgres', () => {
     expect(rescued!.lockedBy).toBe('worker-rescue');
     expect(rescued!.attempts).toBe(2);
     await completeJob(db, jobId);
+  });
+
+  // spec §10 R6 — a long phase must be able to hold its lease open, and a worker
+  // that lost the lease must find out instead of finalizing behind the new owner.
+  it('heartbeatJob keeps a live job un-claimable past LEASE_SECONDS', async () => {
+    const jobId = await enqueue(db, 'generate_draft', worldId);
+    const claimed = await claimNextJob(db, ['generate_draft'], 'worker-live');
+    expect(claimed!.id).toBe(jobId);
+
+    // Age the lease past expiry — without a heartbeat this job is up for grabs.
+    await pool.query(
+      `UPDATE jobs SET locked_at = now() - ($1 + 1) * interval '1 second' WHERE id = $2`,
+      [LEASE_SECONDS, jobId],
+    );
+    expect(await heartbeatJob(db, jobId, 'worker-live')).toBe(true);
+
+    // The refreshed lease blocks the re-claim the stale one would have allowed.
+    expect(await claimNextJob(db, ['generate_draft'], 'worker-thief')).toBeNull();
+    await completeJob(db, jobId);
+  });
+
+  it('heartbeatJob reports the lease LOST to a worker that no longer holds it', async () => {
+    const jobId = await enqueue(db, 'generate_hq', worldId);
+    await claimNextJob(db, ['generate_hq'], 'worker-old');
+
+    // Someone else re-claims after the lease expires (crash recovery).
+    await pool.query(
+      `UPDATE jobs SET locked_at = now() - ($1 + 1) * interval '1 second' WHERE id = $2`,
+      [LEASE_SECONDS, jobId],
+    );
+    const rescued = await claimNextJob(db, ['generate_hq'], 'worker-new');
+    expect(rescued!.lockedBy).toBe('worker-new');
+
+    expect(await heartbeatJob(db, jobId, 'worker-old')).toBe(false);
+    expect(await heartbeatJob(db, jobId, 'worker-new')).toBe(true);
+
+    // A finished/parked job cannot be heartbeated by anyone.
+    await completeJob(db, jobId);
+    expect(await heartbeatJob(db, jobId, 'worker-new')).toBe(false);
   });
 
   it('drizzle raw execute sanity: search_path isolation works', async () => {
