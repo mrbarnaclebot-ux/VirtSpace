@@ -31,6 +31,14 @@ final class BackgroundUploadCoordinator: NSObject, URLSessionDataDelegate {
     /// been delivered, so UIKit can snapshot and re-suspend the app.
     private var backgroundEventsCompletion: (() -> Void)?
 
+    /// Hard ceiling on a single frame PUT, connectivity waiting included.
+    /// `waitsForConnectivity` with no resource timeout means a task can sit
+    /// forever, and its continuation with it — one stuck frame wedged the whole
+    /// upload flow (spec §10 R12). 10 minutes is far beyond a legitimate
+    /// multi-megabyte JPEG PUT on any usable connection, so hitting it means
+    /// the transfer is dead: fail, let the session stay on disk, and retry.
+    static let resourceTimeout: TimeInterval = 600
+
     private lazy var session: URLSession = {
         let config = URLSessionConfiguration.background(withIdentifier: Self.sessionIdentifier)
         // Relaunch the app in the background to finish/deliver events even after
@@ -40,6 +48,8 @@ final class BackgroundUploadCoordinator: NSObject, URLSessionDataDelegate {
         config.isDiscretionary = false
         config.allowsCellularAccess = true
         config.waitsForConnectivity = true
+        // Bounded wait: without this the pair above can block indefinitely.
+        config.timeoutIntervalForResource = Self.resourceTimeout
         let queue = OperationQueue()
         queue.maxConcurrentOperationCount = 1
         return URLSession(configuration: config, delegate: self, delegateQueue: queue)
@@ -77,23 +87,43 @@ final class BackgroundUploadCoordinator: NSObject, URLSessionDataDelegate {
     // MARK: URLSessionTaskDelegate
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        lock.lock()
-        let cont = continuations.removeValue(forKey: task.taskIdentifier)
-        lock.unlock()
-        // No continuation → this task finished in a PRIOR process (the app was
-        // terminated mid-upload and relaunched). The bytes already reached R2;
-        // the resume flow re-PUTs anything not marked uploaded, so we just drop it.
-        guard let cont else { return }
-
+        // Every completion path — success, failure, resource timeout, explicit
+        // cancel — funnels through `finish`, which removes the continuation
+        // under the lock. A continuation is therefore resumed exactly once:
+        // whoever wins removeValue owns it, everyone else sees nil.
         if let error {
-            cont.resume(throwing: APIError.network(error))
+            finish(task.taskIdentifier, with: .failure(APIError.network(error)))
             return
         }
         guard let http = task.response as? HTTPURLResponse else {
-            cont.resume(throwing: APIError.invalidResponse)
+            finish(task.taskIdentifier, with: .failure(APIError.invalidResponse))
             return
         }
-        cont.resume(returning: http)
+        finish(task.taskIdentifier, with: .success(http))
+    }
+
+    /// The session became unusable (invalidated / unrecoverable error). Fail
+    /// every outstanding continuation rather than leaving awaiting flows hung
+    /// forever — the whole point of R12.
+    func urlSession(_ session: URLSession, didBecomeInvalidWithError error: Error?) {
+        lock.lock()
+        let pending = continuations
+        continuations.removeAll()
+        lock.unlock()
+        let failure = error.map { APIError.network($0) } ?? APIError.invalidResponse
+        for (_, cont) in pending { cont.resume(throwing: failure) }
+    }
+
+    /// Resume the continuation for `taskIdentifier` exactly once, or do nothing
+    /// if it was already resumed / belongs to a prior process (the app was
+    /// terminated mid-upload and relaunched — those bytes already reached R2
+    /// and the resume flow re-PUTs anything not marked uploaded).
+    private func finish(_ taskIdentifier: Int, with result: Result<HTTPURLResponse, Error>) {
+        lock.lock()
+        let cont = continuations.removeValue(forKey: taskIdentifier)
+        lock.unlock()
+        guard let cont else { return }
+        cont.resume(with: result)
     }
 
     func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {

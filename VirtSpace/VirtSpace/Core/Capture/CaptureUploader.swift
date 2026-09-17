@@ -39,7 +39,12 @@ final class CaptureUploader {
         guard let session = pending.first(where: { $0.id == result.sessionID }) else {
             throw APIError.server(0, "Capture session not found on disk")
         }
-        return try await upload(session: session, progress: progress)
+        guard let world = try await withClaim(session.id, {
+            try await upload(session: session, progress: progress)
+        }) else {
+            throw APIError.server(0, "This capture is already uploading")
+        }
+        return world
     }
 
     /// Retry every complete session left on disk (called at launch / on the
@@ -50,22 +55,49 @@ final class CaptureUploader {
     func resumePending(progress: @escaping (Int) -> Void = { _ in }) async -> [World] {
         var uploaded: [World] = []
         for session in store.loadPending() {
-            if session.manifest.isComplete {
-                if let world = try? await upload(session: session, progress: progress) {
-                    uploaded.append(world)
+            // Skip (never wait for) a session another flow already owns — one
+            // wedged upload must not block the rest, or the retry button (R12).
+            await withClaim(session.id) {
+                if session.manifest.isComplete {
+                    if let world = try? await upload(session: session, progress: progress) {
+                        uploaded.append(world)
+                    }
+                } else if Date().timeIntervalSince(session.manifest.createdAt) > 86_400 {
+                    // Permanently discarding the session — if it already minted
+                    // a backend world, best-effort delete it so it doesn't
+                    // linger as an orphan in `uploading` (the server-side 24 h
+                    // reaper is the backstop if this delete never lands).
+                    if let worldId = session.manifest.createdWorldId {
+                        try? await api.deleteWorld(id: worldId)
+                    }
+                    store.purge(id: session.id)
                 }
-            } else if Date().timeIntervalSince(session.manifest.createdAt) > 86_400 {
-                // Permanently discarding the session — if it already minted a
-                // backend world, best-effort delete it so it doesn't linger as
-                // an orphan in `uploading` (the server-side 24 h reaper is the
-                // backstop if this delete never lands).
-                if let worldId = session.manifest.createdWorldId {
-                    try? await api.deleteWorld(id: worldId)
-                }
-                store.purge(id: session.id)
             }
         }
         return uploaded
+    }
+
+    // MARK: - Per-session exclusion
+
+    /// Run `body` while holding an exclusive claim on `id`, or skip it entirely
+    /// (returning nil) when another in-flight flow already owns that session.
+    /// This is the ONLY serialization upload flows need: two flows must never
+    /// work the same session, but flows on different sessions are independent
+    /// (spec §10 R12 — the old global chain let one stuck session block all).
+    @discardableResult
+    private func withClaim<T>(_ id: UUID, _ body: () async throws -> T) async rethrows -> T? {
+        guard await SessionClaims.shared.claim(id) else {
+            AppLog.upload.log("Session \(id.uuidString, privacy: .public) is already being worked by another flow — skipping")
+            return nil
+        }
+        do {
+            let value = try await body()
+            await SessionClaims.shared.release(id)
+            return value
+        } catch {
+            await SessionClaims.shared.release(id)
+            throw error
+        }
     }
 
     // MARK: - Stranded-session completion
@@ -87,40 +119,53 @@ final class CaptureUploader {
                 manifest.frames.count > 0,
                 manifest.uploadedFrameIndices.count >= manifest.frames.count
             else { continue }
-            AppLog.upload.log("Stranded session \(session.id.uuidString, privacy: .public): \(manifest.uploadedFrameIndices.count)/\(manifest.frames.count) frames already uploaded, world \(worldId, privacy: .public) — going straight to frames:done")
-            do {
-                let poses = manifest.frames.map {
-                    FramePose(
-                        index: $0.index,
-                        timestamp: $0.timestamp,
-                        transform: $0.transform,
-                        intrinsics: $0.intrinsics,
-                        exposureLocked: $0.exposureLocked
-                    )
-                }
-                AppLog.upload.log("uploads complete, calling frames:done for \(worldId, privacy: .public)")
-                try await api.framesDone(worldId: worldId, poses: poses)
-                AppLog.upload.log("frames:done ok for \(worldId, privacy: .public) with \(poses.count) poses (stranded recovery)")
-                store.purge(id: session.id)
-                completed += 1
-            } catch is CancellationError {
-                AppLog.upload.fault("frames:done for stranded world \(worldId, privacy: .public) hit CancellationError — this flow must be app-scoped (UploadManager), investigate!")
-            } catch let error as APIError where error.isWorldGone {
-                // The stranded world was deleted server-side (404 world_not_found):
-                // frames:done can never land. Clear the dead world id + uploaded
-                // flags (frames stay on disk), then start a fresh upload in this
-                // same run so the user's 28 frames aren't stranded forever.
-                AppLog.upload.fault("resume: world \(worldId, privacy: .public) gone server-side — starting fresh")
-                store.resetWorldState(forSession: session.id, in: session.directory)
-                if let fresh = store.loadPending().first(where: { $0.id == session.id }),
-                   (try? await upload(session: fresh, progress: { _ in })) != nil {
-                    completed += 1
-                }
-            } catch {
-                AppLog.upload.error("Stranded-session frames:done failed for \(worldId, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            // Another flow already owns this session — skip, never block (R12).
+            await withClaim(session.id) {
+                if await completeStranded(session: session, worldId: worldId) { completed += 1 }
             }
         }
         return completed
+    }
+
+    /// The stranded-recovery body for one already-claimed session. Returns true
+    /// when the session was completed (or re-uploaded to a fresh world).
+    private func completeStranded(session: CaptureStore.PendingSession, worldId: String) async -> Bool {
+        let manifest = session.manifest
+        AppLog.upload.log("Stranded session \(session.id.uuidString, privacy: .public): \(manifest.uploadedFrameIndices.count)/\(manifest.frames.count) frames already uploaded, world \(worldId, privacy: .public) — going straight to frames:done")
+        do {
+            let poses = manifest.frames.map {
+                FramePose(
+                    index: $0.index,
+                    timestamp: $0.timestamp,
+                    transform: $0.transform,
+                    intrinsics: $0.intrinsics,
+                    exposureLocked: $0.exposureLocked
+                )
+            }
+            AppLog.upload.log("uploads complete, calling frames:done for \(worldId, privacy: .public)")
+            try await api.framesDone(worldId: worldId, poses: poses)
+            AppLog.upload.log("frames:done ok for \(worldId, privacy: .public) with \(poses.count) poses (stranded recovery)")
+            store.purge(id: session.id)
+            return true
+        } catch is CancellationError {
+            AppLog.upload.fault("frames:done for stranded world \(worldId, privacy: .public) hit CancellationError — this flow must be app-scoped (UploadManager), investigate!")
+            return false
+        } catch let error as APIError where error.isWorldGone {
+            // The stranded world was deleted server-side (404 world_not_found):
+            // frames:done can never land. Clear the dead world id + uploaded
+            // flags (frames stay on disk), then start a fresh upload in this
+            // same run so the user's 28 frames aren't stranded forever.
+            AppLog.upload.fault("resume: world \(worldId, privacy: .public) gone server-side — starting fresh")
+            store.resetWorldState(forSession: session.id, in: session.directory)
+            if let fresh = store.loadPending().first(where: { $0.id == session.id }),
+               (try? await upload(session: fresh, progress: { _ in })) != nil {
+                return true
+            }
+            return false
+        } catch {
+            AppLog.upload.error("Stranded-session frames:done failed for \(worldId, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            return false
+        }
     }
 
     // MARK: - Internals

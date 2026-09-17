@@ -13,7 +13,14 @@
 //  Every flow here runs in an unstructured Task owned by this singleton —
 //  detached from any view. Views merely kick a flow and (optionally) await the
 //  returned handle for UI; cancelling THAT await never cancels the flow.
-//  Flows are serialized so a kick and a resume can't double-upload a session.
+//
+//  Mutual exclusion is PER SESSION (`SessionClaims`), not global. Flows used to
+//  queue behind one global chain, so a single wedged frame PUT blocked every
+//  later flow — including the user's "Retry upload" button, which just sat in
+//  the queue behind the stuck upload (spec §10 R12). Now a flow claims each
+//  session it touches and skips any session another flow already owns: two
+//  flows still never double-upload the same session, but a stuck session can
+//  no longer block a different one, or a retry.
 //
 
 import Foundation
@@ -22,10 +29,6 @@ import OSLog
 @MainActor
 final class UploadManager {
     static let shared = UploadManager()
-
-    /// Tail of the serialized flow chain — each new flow awaits the previous
-    /// one so two flows never touch the same session concurrently.
-    private var chain: Task<Void, Never>?
 
     private init() {}
 
@@ -85,17 +88,16 @@ final class UploadManager {
         }
     }
 
-    // MARK: - Serialization
+    // MARK: - Flow ownership
 
-    /// Run `op` in an unstructured, manager-owned task ordered after every
-    /// previously enqueued flow. The returned handle is for observation only.
+    /// Run `op` in an unstructured, manager-owned task. The returned handle is
+    /// for observation only — cancelling an await on it never cancels the flow.
+    ///
+    /// Flows are deliberately NOT chained behind one another: correctness comes
+    /// from the per-session claims taken inside `CaptureUploader`, and a global
+    /// chain would just recreate the R12 wedge (one stuck session blocking the
+    /// retry button).
     private func enqueue<T>(_ op: @escaping () async -> T) -> Task<T, Never> {
-        let previous = chain
-        let task = Task {
-            await previous?.value
-            return await op()
-        }
-        chain = Task { _ = await task.value }
-        return task
+        Task { await op() }
     }
 }
