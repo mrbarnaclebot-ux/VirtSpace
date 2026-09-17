@@ -58,38 +58,19 @@ actor PanoCache {
             return dest
         }
 
-        let (bytes, response) = try await URLSession.shared.bytes(from: remoteURL)
-        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-            throw PanoCacheError.badStatus(http.statusCode)
-        }
-        let expected = response.expectedContentLength // -1 if unknown
-
+        // Download to a scratch file in the same directory (same volume → the
+        // move below is a rename), via a download task rather than a
+        // byte-at-a-time async sequence (spec §10 R12).
         let tmp = try directory.appendingPathComponent("\(UUID().uuidString).partial")
-        fm.createFile(atPath: tmp.path, contents: nil)
-        guard let handle = try? FileHandle(forWritingTo: tmp) else {
-            throw PanoCacheError.writeFailed
-        }
-
-        var received: Int64 = 0
-        var buffer = Data()
-        buffer.reserveCapacity(256 * 1024)
         do {
-            for try await byte in bytes {
-                buffer.append(byte)
-                if buffer.count >= 256 * 1024 {
-                    try handle.write(contentsOf: buffer)
-                    received += Int64(buffer.count)
-                    buffer.removeAll(keepingCapacity: true)
-                    if expected > 0 { progress(min(1, Double(received) / Double(expected))) }
-                }
+            try await FileDownload.download(from: remoteURL, to: tmp, progress: progress)
+        } catch let error as FileDownloadError {
+            try? fm.removeItem(at: tmp)
+            switch error {
+            case .badStatus(let code): throw PanoCacheError.badStatus(code)
+            case .writeFailed: throw PanoCacheError.writeFailed
             }
-            if !buffer.isEmpty {
-                try handle.write(contentsOf: buffer)
-                received += Int64(buffer.count)
-            }
-            try handle.close()
         } catch {
-            try? handle.close()
             try? fm.removeItem(at: tmp)
             throw error
         }
