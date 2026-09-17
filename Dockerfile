@@ -37,6 +37,10 @@ RUN npm ci
 COPY backend/tsconfig.json ./
 COPY backend/src ./src
 COPY backend/stitcher ./stitcher
+# Committed migration SQL + snapshots. drizzle-kit is a devDependency and is
+# pruned below, so the release step runs dist/migrate.js (drizzle-orm's own
+# migrator) against THIS folder — without it, code ships ahead of schema.
+COPY backend/drizzle ./drizzle
 RUN npm run build && npm prune --omit=dev
 
 ENV NODE_ENV=production

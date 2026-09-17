@@ -39,7 +39,8 @@ npm run dev               # tsx watch + dotenv → http://localhost:8080/healthz
 | `typecheck` | `tsc --noEmit` |
 | `test` | `vitest run` (no DB required — pure/smoke tests) |
 | `db:generate` | drizzle-kit: SQL migration from `src/db/schema.ts` (no DB) |
-| `db:migrate` | drizzle-kit: apply migrations (connects to `DATABASE_URL`) |
+| `db:migrate` | drizzle-kit: apply migrations, **dev only** (needs devDependencies) |
+| `db:migrate:prod` | `node dist/migrate.js` — drizzle-orm migrator, advisory-locked; the release step |
 
 ## Architecture map
 
@@ -199,9 +200,42 @@ writes a timestamped SQL file + snapshot into `drizzle/`. `generate` needs **no*
 database connection. `npm run db:migrate` applies pending files to
 `DATABASE_URL`. Committed migrations: `0000_*.sql` (initial schema), `0001_*.sql` (the
 `credit_events` ledger for the Stage-2 budget guard), `0002_*.sql` (pipeline
-progress + heartbeat columns) and `0003_heavy_maddog.sql`
+progress + heartbeat columns), `0003_heavy_maddog.sql`
 (`worlds.client_request_id` + its per-owner unique index — idempotent create,
 spec §10 R4).
+
+### Applying migrations in production (spec §10 R10)
+
+`drizzle-kit` is a **devDependency** and the image prunes dev deps, so
+`db:migrate` does not exist in the deployed container. Migrations used to be
+applied by hand, which let code ship ahead of its schema.
+
+`src/migrate.ts` (built to `dist/migrate.js`, `npm run db:migrate:prod`) runs the
+same committed SQL through **drizzle-orm's own migrator** — no CLI, no dev
+toolchain. The Dockerfile now `COPY`s `backend/drizzle` into the image so the
+files are actually there.
+
+It holds a **Postgres advisory lock** for the whole run, on a dedicated
+`pg.Client` (the lock is session-scoped, so a pooled connection could hand the
+lock and the DDL to different backends). A concurrent runner blocks, then finds
+nothing pending.
+
+It is deliberately **not** run at server/worker boot: both services can scale
+past one replica and both would race the same DDL on every deploy. It is a
+release step.
+
+**Railway setup — do this once, on the `api` service only:**
+
+> Settings → Deploy → **Pre-deploy Command**: `node dist/migrate.js`
+
+Leave the `worker` service's pre-deploy command empty, or both services race
+each other on every deploy. A failed migration exits non-zero and aborts the
+rollout, which is the point.
+
+> ⚠️ **`0003_heavy_maddog.sql` is still pending in production.** It adds
+> `worlds.client_request_id` and its per-owner unique index — the columns the
+> shipped idempotent-create path (spec §10 R4) reads. Set the pre-deploy command
+> **before** the next deploy so it lands.
 
 ## Dev storage (`STORAGE_DRIVER=local`)
 
