@@ -39,6 +39,12 @@ const baseSchema = z.object({
 
   WORLDLABS_API_KEY: z.string().optional(),
   PROVIDER_MODE: z.enum(['mock', 'live']).default('mock'),
+  // Asset-download guards (spec §10 R10). Comma-separated host allowlist; an
+  // entry starting with '.' matches that host and its subdomains. Unset uses
+  // provider/worldlabs.ts DEFAULT_ASSET_HOSTS.
+  WORLDLABS_ASSET_HOSTS: z.string().optional(),
+  // Byte ceiling per downloaded asset, enforced while streaming (default 200 MB).
+  WORLDLABS_ASSET_MAX_BYTES: numberFromEnv(200 * 1024 * 1024),
 
   DAILY_CREDIT_BUDGET: numberFromEnv(500),
   DAILY_SCAN_QUOTA: numberFromEnv(10),

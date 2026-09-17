@@ -20,6 +20,112 @@ import {
 const DEFAULT_BASE_URL = 'https://api.worldlabs.ai';
 const DEFAULT_TIMEOUT_MS = 120_000; // matches spike.py urlopen timeout=120.
 
+// --- Asset download hardening (spec §10 R10) ---------------------------------
+//
+// getWorld() returns asset URLs chosen by the PROVIDER. downloadAsset used to
+// fetch whatever came back, with our API key attached and no size ceiling — so a
+// compromised or buggy provider response could exfiltrate the key to any host it
+// named, or hand the worker a multi-gigabyte body to buffer.
+
+/**
+ * Hosts assets may be fetched from when `WORLDLABS_ASSET_HOSTS` is unset. The
+ * API host serves nothing but the API; `cdn.marble.worldlabs.ai` is the CDN the
+ * Phase 0 spike observed serving SPZ/GLB/thumbnail assets (spec §10 risk table).
+ * A leading dot means "this host or any subdomain of it".
+ */
+export const DEFAULT_ASSET_HOSTS = ['api.worldlabs.ai', '.worldlabs.ai'];
+
+/** Default ceiling on a single downloaded asset (200 MB). */
+export const DEFAULT_ASSET_MAX_BYTES = 200 * 1024 * 1024;
+
+/** Parse a comma-separated host allowlist; falls back to DEFAULT_ASSET_HOSTS. */
+export function parseAssetHosts(csv?: string): string[] {
+  const entries = (csv ?? '')
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+  return entries.length > 0 ? entries : DEFAULT_ASSET_HOSTS;
+}
+
+/**
+ * True for hostnames that are IP literals in a private, loopback, link-local or
+ * otherwise non-routable range.
+ *
+ * Defence in depth: the allowlist above already excludes these, so this only
+ * fires if someone puts an address in `WORLDLABS_ASSET_HOSTS`. It refuses to let
+ * a misconfiguration turn asset fetching into an SSRF primitive against the
+ * container's own network (link-local 169.254.169.254 is the cloud metadata
+ * endpoint on every major provider).
+ */
+export function isNonRoutableHost(hostname: string): boolean {
+  const host = hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  if (host === 'localhost' || host.endsWith('.localhost')) return true;
+
+  // IPv4 literal.
+  const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  if (v4) {
+    const [a, b] = [Number(v4[1]), Number(v4[2])];
+    if (a === 0 || a === 10 || a === 127) return true;
+    if (a === 169 && b === 254) return true; // link-local incl. cloud metadata
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT
+    return false;
+  }
+
+  // IPv6 literal.
+  if (host.includes(':')) {
+    if (host === '::' || host === '::1') return true;
+    if (/^f[cd][0-9a-f]{2}:/.test(host)) return true; // unique-local fc00::/7
+    if (/^fe[89ab][0-9a-f]:/.test(host)) return true; // link-local fe80::/10
+    // IPv4-mapped (::ffff:127.0.0.1) — re-check the embedded address.
+    const mapped = /::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/.exec(host);
+    if (mapped?.[1]) return isNonRoutableHost(mapped[1]);
+    return false;
+  }
+
+  return false;
+}
+
+/** True when `host` matches an allowlist entry (exact, or `.suffix` subdomain). */
+export function hostAllowed(host: string, allowlist: string[]): boolean {
+  const h = host.toLowerCase();
+  return allowlist.some((entry) =>
+    entry.startsWith('.') ? h === entry.slice(1) || h.endsWith(entry) : h === entry,
+  );
+}
+
+/**
+ * Validate a provider-supplied asset URL. Returns the parsed URL or throws.
+ * https only: the key must never ride a plaintext request, and an asset fetched
+ * over http could be swapped in transit.
+ */
+export function assertDownloadableUrl(raw: string, allowlist: string[]): URL {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new ProviderError(`asset URL is not a valid URL: ${raw}`, { endpoint: raw });
+  }
+  if (url.protocol !== 'https:') {
+    throw new ProviderError(`asset URL must be https, got ${url.protocol}`, {
+      endpoint: raw,
+    });
+  }
+  if (isNonRoutableHost(url.hostname)) {
+    throw new ProviderError(`asset URL host is non-routable: ${url.hostname}`, {
+      endpoint: raw,
+    });
+  }
+  if (!hostAllowed(url.hostname, allowlist)) {
+    throw new ProviderError(
+      `asset URL host ${url.hostname} is not in the allowlist (${allowlist.join(', ')})`,
+      { endpoint: raw },
+    );
+  }
+  return url;
+}
+
 /** Injectable fetch (Node 24 global) so tests can assert request shaping. */
 export type FetchLike = typeof fetch;
 
@@ -28,6 +134,66 @@ export interface WorldLabsOptions {
   baseUrl?: string;
   fetchImpl?: FetchLike;
   timeoutMs?: number;
+  /** Comma-separated host allowlist for asset downloads (spec §10 R10). */
+  assetHosts?: string;
+  /** Byte ceiling for a single downloaded asset. */
+  assetMaxBytes?: number;
+}
+
+/**
+ * Read a response body, aborting as soon as it exceeds `cap` bytes.
+ *
+ * Streams rather than `arrayBuffer()`: the point is to stop a hostile or broken
+ * response BEFORE it is fully in memory, so checking the size afterwards would
+ * be too late. Content-Length is honoured as a fast path but never trusted — it
+ * is attacker-controlled and may be absent under chunked encoding.
+ */
+async function readBodyCapped(
+  res: Response,
+  cap: number,
+  url: string,
+  abort: AbortController,
+): Promise<Buffer> {
+  const declared = Number(res.headers.get('content-length'));
+  if (Number.isFinite(declared) && declared > cap) {
+    abort.abort();
+    throw new ProviderError(
+      `asset exceeds the ${cap}-byte cap (Content-Length ${declared})`,
+      { endpoint: url },
+    );
+  }
+
+  if (!res.body) {
+    // No stream available (some test doubles, HEAD-like responses).
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (buf.byteLength > cap) {
+      throw new ProviderError(
+        `asset exceeds the ${cap}-byte cap (${buf.byteLength} bytes)`,
+        { endpoint: url },
+      );
+    }
+    return buf;
+  }
+
+  const reader = res.body.getReader();
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > cap) {
+      // Stop the transfer instead of draining it.
+      await reader.cancel().catch(() => undefined);
+      abort.abort();
+      throw new ProviderError(
+        `asset exceeds the ${cap}-byte cap (aborted after ${total} bytes)`,
+        { endpoint: url },
+      );
+    }
+    chunks.push(Buffer.from(value));
+  }
+  return Buffer.concat(chunks, total);
 }
 
 interface PrepareUploadResponse {
@@ -43,6 +209,11 @@ export function createWorldLabsProvider(opts: WorldLabsOptions): WorldGenProvide
   const baseUrl = (opts.baseUrl ?? DEFAULT_BASE_URL).replace(/\/$/, '');
   const doFetch: FetchLike = opts.fetchImpl ?? fetch;
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const assetHosts = parseAssetHosts(opts.assetHosts);
+  const assetMaxBytes = opts.assetMaxBytes ?? DEFAULT_ASSET_MAX_BYTES;
+  // The API host is the ONLY host our key is ever sent to (see downloadAsset).
+  // Derived from baseUrl so a test/staging base URL stays self-consistent.
+  const apiHost = new URL(baseUrl).hostname.toLowerCase();
 
   const jsonHeaders = (): Record<string, string> => ({
     'WLT-Api-Key': opts.apiKey,
@@ -254,15 +425,49 @@ export function createWorldLabsProvider(opts: WorldLabsOptions): WorldGenProvide
       return out;
     },
 
-    async downloadAsset(url): Promise<Buffer> {
-      const res = await request('GET', url, { headers: { 'WLT-Api-Key': opts.apiKey } });
-      if (!res.ok) {
-        throw new ProviderError(`asset download failed: ${res.status}`, {
-          status: res.status,
-          endpoint: url,
+    async downloadAsset(rawUrl): Promise<Buffer> {
+      // The URL comes from the PROVIDER's JSON, so it is untrusted input.
+      const url = assertDownloadableUrl(rawUrl, assetHosts);
+
+      // Send the API key ONLY to the API host. CDN asset URLs are already signed
+      // and do not need it, and attaching it to whatever host the response named
+      // is exactly how a credential leaks.
+      const headers: Record<string, string> = {};
+      if (url.hostname.toLowerCase() === apiHost) {
+        headers['WLT-Api-Key'] = opts.apiKey;
+      }
+
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      let res: Response;
+      try {
+        res = await doFetch(url.toString(), {
+          method: 'GET',
+          headers,
+          signal: controller.signal,
+        });
+      } catch (err) {
+        clearTimeout(timer);
+        if (err instanceof Error && err.name === 'AbortError') {
+          throw new ProviderTimeoutError(`asset download timed out after ${timeoutMs}ms`, rawUrl);
+        }
+        throw new ProviderError(`network error: ${String(err)}`, {
+          endpoint: rawUrl,
+          cause: err,
         });
       }
-      return Buffer.from(await res.arrayBuffer());
+
+      try {
+        if (!res.ok) {
+          throw new ProviderError(`asset download failed: ${res.status}`, {
+            status: res.status,
+            endpoint: rawUrl,
+          });
+        }
+        return await readBodyCapped(res, assetMaxBytes, rawUrl, controller);
+      } finally {
+        clearTimeout(timer);
+      }
     },
   };
 }

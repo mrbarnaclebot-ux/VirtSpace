@@ -530,6 +530,23 @@ once** per job. `jobs.provider_operation_id` drives three entry states:
 Provider CDN URLs are never exposed: every asset (SPZ 500k/100k, thumbnail,
 collider) is downloaded and re-hosted on **our** storage under `worlds/{id}/`.
 
+**Asset downloads are treated as untrusted input** (spec §10 R10). The URLs come
+from the provider's own JSON, so `downloadAsset`:
+
+- sends `WLT-Api-Key` **only** when the host is the API host. Signed CDN URLs
+  need no credential, and attaching one to a provider-chosen host is how a key
+  leaks;
+- requires **https** and an allowlisted host — `WORLDLABS_ASSET_HOSTS`
+  (comma-separated; a leading `.` matches subdomains), defaulting to
+  `api.worldlabs.ai` and `.worldlabs.ai`;
+- refuses non-routable hosts (loopback, RFC1918, CGNAT, and link-local
+  `169.254.169.254`, the cloud metadata endpoint) even if the allowlist names
+  one, so a misconfigured env cannot become an SSRF primitive;
+- enforces `WORLDLABS_ASSET_MAX_BYTES` (default **200 MB**) **while streaming**,
+  aborting the transfer rather than discovering the size after buffering it.
+  `Content-Length` is a fast path only — it is attacker-controlled and absent
+  under chunked encoding.
+
 ### Mock mode walkthrough (offline, zero credits)
 
 `PROVIDER_MODE=mock` (the default) runs the whole pipeline with **no network and

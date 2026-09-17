@@ -16,5 +16,9 @@ export function createProvider(config: Config): WorldGenProvider {
   if (!config.WORLDLABS_API_KEY) {
     throw new Error('PROVIDER_MODE=live requires WORLDLABS_API_KEY');
   }
-  return createWorldLabsProvider({ apiKey: config.WORLDLABS_API_KEY });
+  return createWorldLabsProvider({
+    apiKey: config.WORLDLABS_API_KEY,
+    ...(config.WORLDLABS_ASSET_HOSTS ? { assetHosts: config.WORLDLABS_ASSET_HOSTS } : {}),
+    assetMaxBytes: config.WORLDLABS_ASSET_MAX_BYTES,
+  });
 }
