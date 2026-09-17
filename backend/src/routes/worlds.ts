@@ -4,7 +4,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { getDb } from '../db/client.js';
 import { captures, worlds, type World } from '../db/schema.js';
 import { enqueue } from '../queue.js';
-import { chargeScanQuota } from '../quota.js';
+import { chargeScanQuota, releaseScanQuota } from '../quota.js';
 import { MAX_FRAME_BYTES, type StorageDriver } from '../storage/index.js';
 import type { RouteDeps } from './deps.js';
 
@@ -143,7 +143,29 @@ export function worldsRoutes(app: FastifyInstance, deps: RouteDeps): void {
       return reply.code(400).send({ error: 'invalid_body', issues: parsed.error.issues });
     }
     const body = parsed.data;
+    const sizes = frameSizeMap(body.frames);
     const db = getDb();
+
+    // Idempotency-Key (spec §10 R4): the client's capture-session UUID. A retry
+    // of a create that already succeeded must return the SAME world — not mint a
+    // second one, and not charge quota again.
+    const keyHeader = req.headers['idempotency-key'];
+    const rawKey = Array.isArray(keyHeader) ? keyHeader[0] : keyHeader;
+    let clientRequestId: string | null = null;
+    if (rawKey !== undefined) {
+      const key = z.string().uuid().safeParse(rawKey.trim());
+      if (!key.success) {
+        return reply
+          .code(400)
+          .send({ error: 'invalid_idempotency_key', detail: 'expected a UUID' });
+      }
+      clientRequestId = key.data;
+
+      const existing = await findWorldByClientRequestId(db, userId, clientRequestId);
+      if (existing) {
+        return replayCreate(reply, db, storage, existing, sizes);
+      }
+    }
 
     // Daily scan quota (spec §7). ONE conditional UPDATE … RETURNING — the
     // old read-then-write let two concurrent creates both pass at the limit
@@ -158,21 +180,35 @@ export function worldsRoutes(app: FastifyInstance, deps: RouteDeps): void {
     }
 
     // Create the world shell in the uploading state.
-    const [world] = await db
-      .insert(worlds)
-      .values({
-        ownerId: userId,
-        title: body.title ?? null,
-        lat: body.lat ?? null,
-        lng: body.lng ?? null,
-        status: 'uploading',
-      })
-      .returning();
+    let world: World;
+    try {
+      const [row] = await db
+        .insert(worlds)
+        .values({
+          ownerId: userId,
+          title: body.title ?? null,
+          lat: body.lat ?? null,
+          lng: body.lng ?? null,
+          status: 'uploading',
+          clientRequestId,
+        })
+        .returning();
+      world = row!;
+    } catch (err) {
+      // Concurrent duplicate: two in-flight creates with the same key. The
+      // unique index — not this handler — is what makes that impossible, so the
+      // loser refunds the scan it just charged and replays the winner's world.
+      if (!clientRequestId || !isUniqueViolation(err)) throw err;
+      await releaseScanQuota(db, userId);
+      const winner = await findWorldByClientRequestId(db, userId, clientRequestId);
+      if (!winner) throw err; // not our constraint after all — surface it.
+      return replayCreate(reply, db, storage, winner, sizes);
+    }
 
     // Create the capture row and its frame-key prefix.
     const [capture] = await db
       .insert(captures)
-      .values({ worldId: world!.id, frameCount: body.frame_count })
+      .values({ worldId: world.id, frameCount: body.frame_count })
       .returning();
     const prefix = `captures/${capture!.id}`;
     await db
@@ -182,15 +218,10 @@ export function worldsRoutes(app: FastifyInstance, deps: RouteDeps): void {
 
     // Presign one upload URL per frame, binding Content-Length for every frame
     // whose exact size the client declared (spec §10 R7).
-    const uploads = await presignFrameUploads(
-      storage,
-      prefix,
-      body.frame_count,
-      frameSizeMap(body.frames),
-    );
+    const uploads = await presignFrameUploads(storage, prefix, body.frame_count, sizes);
 
     return reply.code(201).send({
-      world: serializeWorld(world!),
+      world: serializeWorld(world),
       capture_id: capture!.id,
       uploads,
     });
@@ -411,6 +442,89 @@ async function presignFrameUploads(
       return { index: i, key, ...presigned };
     }),
   );
+}
+
+/**
+ * True when an error is a Postgres unique-constraint violation (SQLSTATE 23505).
+ * Drizzle may wrap the driver error, so the whole `cause` chain is inspected.
+ */
+export function isUniqueViolation(err: unknown): boolean {
+  let cur: unknown = err;
+  for (let depth = 0; cur && depth < 5; depth++) {
+    if (typeof cur === 'object' && (cur as { code?: unknown }).code === '23505') return true;
+    cur = (cur as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
+/** Look a world up by its owner's idempotency key, INCLUDING soft-deleted rows
+ * (a replayed key must not silently resurrect or duplicate a deleted world). */
+async function findWorldByClientRequestId(
+  db: ReturnType<typeof getDb>,
+  userId: string,
+  clientRequestId: string,
+): Promise<World | undefined> {
+  const [world] = await db
+    .select()
+    .from(worlds)
+    .where(
+      and(eq(worlds.ownerId, userId), eq(worlds.clientRequestId, clientRequestId)),
+    )
+    .limit(1);
+  return world;
+}
+
+/**
+ * Idempotent replay of POST /v1/worlds (spec §10 R4): the ORIGINAL world, the
+ * original capture id, and FRESH presigned upload URLs for the same keys (the
+ * first batch has almost certainly expired — that is usually why the client is
+ * retrying). Same body shape as a create, status 200 rather than 201 so the
+ * replay is visible in logs; the iOS client accepts any 2xx.
+ *
+ * A soft-deleted world is a 409, not a new create: reusing the key would either
+ * resurrect a world whose assets the purge job has destroyed or silently mint a
+ * second billable world behind the same key. The client decides (new key, or
+ * surface the deletion).
+ */
+async function replayCreate(
+  reply: FastifyReply,
+  db: ReturnType<typeof getDb>,
+  storage: StorageDriver,
+  world: World,
+  sizes: Map<number, number>,
+) {
+  if (world.deletedAt) {
+    return reply.code(409).send({
+      error: 'idempotency_key_world_deleted',
+      world_id: world.id,
+    });
+  }
+  const [capture] = await db
+    .select()
+    .from(captures)
+    .where(eq(captures.worldId, world.id))
+    .orderBy(desc(captures.createdAt))
+    .limit(1);
+  if (!capture || !capture.r2FramesPrefix) {
+    // The original create did not get as far as a usable capture row; there is
+    // nothing to hand back that the client could upload to.
+    return reply.code(409).send({
+      error: 'idempotency_key_incomplete_world',
+      world_id: world.id,
+    });
+  }
+  const uploads = await presignFrameUploads(
+    storage,
+    capture.r2FramesPrefix,
+    capture.frameCount,
+    sizes,
+  );
+  return reply.code(200).send({
+    world: serializeWorld(world),
+    capture_id: capture.id,
+    uploads,
+    idempotent_replay: true,
+  });
 }
 
 async function findOwnedWorld(

@@ -9,6 +9,7 @@ import {
   timestamp,
   jsonb,
   index,
+  uniqueIndex,
 } from 'drizzle-orm/pg-core';
 
 // Data model — spec §7. Asset columns store R2/storage *keys*; signed URLs are
@@ -64,6 +65,12 @@ export const worlds = pgTable(
       .references(() => users.id),
     title: text('title'),
     caption: text('caption'),
+    // Client-supplied idempotency key (the capture session UUID, sent as the
+    // `Idempotency-Key` header on POST /v1/worlds — spec §10 R4). Unique per
+    // owner, so a retried create returns the SAME world instead of minting a
+    // second billable one. NULL for clients that send no key (many NULLs are
+    // allowed by a Postgres unique index).
+    clientRequestId: text('client_request_id'),
     lat: doublePrecision('lat'),
     lng: doublePrecision('lng'),
     placeName: text('place_name'),
@@ -100,7 +107,12 @@ export const worlds = pgTable(
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
     deletedAt: timestamp('deleted_at', { withTimezone: true }),
   },
-  (t) => [index('worlds_owner_idx').on(t.ownerId)],
+  (t) => [
+    index('worlds_owner_idx').on(t.ownerId),
+    // The idempotency guarantee itself: the DB, not the request handler, is what
+    // makes a concurrent double-create impossible (spec §10 R4).
+    uniqueIndex('worlds_owner_client_request_idx').on(t.ownerId, t.clientRequestId),
+  ],
 );
 
 export const captures = pgTable('captures', {

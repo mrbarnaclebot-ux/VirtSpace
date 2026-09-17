@@ -142,6 +142,25 @@ export async function chargeScanQuota(
 }
 
 /**
+ * Give back one charged scan (spec §10 R4). Used when a create is charged and
+ * then loses the `Idempotency-Key` insert race: the winner's world is returned,
+ * so the loser's charge bought nothing and must not count against the user.
+ *
+ * Only ever decrements inside a LIVE window (a new window would have reset the
+ * counter anyway) and never below zero, so a duplicated refund cannot mint
+ * quota out of thin air.
+ */
+export async function releaseScanQuota(db: Db, userId: string): Promise<void> {
+  await db.execute(sql`
+    UPDATE users
+    SET daily_scan_count = GREATEST(daily_scan_count - 1, 0)
+    WHERE id = ${userId}
+      AND quota_reset_at IS NOT NULL
+      AND quota_reset_at > now()
+  `);
+}
+
+/**
  * Read-only quota snapshot for GET /v1/me/quota — the same window logic as
  * evaluateQuota, without persisting anything. If the reset window has passed (or
  * never opened) the user is back to a full allowance and there is no active

@@ -108,6 +108,25 @@ test/                vitest: config, storage, auth, quota/backoff
   devices, mark the user deleted. **After deletion every authenticated request
   from that identity is `403 {"error":"account_deleted"}`** — see below.
 
+### Idempotent world creation (spec §10 R4)
+
+`POST /v1/worlds` accepts an optional **`Idempotency-Key: <UUID>`** header — the
+client's capture-session UUID. Without it the endpoint behaves exactly as before.
+
+| Case | Result |
+|---|---|
+| First request with a key | `201` — world created, key stored in `worlds.client_request_id`, quota charged once |
+| Repeat with the same key | `200` — the **same** world + capture id, **fresh** presigned upload URLs for the same keys, `idempotent_replay: true`. No second row, no second quota charge |
+| Key present but not a UUID | `400 invalid_idempotency_key` (before any quota charge) |
+| Key maps to a **soft-deleted** world | `409 idempotency_key_world_deleted` (+ `world_id`) — the client decides: new key, or surface the deletion. Reusing it would resurrect a purged world or hide a second billable one behind the same key |
+| Key maps to a world with no usable capture row | `409 idempotency_key_incomplete_world` |
+| Two concurrent requests, same key | The `worlds_owner_client_request_idx` unique index decides; the loser refunds its scan (`releaseScanQuota`) and replays the winner's world (`200`) |
+
+Uniqueness is enforced by the database — `UNIQUE (owner_id, client_request_id)`,
+migration `drizzle/0003_heavy_maddog.sql` — not by a check in the handler, so the
+concurrent case cannot slip through. Many NULLs are allowed, so keyless creates
+are unaffected.
+
 ### Upload size caps (spec §10 R7)
 
 `s3.presignUpload` used to take a `_maxBytes` argument and ignore it, so a
@@ -178,8 +197,11 @@ production traffic a shared-token auth mode silently. The config loader now
 Drizzle-kit is schema-first: edit `src/db/schema.ts`, then `npm run db:generate`
 writes a timestamped SQL file + snapshot into `drizzle/`. `generate` needs **no**
 database connection. `npm run db:migrate` applies pending files to
-`DATABASE_URL`. Committed migrations: `0000_*.sql` (initial schema) and
-`0001_*.sql` (the `credit_events` ledger for the Stage-2 budget guard).
+`DATABASE_URL`. Committed migrations: `0000_*.sql` (initial schema), `0001_*.sql` (the
+`credit_events` ledger for the Stage-2 budget guard), `0002_*.sql` (pipeline
+progress + heartbeat columns) and `0003_heavy_maddog.sql`
+(`worlds.client_request_id` + its per-owner unique index — idempotent create,
+spec §10 R4).
 
 ## Dev storage (`STORAGE_DRIVER=local`)
 
