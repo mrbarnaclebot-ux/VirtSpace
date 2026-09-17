@@ -1008,6 +1008,14 @@ async function handleGenerate(
       updatedAt: sql`now()`,
       provider: provider.mode === 'mock' ? 'mock' : 'worldlabs',
       creditsSpent: sql`${worlds.creditsSpent} + ${cost}`,
+      // The HQ pass OVERWRITES the draft's asset objects — assetKeyFor is not
+      // version-scoped, so `worlds/<id>/splat_500k.spz` now holds marble-1.1
+      // bytes at the same key and the same signed URL shape. asset_version is
+      // the client's cache key for exactly this (iOS passes it to SplatCache),
+      // and nothing incremented it, so a finished enhance left every client
+      // serving its cached DRAFT splat forever — the enhance was invisible.
+      // Bumped only on the HQ pass: the draft IS version 1.
+      ...(isDraft ? {} : { assetVersion: sql`${worlds.assetVersion} + 1` }),
       ...result.assetKeys,
       ...(result.caption ? { caption: result.caption } : {}),
       ...(isDraft
