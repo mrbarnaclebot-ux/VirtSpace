@@ -25,6 +25,10 @@
 //  stands in, over which a Canvas paints a simplified equivalent of the same
 //  quads using the shared projection math.
 //
+//  Session attachment is DEFERRED (crash fix, iOS 27): the ARSession is handed
+//  to the ARSCNView on a main-actor hop, never from inside SwiftUI's make /
+//  update pass. See CameraPreviewHost below for the full why.
+//
 
 import simd
 import SwiftUI
@@ -32,6 +36,7 @@ import SwiftUI
 #if !targetEnvironment(simulator)
 import ARKit
 import SceneKit
+import UIKit
 
 struct CameraPreviewView: UIViewRepresentable {
     let session: ARSession
@@ -45,9 +50,9 @@ struct CameraPreviewView: UIViewRepresentable {
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
-    func makeUIView(context: Context) -> ARSCNView {
-        let view = ARSCNView(frame: .zero)
-        view.session = session
+    func makeUIView(context: Context) -> CameraPreviewHost {
+        let host = CameraPreviewHost(frame: .zero)
+        let view = host.sceneView
         view.scene = SCNScene()
         view.automaticallyUpdatesLighting = false
         view.antialiasingMode = .none
@@ -55,13 +60,20 @@ struct CameraPreviewView: UIViewRepresentable {
         // Cap the render loop: a viewfinder, not a game (deliverable 2d). The
         // live feed still updates every session frame, just rate-limited.
         view.preferredFramesPerSecond = preferredFPS
-        return view
+        // Deliberately NOT `view.session = session` here — that assignment is
+        // what crashed on iOS 27 when made from inside SwiftUI's update pass
+        // (see CameraPreviewHost). The host applies it on a later hop.
+        host.attach(session)
+        return host
     }
 
-    func updateUIView(_ view: ARSCNView, context: Context) {
-        if view.session !== session {
-            view.session = session
-        }
+    func updateUIView(_ host: CameraPreviewHost, context: Context) {
+        // A session swap (new scan) takes the same deferred, guarded route:
+        // assigning it inline here would re-enter ARKit's lock exactly as
+        // makeUIView's assignment did.
+        host.attach(session)
+
+        let view = host.sceneView
         view.preferredFramesPerSecond = preferredFPS
 
         // Session reset (new scan) → clear painted quads.
@@ -77,6 +89,17 @@ struct CameraPreviewView: UIViewRepresentable {
             let node = Self.makeQuadNode(for: shot, radius: radius)
             view.scene.rootNode.addChildNode(node)
         }
+    }
+
+    /// Teardown. We only drop the queued attach so a hop that outlives the
+    /// representable can't touch a stale session; we deliberately do NOT hand
+    /// the ARSCNView a different session to "detach" it, because re-assigning
+    /// `session` is precisely the call that re-enters ARKit's lock, and
+    /// dismantle runs inside SwiftUI's update pass. The engine's
+    /// ARKitCaptureSource owns the session lifecycle and has already stopped it
+    /// by the time this view goes away — this view never runs or pauses it.
+    static func dismantleUIView(_ host: CameraPreviewHost, coordinator: Coordinator) {
+        host.cancelPendingAttach()
     }
 
     /// Build a textured, unlit, single-sided quad sized to the camera FOV at
@@ -121,6 +144,96 @@ struct CameraPreviewView: UIViewRepresentable {
 
     final class Coordinator {
         var addedIndices = Set<Int>()
+    }
+}
+
+/// Wrapper that owns the ARSCNView and gives it the ARSession from OUTSIDE
+/// SwiftUI's make/update pass.
+///
+/// WHY (crash fix — EXC_BREAKPOINT, "Trying to recursively lock an
+/// os_unfair_lock", main thread, iOS 27): `-[ARSession setViewLayer:]` takes
+/// the session's unfair lock and, while still holding it, synchronously
+/// delivers the current preview rotation angle to the view. ARSCNView responds
+/// by publishing an orientation swap, which runs a UIKit layout pass inline,
+/// which re-enters SwiftUI's graph update. When the original assignment came
+/// from `makeUIView`, SwiftUI has no view for this representable yet, so the
+/// re-entrant update calls `makeUIView` a SECOND time — a second
+/// `setSession:` on the same ARSession, whose `setViewLayer:` then tries to
+/// take the lock the outer call is still holding, and libplatform aborts.
+///
+/// Hopping the assignment onto the main actor means `makeUIView` has long
+/// returned before ARKit re-enters, so the worst case is a redundant
+/// `updateUIView` (a no-op — the session is already pending/attached) instead
+/// of a recursive `makeUIView`. `isAttaching` is a second fuse for the case
+/// where the inline layout pass drains the main queue re-entrantly.
+///
+/// Like the ARSCNView it wraps, this view never runs or pauses the session:
+/// the engine's ARKitCaptureSource stays the sole owner of that lifecycle.
+final class CameraPreviewHost: UIView {
+    let sceneView = ARSCNView(frame: .zero)
+
+    /// The session we've been asked to show. Cleared on dismantle so a hop
+    /// that outlives the representable can't attach to a stale session.
+    private var pendingSession: ARSession?
+    /// True while `setSession:` is on the stack — re-entrancy fuse.
+    private var isAttaching = false
+    /// At most one hop in flight at a time.
+    private var isAttachScheduled = false
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        sceneView.frame = bounds
+        sceneView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        addSubview(sceneView)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("CameraPreviewHost is code-only")
+    }
+
+    /// Ask for `session` to be shown. Safe to call from inside a SwiftUI
+    /// update and idempotent: the assignment itself happens on a later hop.
+    func attach(_ session: ARSession) {
+        guard pendingSession !== session else { return }
+        pendingSession = session
+        scheduleAttach()
+    }
+
+    /// Drop the queued attach (representable torn down).
+    func cancelPendingAttach() {
+        pendingSession = nil
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        // The hop can fire before SwiftUI has put us on screen; try again now
+        // that it has — still deferred, never inline, because this callback is
+        // itself delivered from inside SwiftUI's update.
+        if window != nil { scheduleAttach() }
+    }
+
+    private func scheduleAttach() {
+        guard !isAttachScheduled, pendingSession != nil else { return }
+        isAttachScheduled = true
+        // A main-actor hop, NOT a synchronous call: this has to land after
+        // SwiftUI's current graph update has unwound.
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.isAttachScheduled = false
+            self.attachIfNeeded()
+        }
+    }
+
+    /// Attaches at most once per session identity, and only while we're really
+    /// on screen — a view already torn down (or pointed at a newer session)
+    /// never touches the old one.
+    private func attachIfNeeded() {
+        guard !isAttaching, window != nil else { return }
+        guard let session = pendingSession, sceneView.session !== session else { return }
+        isAttaching = true
+        defer { isAttaching = false }
+        sceneView.session = session
     }
 }
 #endif
