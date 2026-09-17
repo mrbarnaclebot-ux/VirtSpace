@@ -18,19 +18,78 @@ final class APIClient {
     private let decoder: JSONDecoder
     private let encoder: JSONEncoder
 
+    /// Host of the owner's production backend (Railway). Named so the DEBUG
+    /// simulator guard below can recognise it without re-deriving it from a
+    /// string literal at the call site.
+    static let productionHost = "api-production-dbd38.up.railway.app"
+
+    /// Fallback used whenever a DEBUG run must not be allowed near production
+    /// (simulator guard, XCTest host). Points at a local backend/mock.
+    static let localBaseURL = "http://localhost:8080"
+
     /// Resolve the backend base URL. In DEBUG a `VIRTSPACE_API_BASE_URL` launch
     /// env var (e.g. a local mock backend) overrides the compiled-in default so
     /// upload/resume flows can be exercised end-to-end off production. Never
     /// consulted in release builds.
     static var defaultBaseURL: String {
         #if DEBUG
+        // Hosted unit tests launch the real app process. Pin them to localhost
+        // so nothing a test does can reach a deployed backend, and so the
+        // production guard below can never fatalError the test host.
+        if isRunningUnderXCTest { return localBaseURL }
         if let override = ProcessInfo.processInfo.environment["VIRTSPACE_API_BASE_URL"],
            !override.isEmpty {
-            return override
+            return guardAgainstProduction(override)
+        }
+        return guardAgainstProduction(Secrets.apiBaseURL)
+        #else
+        return Secrets.apiBaseURL
+        #endif
+    }
+
+    #if DEBUG
+    /// True when the process was launched by XCTest (hosted test bundle).
+    static var isRunningUnderXCTest: Bool {
+        ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+    }
+
+    /// Production-data guard (spec §10 R5). A DEBUG **simulator** run that
+    /// resolves to the production host is an accident in nearly every case —
+    /// agent/QA sim runs have previously written real frames into the owner's
+    /// production library and burned the daily scan quota, because launch-time
+    /// resume/recovery kicks create real state before anyone touches the UI.
+    /// Such a run dies immediately with an explanation; set
+    /// `VIRTSPACE_ALLOW_PROD=1` in the scheme's environment for a deliberate
+    /// production check from the simulator.
+    ///
+    /// On a physical device this is a no-op: the owner routinely runs DEBUG
+    /// builds against production with free provisioning, and that must keep
+    /// working unchanged.
+    private static func guardAgainstProduction(_ urlString: String) -> String {
+        #if targetEnvironment(simulator)
+        let host = URLComponents(string: urlString)?.host ?? ""
+        if host == productionHost,
+           ProcessInfo.processInfo.environment["VIRTSPACE_ALLOW_PROD"] != "1" {
+            fatalError("""
+            Refusing to run a DEBUG simulator build against PRODUCTION (\(host)).
+
+            Simulator runs create real data: launch-time upload resume/recovery \
+            mints worlds, uploads frames and spends the daily scan quota before \
+            you touch the UI.
+
+            Fix one of these:
+              • point the run at a local backend/mock: set VIRTSPACE_API_BASE_URL \
+            (e.g. http://localhost:8080) in the scheme's Run → Arguments → \
+            Environment Variables, or
+              • if you really mean production, set VIRTSPACE_ALLOW_PROD=1 there too.
+
+            Physical-device DEBUG builds are unaffected by this guard.
+            """)
         }
         #endif
-        return Secrets.apiBaseURL
+        return urlString
     }
+    #endif
 
     init(baseURL: String = APIClient.defaultBaseURL, session: URLSession = .shared) {
         // Trim any trailing slash so path joins are clean.
