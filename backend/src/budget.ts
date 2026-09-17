@@ -56,10 +56,20 @@ export async function reserveCredits(
     // Serialize budget checks across workers for the duration of this txn.
     await tx.execute(sql`SELECT pg_advisory_xact_lock(${BUDGET_LOCK_KEY})`);
 
+    // The day window is pinned to UTC. `date_trunc('day', now())` follows the
+    // session's TimeZone, so the budget would reset at whatever local midnight
+    // the connection happened to inherit — and two connections with different
+    // TimeZone settings would disagree about which day a charge belongs to.
+    //
+    // `AT TIME ZONE 'UTC'` twice is deliberate, not redundant: the first
+    // converts timestamptz -> naive UTC wall time so date_trunc cuts on the UTC
+    // day, the second converts that naive midnight back to a timestamptz. Drop
+    // the second and Postgres would re-interpret midnight in the SESSION zone,
+    // reintroducing exactly the bug this fixes.
     const res = await tx.execute<{ total: string | number | null }>(sql`
       SELECT COALESCE(SUM(amount), 0) AS total
       FROM credit_events
-      WHERE created_at >= date_trunc('day', now())
+      WHERE created_at >= (date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')
     `);
     const rows = (res as unknown as { rows: { total: string | number | null }[] }).rows;
     const spentToday = Number(rows[0]?.total ?? 0);
