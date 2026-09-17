@@ -100,6 +100,7 @@ export function makeAuthPreHandler(config: Config): preHandlerHookHandler {
       const res = parseDevAuth(req.headers, config.DEV_AUTH_TOKEN);
       if (!res.ok) return reply.code(res.status).send({ error: res.message });
       const user = await upsertUserBySub(getDb(), res.subject, res.displayName);
+      if (user.deletedAt) return replyAccountDeleted(reply);
       req.userId = user.id;
       return;
     }
@@ -107,16 +108,34 @@ export function makeAuthPreHandler(config: Config): preHandlerHookHandler {
     // apple mode
     const token = bearerFrom(req);
     if (!token) return reply.code(401).send({ error: 'missing bearer token' });
+    let userId: string;
     try {
       const { subject, email } = await verifyAppleToken(
         token,
         config.APPLE_BUNDLE_ID as string,
       );
       const user = await upsertUserBySub(getDb(), subject, email ?? null);
-      req.userId = user.id;
+      if (user.deletedAt) return replyAccountDeleted(reply);
+      userId = user.id;
     } catch (err) {
       req.log.warn({ err }, 'apple token verification failed');
       return reply.code(401).send({ error: 'invalid apple identity token' });
     }
+    req.userId = userId;
   };
+}
+
+/**
+ * Deleted accounts stay deleted (spec §10 R3 / §13). `users.deleted_at` was
+ * written by DELETE /v1/account but never read, so a deleted account's token
+ * kept working and kept being upserted. Re-signing in with the SAME identity
+ * subject is refused rather than resurrecting or forking the row: the purge job
+ * has already destroyed that user's worlds and frames, so "reviving" them would
+ * hand back an account whose data is gone, and minting a second row for the same
+ * `apple_sub` is impossible (the column is UNIQUE) without rewriting identity —
+ * which would silently break any surviving foreign keys. A genuinely new user is
+ * a new Apple `sub` and gets a fresh row as usual.
+ */
+function replyAccountDeleted(reply: FastifyReply) {
+  return reply.code(403).send({ error: 'account_deleted' });
 }

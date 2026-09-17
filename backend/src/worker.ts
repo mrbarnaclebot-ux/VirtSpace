@@ -658,6 +658,17 @@ async function handlePurge(deps: WorkerDeps, job: Job): Promise<void> {
     }
   }
 
+  // Purge the per-frame ARKit poses too (spec §13 data minimization / §10 R3).
+  // poses_json is personal motion data whose only consumer is the stitcher; once
+  // the frames it describes are gone it is dead weight that survived deletion.
+  // Applies to the frames-only (reaper) path as well — same frames, same poses.
+  if (caps.length > 0) {
+    await db
+      .update(captures)
+      .set({ posesJson: null })
+      .where(eq(captures.worldId, worldId));
+  }
+
   await completeJob(db, job.id);
 }
 

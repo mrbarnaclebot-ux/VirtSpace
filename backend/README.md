@@ -100,7 +100,23 @@ test/                vitest: config, storage, auth, quota/backoff
 - `DELETE /v1/worlds/:id` — soft delete + enqueue `purge`.
 - `POST /v1/devices` — upsert an APNs token.
 - `DELETE /v1/account` — soft-delete the user's worlds (+ enqueue purges), delete
-  devices, mark the user deleted.
+  devices, mark the user deleted. **After deletion every authenticated request
+  from that identity is `403 {"error":"account_deleted"}`** — see below.
+
+### Account deletion semantics (spec §13 / §10 R3)
+
+- **Deleted stays deleted.** `users.deleted_at` is read by the auth preHandler in
+  **both** modes: a deleted user is rejected with `403 account_deleted` instead of
+  being re-upserted and served. Re-signing in with the *same* Apple `sub` does
+  **not** resurrect the account and does **not** mint a second row (`apple_sub` is
+  UNIQUE, and the purge job has already destroyed that user's worlds and frames —
+  a revived row would point at deleted data). A genuinely new user has a new
+  Apple `sub` and gets a fresh row as usual. Re-admitting a previously deleted
+  `sub` would need an explicit product decision (e.g. rewriting the old row's
+  `apple_sub` to a tombstone value on delete); it is deliberately not done here.
+- **Purge nulls `captures.poses_json`.** The per-frame ARKit poses are personal
+  motion data whose only consumer is the stitcher; the purge job now clears them
+  alongside the frame objects (including on the reaper's frames-only purge).
 
 ## Auth
 
