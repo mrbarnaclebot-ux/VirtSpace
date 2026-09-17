@@ -576,6 +576,21 @@ captures additionally exercise the Python stitcher — ensure `PYTHON_BIN` point
 at a venv with `stitcher/requirements.txt` installed; see
 [Stitcher](#stitcher-spec-5--phase-05).)
 
+## Known leftovers
+
+Deliberately not fixed — recorded so the next reader does not mistake them for
+oversights.
+
+- **`worlds.spz_full_url` is a dead column.** Nothing writes it: the worker
+  re-hosts only the 100k and 500k SPZ tiers (spec §3.2 — `full_res` is an
+  export/desktop concern, and WKWebView has a hard memory ceiling), and
+  `getWorld` parses `full_res` into `spzUrls.full` which `collectAssets` never
+  stores. It *is* still presigned into the detail response's `assets` object, so
+  it reads as `null` for every world. Left in place: dropping a column is a
+  destructive, irreversible migration to reclaim a few bytes per row, and the
+  column is the obvious place to put the full-res URL if the export path ever
+  ships. Treat it as reserved, not as a bug.
+
 ## Notes / boundaries
 
 - No DB connection is made on boot — the `pg` pool is created lazily on the first
