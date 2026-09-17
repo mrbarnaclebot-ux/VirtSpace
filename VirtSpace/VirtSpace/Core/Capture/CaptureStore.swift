@@ -55,10 +55,51 @@ final class CaptureStore {
         /// Frame indices confirmed uploaded to R2. A resume skips these and only
         /// re-PUTs the rest. Written after each confirmed upload → crash-safe.
         var uploadedFrameIndices: [Int]
+        /// Idempotency-Key for this session's `POST /v1/worlds`, persisted
+        /// BEFORE the request goes out. A kill between request and response
+        /// therefore can't double-create: the retry replays the same key and
+        /// the backend returns the same world. Regenerated (and re-persisted,
+        /// still before the request) only when we deliberately mint a
+        /// REPLACEMENT world because the old one was deleted server-side.
+        var worldRequestId: UUID?
+        /// Automatic upload attempts that failed for a real reason. Drives the
+        /// backoff schedule and, at `maxAutomaticAttempts`, parks the session.
+        /// Reset to 0 by a user-initiated retry.
+        var attemptCount: Int
+        /// When the last attempt ran (successful or not) — the backoff clock.
+        var lastAttemptAt: Date?
+
+        /// Failed attempts after which automatic retrying stops entirely: no
+        /// more uploads, and crucially no more automatic fresh-world minting
+        /// (each mint is billable — the R4 finding). The session then waits for
+        /// an explicit user "Retry upload" or "Discard".
+        static let maxAutomaticAttempts = 5
+
+        /// Delay before automatic attempt n+1, indexed by `attemptCount`:
+        /// 1 min, 5 min, 30 min, 2 h, 6 h.
+        static let backoffDelays: [TimeInterval] = [60, 300, 1_800, 7_200, 21_600]
 
         var isComplete: Bool { frames.count >= expectedFrameCount }
 
         func isUploaded(_ index: Int) -> Bool { uploadedFrameIndices.contains(index) }
+
+        /// True once automatic retrying has given up on this session.
+        var isParked: Bool { attemptCount >= Self.maxAutomaticAttempts }
+
+        /// Earliest time an automatic retry may run again; nil when no attempt
+        /// has been made yet (retry immediately).
+        var nextAutomaticAttemptAt: Date? {
+            guard let lastAttemptAt else { return nil }
+            let index = min(attemptCount, Self.backoffDelays.count - 1)
+            return lastAttemptAt.addingTimeInterval(Self.backoffDelays[index])
+        }
+
+        /// Whether an automatic sweep may work this session right now.
+        func isReadyForAutomaticRetry(now: Date = Date()) -> Bool {
+            guard !isParked else { return false }
+            guard let next = nextAutomaticAttemptAt else { return true }
+            return now >= next
+        }
 
         init(
             sessionID: UUID,
@@ -66,7 +107,10 @@ final class CaptureStore {
             createdAt: Date,
             frames: [FramePose],
             createdWorldId: String? = nil,
-            uploadedFrameIndices: [Int] = []
+            uploadedFrameIndices: [Int] = [],
+            worldRequestId: UUID? = nil,
+            attemptCount: Int = 0,
+            lastAttemptAt: Date? = nil
         ) {
             self.sessionID = sessionID
             self.expectedFrameCount = expectedFrameCount
@@ -74,6 +118,9 @@ final class CaptureStore {
             self.frames = frames
             self.createdWorldId = createdWorldId
             self.uploadedFrameIndices = uploadedFrameIndices
+            self.worldRequestId = worldRequestId
+            self.attemptCount = attemptCount
+            self.lastAttemptAt = lastAttemptAt
         }
 
         enum CodingKeys: String, CodingKey {
@@ -83,10 +130,14 @@ final class CaptureStore {
             case frames
             case createdWorldId = "created_world_id"
             case uploadedFrameIndices = "uploaded_frame_indices"
+            case worldRequestId = "world_request_id"
+            case attemptCount = "attempt_count"
+            case lastAttemptAt = "last_attempt_at"
         }
 
-        // Custom decode so manifests written before the resume fields existed
-        // (older sessions on disk) still load — the new fields default cleanly.
+        // Custom decode so manifests written before the resume/attempt fields
+        // existed (older sessions on disk) still load — the new fields default
+        // cleanly: no world request id yet, zero attempts, never attempted.
         init(from decoder: Decoder) throws {
             let c = try decoder.container(keyedBy: CodingKeys.self)
             sessionID = try c.decode(UUID.self, forKey: .sessionID)
@@ -95,6 +146,9 @@ final class CaptureStore {
             frames = try c.decode([FramePose].self, forKey: .frames)
             createdWorldId = try c.decodeIfPresent(String.self, forKey: .createdWorldId)
             uploadedFrameIndices = try c.decodeIfPresent([Int].self, forKey: .uploadedFrameIndices) ?? []
+            worldRequestId = try c.decodeIfPresent(UUID.self, forKey: .worldRequestId)
+            attemptCount = try c.decodeIfPresent(Int.self, forKey: .attemptCount) ?? 0
+            lastAttemptAt = try c.decodeIfPresent(Date.self, forKey: .lastAttemptAt)
         }
     }
 
@@ -132,8 +186,14 @@ final class CaptureStore {
     }()
     private let decoder = JSONDecoder()
 
-    init(fileManager: FileManager = .default) {
+    /// `baseDirectory` overrides where sessions live; tests point it at a temp
+    /// directory so they never touch the real captures folder.
+    init(fileManager: FileManager = .default, baseDirectory: URL? = nil) {
         self.fileManager = fileManager
+        if let baseDirectory {
+            self.baseDirectory = baseDirectory
+            return
+        }
         let support = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? fileManager.temporaryDirectory
         self.baseDirectory = support.appendingPathComponent("captures", isDirectory: true)
@@ -192,6 +252,56 @@ final class CaptureStore {
         mutateManifest(id: id, in: directory) { m in
             m.createdWorldId = nil
             m.uploadedFrameIndices = []
+        }
+    }
+
+    /// The Idempotency-Key to send with this session's `POST /v1/worlds`,
+    /// PERSISTED BEFORE the caller makes that request (spec §10 R4).
+    ///
+    /// - `renew: false` — the key for this session's world. Reuses the stored
+    ///   one if there is one; otherwise adopts the session's own UUID, so the
+    ///   very first mint keys on the session id. Every retry of the same
+    ///   logical request replays the same key, and the backend returns the same
+    ///   world instead of minting (and billing) a second one.
+    /// - `renew: true` — a brand-new key, for the one case where a NEW world is
+    ///   genuinely wanted: the previous world was deleted server-side. Written
+    ///   to disk before the request returns, so a kill in that window still
+    ///   can't double-create — the retry replays the new key.
+    @discardableResult
+    func worldRequestId(forSession id: UUID, in directory: URL, renew: Bool = false) -> UUID {
+        var assigned = id
+        mutateManifest(id: id, in: directory) { m in
+            if renew || m.worldRequestId == nil {
+                m.worldRequestId = renew ? UUID() : m.sessionID
+            }
+            assigned = m.worldRequestId ?? id
+        }
+        return assigned
+    }
+
+    /// Record that an upload attempt for this session just finished failing.
+    /// `countsTowardParking` is false for failures that say nothing about the
+    /// session's health — no connectivity, or a quota/credit refusal (429):
+    /// those must never push a perfectly good capture toward being parked, but
+    /// they do update the clock so the next automatic try still backs off.
+    func recordFailedAttempt(
+        forSession id: UUID,
+        in directory: URL,
+        countsTowardParking: Bool,
+        at date: Date = Date()
+    ) {
+        mutateManifest(id: id, in: directory) { m in
+            if countsTowardParking { m.attemptCount += 1 }
+            m.lastAttemptAt = date
+        }
+    }
+
+    /// Clear the attempt counter — a user-initiated retry starts the automatic
+    /// budget over (and un-parks the session).
+    func resetUploadAttempts(forSession id: UUID, in directory: URL) {
+        mutateManifest(id: id, in: directory) { m in
+            m.attemptCount = 0
+            m.lastAttemptAt = nil
         }
     }
 

@@ -59,22 +59,41 @@ final class UploadManager {
         }
     }
 
-    /// Retry every session left on disk (stranded-completion first, then full
-    /// resume). Returns the worlds whose pipelines were (re)started.
+    /// Retry the sessions left on disk (stranded-completion first, then full
+    /// resume). `userInitiated` marks the user's explicit Retry: it clears the
+    /// attempt counter, ignores backoff and un-parks the session.
     @discardableResult
     func kickResume(
         api: APIClient,
+        userInitiated: Bool = false,
         progress: @escaping (Int) -> Void = { _ in }
-    ) -> Task<[World], Never> {
+    ) -> Task<ResumeOutcome, Never> {
         enqueue {
-            AppLog.upload.log("UploadManager: resume flow started")
+            AppLog.upload.log("UploadManager: resume flow started (userInitiated: \(userInitiated))")
             let uploader = CaptureUploader(api: api)
             // Cheap idempotent recovery for the exact stranded state first.
-            _ = await uploader.completeStrandedSessions()
-            let worlds = await uploader.resumePending(progress: progress)
-            AppLog.upload.log("UploadManager: resume flow finished (\(worlds.count) uploaded)")
-            return worlds
+            let stranded = await uploader.completeStrandedSessions(userInitiated: userInitiated)
+            let outcome = await uploader.resumePending(userInitiated: userInitiated, progress: progress)
+            AppLog.upload.log("UploadManager: resume flow finished (\(stranded) stranded completed, outcome: \(String(describing: outcome), privacy: .public))")
+            // A stranded session finished by frames:done IS a success even when
+            // the sweep itself had nothing left to upload.
+            if stranded > 0, case .nothingToResume = outcome { return .succeeded([]) }
+            return outcome
         }
+    }
+
+    /// Throw away the pending capture sessions at the user's request (the
+    /// "Discard" half of the parked-upload choice).
+    @discardableResult
+    func kickDiscardPending(api: APIClient) -> Task<Int, Never> {
+        enqueue {
+            await CaptureUploader(api: api).discardPending()
+        }
+    }
+
+    /// What's waiting on disk, for the capture screen's affordances.
+    func pendingSummary(api: APIClient) -> PendingUploadSummary {
+        CaptureUploader(api: api).pendingSummary()
     }
 
     /// Completion kick (launch + every scenePhase → .active): any pending

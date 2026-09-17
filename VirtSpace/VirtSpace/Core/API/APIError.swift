@@ -48,4 +48,58 @@ enum APIError: Error, LocalizedError {
         guard let message, !message.isEmpty else { return true }
         return message.localizedCaseInsensitiveContains("world_not_found")
     }
+
+    /// True when `POST /v1/worlds` refuses a replayed `Idempotency-Key` because
+    /// the world it originally created has since been deleted (HTTP 409). The
+    /// key is spent and can never produce a world again; the caller must
+    /// persist a NEW key and retry with it (spec §10 R4).
+    var isIdempotencyConflict: Bool {
+        guard case let .server(status, _) = self, status == 409 else { return false }
+        return true
+    }
+
+    /// True when the failure is "the network isn't there right now" — the
+    /// device is offline, the request timed out, the connection dropped. These
+    /// say nothing about whether the capture or the backend is healthy, so they
+    /// must never count toward parking a session (spec §10 R4).
+    var isConnectivityFailure: Bool {
+        guard case let .network(underlying) = self else { return false }
+        let error = underlying as NSError
+        guard error.domain == NSURLErrorDomain else { return false }
+        switch error.code {
+        case NSURLErrorNotConnectedToInternet,
+             NSURLErrorNetworkConnectionLost,
+             NSURLErrorTimedOut,
+             NSURLErrorCannotConnectToHost,
+             NSURLErrorCannotFindHost,
+             NSURLErrorDNSLookupFailed,
+             NSURLErrorInternationalRoamingOff,
+             NSURLErrorDataNotAllowed,
+             NSURLErrorCallIsActive,
+             NSURLErrorSecureConnectionFailed:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Whether a failed upload attempt should count toward parking the session.
+    /// Quota refusals (402/429) and connectivity failures don't: the capture is
+    /// fine, the world just can't be made *right now*.
+    var countsTowardParking: Bool {
+        switch self {
+        case .quota: return false
+        default: return !isConnectivityFailure
+        }
+    }
+}
+
+extension Error {
+    /// Same question for an arbitrary error: anything that isn't a recognised
+    /// APIError counts (we can't prove it's transient), except a bare URL-level
+    /// connectivity error.
+    var countsTowardUploadParking: Bool {
+        if let apiError = self as? APIError { return apiError.countsTowardParking }
+        return APIError.network(self).countsTowardParking
+    }
 }

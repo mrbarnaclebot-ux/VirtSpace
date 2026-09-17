@@ -9,30 +9,78 @@
 //  keeps the session directory; `resumePending()` retries complete sessions
 //  found on disk (crash/offline recovery, spec §6.1).
 //
+//  Retry policy (spec §10 R4 — this used to retry forever, minting a fresh
+//  BILLABLE world per attempt for a session the backend kept rejecting):
+//    • `POST /v1/worlds` carries an `Idempotency-Key` persisted BEFORE the
+//      request, so a kill or retry in that window returns the same world.
+//    • Automatic retries back off (1 m, 5 m, 30 m, 2 h, 6 h) and stop entirely
+//      after 5 real failures: the session is PARKED — no more uploads and no
+//      more automatic world minting — until the user explicitly retries or
+//      discards it.
+//    • Quota refusals and "there's no network" don't count toward that budget,
+//      and a quota refusal never mints a replacement world.
+//
 
 import Foundation
 import OSLog
 
+/// What a resume sweep actually did. `resumePending` used to swallow every
+/// failure with `try?` and return an array, so the UI could only ever say
+/// "failed again" — including when nothing was pending, or when the session was
+/// simply waiting out its backoff (spec §10 R4).
+enum ResumeOutcome: Equatable {
+    /// Nothing on disk needed uploading.
+    case nothingToResume
+    /// At least one session's pipeline was (re)started.
+    case succeeded([World])
+    /// Work was attempted and every candidate failed. `reason` is user-facing.
+    case failed(reason: String)
+    /// Candidates exist but weren't touched: parked awaiting an explicit user
+    /// choice, waiting out a backoff, or already in flight on another task.
+    case deferred(reason: String)
+}
+
+/// Snapshot of what's waiting on disk, for the capture screen's pending-upload
+/// affordances.
+struct PendingUploadSummary: Equatable {
+    /// Complete sessions still waiting to reach the backend.
+    var pendingCount: Int = 0
+    /// How many of those have exhausted their automatic retry budget.
+    var parkedCount: Int = 0
+
+    var hasPending: Bool { pendingCount > 0 }
+    var hasParked: Bool { parkedCount > 0 }
+}
+
 final class CaptureUploader {
     /// Expected full-sphere frame count — derived from the capture pattern
     /// (Phase 0.5 densified layout = 28) so nothing hardcodes the old 16.
-    static let expectedFrameCount = TargetLayout.targets().count
+    static let expectedFrameCount = TargetLayout.targetCount
 
-    private let api: APIClient
+    private let api: CaptureUploadAPI
     private let store: CaptureStore
-    private let frameUploader: FrameUploader
+    private let frameUploader: FrameUploading
+    /// Injected for tests; production uses the wall clock.
+    private let now: () -> Date
 
-    init(api: APIClient, store: CaptureStore = CaptureStore(), frameUploader: FrameUploader = FrameUploader()) {
+    init(
+        api: CaptureUploadAPI,
+        store: CaptureStore = CaptureStore(),
+        frameUploader: FrameUploading = FrameUploader(),
+        now: @escaping () -> Date = Date.init
+    ) {
         self.api = api
         self.store = store
         self.frameUploader = frameUploader
+        self.now = now
     }
 
     // MARK: - Upload
 
     /// Upload one finished capture session. `progress` receives the number of
     /// frames uploaded so far (0…frameCount). On success the local session is
-    /// purged; on failure it stays on disk for `resumePending()`.
+    /// purged; on failure it stays on disk, with the failure recorded against
+    /// the session's automatic-retry budget, for `resumePending()`.
     @discardableResult
     func upload(result: CaptureResult, progress: @escaping (Int) -> Void = { _ in }) async throws -> World {
         let pending = store.loadPending()
@@ -40,29 +88,66 @@ final class CaptureUploader {
             throw APIError.server(0, "Capture session not found on disk")
         }
         guard let world = try await withClaim(session.id, {
-            try await upload(session: session, progress: progress)
+            try await attemptUpload(session: session, progress: progress)
         }) else {
             throw APIError.server(0, "This capture is already uploading")
         }
         return world
     }
 
-    /// Retry every complete session left on disk (called at launch / on the
-    /// capture screen appearing). Returns the worlds started; failures stay
-    /// on disk for next time. Incomplete sessions older than a day are dead
-    /// (the capture UI can't resume mid-scan yet) and get cleaned up.
+    /// Retry the sessions left on disk (launch, capture screen appearing, or
+    /// the user's Retry button when `userInitiated`).
+    ///
+    /// An automatic sweep skips sessions that are parked or still inside their
+    /// backoff window. A user-initiated one clears the attempt counter first —
+    /// an explicit retry always gets a full fresh budget — and ignores backoff.
+    /// Incomplete sessions older than a day are dead (the capture UI can't
+    /// resume mid-scan yet) and get cleaned up.
     @discardableResult
-    func resumePending(progress: @escaping (Int) -> Void = { _ in }) async -> [World] {
+    func resumePending(
+        userInitiated: Bool = false,
+        progress: @escaping (Int) -> Void = { _ in }
+    ) async -> ResumeOutcome {
         var uploaded: [World] = []
+        var lastFailure: String?
+        var deferrals: [String] = []
+        var candidates = 0
+
         for session in store.loadPending() {
-            // Skip (never wait for) a session another flow already owns — one
-            // wedged upload must not block the rest, or the retry button (R12).
-            await withClaim(session.id) {
-                if session.manifest.isComplete {
-                    if let world = try? await upload(session: session, progress: progress) {
-                        uploaded.append(world)
+            if session.manifest.isComplete {
+                candidates += 1
+                if userInitiated {
+                    // Explicit retry ⇒ fresh budget, no backoff wait, un-parked.
+                    store.resetUploadAttempts(forSession: session.id, in: session.directory)
+                } else if session.manifest.isParked {
+                    AppLog.upload.log("Session \(session.id.uuidString, privacy: .public) is parked after \(session.manifest.attemptCount) failed attempts — waiting for the user")
+                    deferrals.append("paused after \(session.manifest.attemptCount) failed attempts")
+                    continue
+                } else if !session.manifest.isReadyForAutomaticRetry(now: now()) {
+                    deferrals.append("waiting before the next automatic retry")
+                    continue
+                }
+                // Re-read: the reset above changed the manifest on disk.
+                let current = store.loadPending().first(where: { $0.id == session.id }) ?? session
+                // Skip (never wait for) a session another flow already owns — one
+                // wedged upload must not block the rest, or the retry button (R12).
+                let claimed = await withClaim(current.id) { () -> Result<World, Error> in
+                    do {
+                        return .success(try await attemptUpload(session: current, progress: progress))
+                    } catch {
+                        return .failure(error)
                     }
-                } else if Date().timeIntervalSince(session.manifest.createdAt) > 86_400 {
+                }
+                switch claimed {
+                case .none:
+                    deferrals.append("already uploading")
+                case .some(.success(let world)):
+                    uploaded.append(world)
+                case .some(.failure(let error)):
+                    lastFailure = Self.message(for: error)
+                }
+            } else if now().timeIntervalSince(session.manifest.createdAt) > 86_400 {
+                await withClaim(session.id) {
                     // Permanently discarding the session — if it already minted
                     // a backend world, best-effort delete it so it doesn't
                     // linger as an orphan in `uploading` (the server-side 24 h
@@ -74,7 +159,40 @@ final class CaptureUploader {
                 }
             }
         }
-        return uploaded
+
+        if !uploaded.isEmpty { return .succeeded(uploaded) }
+        if let lastFailure { return .failed(reason: lastFailure) }
+        if let deferral = deferrals.first { return .deferred(reason: deferral) }
+        return candidates == 0 ? .nothingToResume : .deferred(reason: "nothing to do")
+    }
+
+    /// What's waiting on disk right now (capture screen affordances).
+    func pendingSummary() -> PendingUploadSummary {
+        var summary = PendingUploadSummary()
+        for session in store.loadPending() where session.manifest.isComplete {
+            summary.pendingCount += 1
+            if session.manifest.isParked { summary.parkedCount += 1 }
+        }
+        return summary
+    }
+
+    /// Throw away every complete pending session at the user's request, and
+    /// best-effort delete any world they already minted so it doesn't sit
+    /// orphaned in `uploading`. Returns the number discarded.
+    @discardableResult
+    func discardPending() async -> Int {
+        var discarded = 0
+        for session in store.loadPending() where session.manifest.isComplete {
+            await withClaim(session.id) {
+                if let worldId = session.manifest.createdWorldId {
+                    try? await api.deleteWorld(id: worldId)
+                }
+                store.purge(id: session.id)
+                discarded += 1
+            }
+        }
+        AppLog.upload.log("Discarded \(discarded) pending capture session(s) at the user's request")
+        return discarded
     }
 
     // MARK: - Per-session exclusion
@@ -108,8 +226,11 @@ final class CaptureUploader {
     /// `uploading` forever server-side). Goes straight to frames:done (with
     /// poses) and purges the session on success. Kicked by UploadManager at
     /// launch and on every scenePhase → .active. Returns sessions completed.
+    ///
+    /// Parked sessions are left alone unless the user asked for this: the
+    /// world-gone branch below MINTS A NEW WORLD, which is billable.
     @discardableResult
-    func completeStrandedSessions() async -> Int {
+    func completeStrandedSessions(userInitiated: Bool = false) async -> Int {
         var completed = 0
         for session in store.loadPending() {
             let manifest = session.manifest
@@ -119,6 +240,10 @@ final class CaptureUploader {
                 manifest.frames.count > 0,
                 manifest.uploadedFrameIndices.count >= manifest.frames.count
             else { continue }
+            if !userInitiated, manifest.isParked {
+                AppLog.upload.log("Stranded session \(session.id.uuidString, privacy: .public) is parked — leaving it for the user")
+                continue
+            }
             // Another flow already owns this session — skip, never block (R12).
             await withClaim(session.id) {
                 if await completeStranded(session: session, worldId: worldId) { completed += 1 }
@@ -154,44 +279,134 @@ final class CaptureUploader {
             // The stranded world was deleted server-side (404 world_not_found):
             // frames:done can never land. Clear the dead world id + uploaded
             // flags (frames stay on disk), then start a fresh upload in this
-            // same run so the user's 28 frames aren't stranded forever.
+            // same run so the user's 28 frames aren't stranded forever. The
+            // replacement world is minted under a NEW idempotency key — see
+            // createFreshWorld(renewKey:).
             AppLog.upload.fault("resume: world \(worldId, privacy: .public) gone server-side — starting fresh")
             store.resetWorldState(forSession: session.id, in: session.directory)
-            if let fresh = store.loadPending().first(where: { $0.id == session.id }),
-               (try? await upload(session: fresh, progress: { _ in })) != nil {
+            guard let fresh = store.loadPending().first(where: { $0.id == session.id }) else { return false }
+            do {
+                _ = try await attemptUpload(session: fresh, progress: { _ in }, renewWorldKey: true)
                 return true
+            } catch {
+                return false
             }
-            return false
         } catch {
             AppLog.upload.error("Stranded-session frames:done failed for \(worldId, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            recordFailure(error, for: session)
             return false
         }
     }
 
     // MARK: - Internals
 
-    /// Mint a brand-new backend world for this session and persist its id BEFORE
-    /// any frame uploads (crash-safe: a kill mid-upload resumes onto this world
-    /// instead of orphaning it). Quota edge: if `createWorld` is refused for
-    /// quota (429), the session is intentionally left pending on disk — NOT
-    /// discarded — so it retries once the user's allowance frees up.
-    private func createFreshWorld(session: CaptureStore.PendingSession, frameCount: Int) async throws -> (World, [FrameUpload]) {
-        let title = "Scan \(Date().formatted(date: .abbreviated, time: .shortened))"
+    /// One upload attempt for an already-claimed session, with the failure
+    /// recorded against the session's automatic-retry budget.
+    private func attemptUpload(
+        session: CaptureStore.PendingSession,
+        progress: @escaping (Int) -> Void,
+        renewWorldKey: Bool = false
+    ) async throws -> World {
+        do {
+            return try await upload(session: session, progress: progress, renewWorldKey: renewWorldKey)
+        } catch {
+            recordFailure(error, for: session)
+            throw error
+        }
+    }
+
+    /// Record a failed attempt. Quota refusals (402/429) and "there's no
+    /// network" don't count toward parking — the capture is fine, the world
+    /// just can't be made right now — but they still move the backoff clock so
+    /// a foreground kick can't hammer the backend.
+    private func recordFailure(_ error: Error, for session: CaptureStore.PendingSession) {
+        if error is CancellationError { return }
+        let counts = error.countsTowardUploadParking
+        store.recordFailedAttempt(
+            forSession: session.id,
+            in: session.directory,
+            countsTowardParking: counts,
+            at: now()
+        )
+        if counts {
+            let attempts = (store.loadPending().first(where: { $0.id == session.id })?.manifest.attemptCount) ?? 0
+            AppLog.upload.error("Upload attempt \(attempts)/\(CaptureStore.Manifest.maxAutomaticAttempts) failed for session \(session.id.uuidString, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            if attempts >= CaptureStore.Manifest.maxAutomaticAttempts {
+                AppLog.upload.fault("Session \(session.id.uuidString, privacy: .public) PARKED after \(attempts) failed attempts — no further automatic retries or world minting until the user chooses")
+            }
+        } else {
+            AppLog.upload.log("Upload attempt for session \(session.id.uuidString, privacy: .public) failed transiently (quota/offline) — not counted toward parking")
+        }
+    }
+
+    /// Mint a backend world for this session and persist its id BEFORE any
+    /// frame uploads (crash-safe: a kill mid-upload resumes onto this world
+    /// instead of orphaning it).
+    ///
+    /// The request carries an `Idempotency-Key` that is written to the manifest
+    /// BEFORE it is sent, so a kill between request and response can't
+    /// double-create: the retry replays the key and the backend returns the
+    /// same world. `renewKey` mints a brand-new key for the one case where a
+    /// genuinely NEW world is wanted — the previous one was deleted
+    /// server-side.
+    ///
+    /// Quota edge: if `createWorld` is refused for quota (429), the session is
+    /// intentionally left pending on disk — NOT discarded, and NOT re-minted —
+    /// so it retries once the user's allowance frees up.
+    private func createFreshWorld(
+        session: CaptureStore.PendingSession,
+        frameCount: Int,
+        renewKey: Bool
+    ) async throws -> (World, [FrameUpload]) {
+        // Defensive: a parked session must never mint a billable world behind
+        // the user's back. Every automatic path already skips parked sessions.
+        if let current = store.loadPending().first(where: { $0.id == session.id }), current.manifest.isParked {
+            AppLog.upload.fault("Refusing to mint a world for PARKED session \(session.id.uuidString, privacy: .public)")
+            throw APIError.server(0, "This upload is paused. Retry or discard it from the capture screen.")
+        }
+        let title = "Scan \(now().formatted(date: .abbreviated, time: .shortened))"
         AppLog.upload.log("Upload start: session \(session.id.uuidString, privacy: .public), \(frameCount) frames")
         do {
-            let (world, slots) = try await api.createWorld(title: title, frameCount: frameCount)
-            // Persist the world id BEFORE uploading any frame so a crash/kill
-            // mid-upload resumes onto this same world instead of orphaning it.
-            store.setCreatedWorldId(world.id, forSession: session.id, in: session.directory)
-            AppLog.upload.log("World created: \(world.id, privacy: .public), \(slots.count) upload slots")
-            return (world, slots)
+            return try await mintWorld(session: session, title: title, frameCount: frameCount, renewKey: renewKey)
+        } catch let error as APIError where error.isIdempotencyConflict {
+            // 409: the world this key created has since been deleted, so the
+            // key is spent and can never produce a world again. Persist a
+            // brand-new key (before the request, as always) and retry once.
+            AppLog.upload.fault("createWorld 409 for session \(session.id.uuidString, privacy: .public) — idempotency key is spent, minting under a fresh key")
+            return try await mintWorld(session: session, title: title, frameCount: frameCount, renewKey: true)
         } catch APIError.quota {
-            AppLog.upload.log("createWorld refused for quota (429) — keeping session \(session.id.uuidString, privacy: .public) pending, will retry when allowance frees up")
+            AppLog.upload.log("createWorld refused for quota (429) — keeping session \(session.id.uuidString, privacy: .public) pending, will retry when allowance frees up (no replacement world minted)")
             throw APIError.quota
         }
     }
 
-    private func upload(session: CaptureStore.PendingSession, progress: @escaping (Int) -> Void) async throws -> World {
+    private func mintWorld(
+        session: CaptureStore.PendingSession,
+        title: String,
+        frameCount: Int,
+        renewKey: Bool
+    ) async throws -> (World, [FrameUpload]) {
+        // Persisted FIRST — the whole point of the key.
+        let key = store.worldRequestId(forSession: session.id, in: session.directory, renew: renewKey)
+        let (world, slots) = try await api.createWorld(
+            title: title,
+            frameCount: frameCount,
+            idempotencyKey: key,
+            lat: nil,
+            lng: nil
+        )
+        // Persist the world id BEFORE uploading any frame so a crash/kill
+        // mid-upload resumes onto this same world instead of orphaning it.
+        store.setCreatedWorldId(world.id, forSession: session.id, in: session.directory)
+        AppLog.upload.log("World created: \(world.id, privacy: .public), \(slots.count) upload slots (idempotency key \(key.uuidString, privacy: .public))")
+        return (world, slots)
+    }
+
+    private func upload(
+        session: CaptureStore.PendingSession,
+        progress: @escaping (Int) -> Void,
+        renewWorldKey: Bool = false
+    ) async throws -> World {
         // Mutable local copy: a world-gone reset below clears the resume fields
         // so the rest of this run re-uploads EVERY frame to the fresh world.
         var manifest = session.manifest
@@ -212,14 +427,15 @@ final class CaptureUploader {
                 // retrying uploads:refresh can NEVER succeed. Clear the dead world
                 // id + every uploaded flag (frames stay on disk), then start fresh
                 // in this same run so the user's captured frames aren't stranded.
+                // A DELIBERATE replacement world ⇒ a brand-new idempotency key.
                 AppLog.upload.fault("resume: world \(existingWorldId, privacy: .public) gone server-side — starting fresh")
                 store.resetWorldState(forSession: session.id, in: session.directory)
                 manifest.createdWorldId = nil
                 manifest.uploadedFrameIndices = []
-                (world, slots) = try await createFreshWorld(session: session, frameCount: frameCount)
+                (world, slots) = try await createFreshWorld(session: session, frameCount: frameCount, renewKey: true)
             }
         } else {
-            (world, slots) = try await createFreshWorld(session: session, frameCount: frameCount)
+            (world, slots) = try await createFreshWorld(session: session, frameCount: frameCount, renewKey: renewWorldKey)
         }
 
         // Count frames already confirmed uploaded (resume) toward progress.
@@ -269,5 +485,13 @@ final class CaptureUploader {
         AppLog.upload.log("frames:done ok for \(world.id, privacy: .public) with \(poses.count) poses")
         store.purge(id: session.id)
         return world
+    }
+
+    /// User-facing text for a failed attempt.
+    private static func message(for error: Error) -> String {
+        if let localized = (error as? LocalizedError)?.errorDescription, !localized.isEmpty {
+            return localized
+        }
+        return error.localizedDescription
     }
 }

@@ -29,8 +29,11 @@ struct CaptureView: View {
     /// full-screen upload overlay.
     @State private var uploadedFrames: Int?
     @State private var didResumePending = false
-    /// True when a finished session is stranded on disk after a failed upload.
-    @State private var hasPendingUpload = false
+    /// Finished sessions stranded on disk after a failed upload, and how many
+    /// have exhausted their automatic retries (parked, spec §10 R4) and so need
+    /// an explicit Retry / Discard from the user.
+    @State private var pendingUpload = PendingUploadSummary()
+    @State private var showDiscardConfirmation = false
     /// Scans left in today's window, from GET /v1/me/quota. nil = unknown (not
     /// yet fetched, or the check failed — in which case we fail open and let
     /// capture proceed). 0 = daily limit reached; capture is blocked up front.
@@ -212,14 +215,8 @@ struct CaptureView: View {
                     .font(.footnote)
                     .foregroundStyle(.white.opacity(0.5))
             }
-            if hasPendingUpload {
-                Button {
-                    Task { await retryPendingUpload() }
-                } label: {
-                    Label("Retry upload", systemImage: "arrow.up.circle")
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(.cyan)
-                }
+            if pendingUpload.hasPending {
+                pendingUploadControls
             }
             Spacer()
             #if DEBUG
@@ -232,7 +229,53 @@ struct CaptureView: View {
         }
         // Refresh the allowance each time the start screen appears so the
         // remaining-scans hint / limit notice is current before a capture.
-        .task { await refreshQuota() }
+        .task {
+            refreshPendingUpload()
+            await refreshQuota()
+        }
+    }
+
+    /// Pending-upload affordances. A session that has burned its automatic
+    /// retry budget is PARKED: nothing retries it in the background any more
+    /// (each retry can mint a billable world — spec §10 R4), so the choice is
+    /// handed to the user explicitly.
+    @ViewBuilder
+    private var pendingUploadControls: some View {
+        VStack(spacing: 10) {
+            if pendingUpload.hasParked {
+                Text("Upload paused after \(CaptureStore.Manifest.maxAutomaticAttempts) failed attempts. Your scan is still saved on this device.")
+                    .font(.footnote)
+                    .foregroundStyle(.white.opacity(0.65))
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 36)
+            }
+            Button {
+                Task { await retryPendingUpload() }
+            } label: {
+                Label("Retry upload", systemImage: "arrow.up.circle")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.cyan)
+            }
+            if pendingUpload.hasParked {
+                Button("Discard scan", role: .destructive) {
+                    showDiscardConfirmation = true
+                }
+                .font(.subheadline.weight(.semibold))
+                .tint(.red)
+            }
+        }
+        .confirmationDialog(
+            "Discard this scan?",
+            isPresented: $showDiscardConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Discard scan", role: .destructive) {
+                Task { await discardPendingUpload() }
+            }
+            Button("Keep it", role: .cancel) {}
+        } message: {
+            Text("The captured frames are deleted from this device and can't be recovered.")
+        }
     }
 
     /// True once we know the daily scan limit is spent (0 remaining). nil/unknown
@@ -277,33 +320,51 @@ struct CaptureView: View {
         }
         switch await handle.value {
         case .success:
-            hasPendingUpload = false
             engine.reset()
+            refreshPendingUpload()
             toast = Toast(message: "Scan uploaded — watch it build in Library.", style: .success)
             try? await Task.sleep(for: .milliseconds(700))
             switchToLibrary()
         case .failure(let error):
-            hasPendingUpload = true
             engine.reset()
+            refreshPendingUpload()
             toast = Toast(message: "Upload failed — your scan is saved. Retry from here or relaunch. (\((error as? LocalizedError)?.errorDescription ?? error.localizedDescription))", style: .error)
         }
     }
 
-    /// Manual retry of a stranded session (app-scoped via UploadManager).
+    /// Manual retry of a stranded session (app-scoped via UploadManager). A
+    /// user-initiated retry clears the attempt counter, so a parked session
+    /// gets a full fresh automatic budget again.
     private func retryPendingUpload() async {
         uploadedFrames = 0
         defer { uploadedFrames = nil }
-        let handle = UploadManager.shared.kickResume(api: api) { done in
+        let handle = UploadManager.shared.kickResume(api: api, userInitiated: true) { done in
             Task { @MainActor in uploadedFrames = done }
         }
-        let uploaded = await handle.value
-        if uploaded.isEmpty {
-            toast = Toast(message: "Upload failed again — check your connection and retry.", style: .error)
-        } else {
-            hasPendingUpload = false
+        let outcome = await handle.value
+        refreshPendingUpload()
+        switch outcome {
+        case .succeeded:
             toast = Toast(message: "Scan uploaded — watch it build in Library.", style: .success)
             try? await Task.sleep(for: .milliseconds(700))
             switchToLibrary()
+        case .nothingToResume:
+            toast = Toast(message: "Nothing left to upload.", style: .success)
+        case .failed(let reason):
+            // Report what ACTUALLY went wrong — resumePending used to swallow
+            // every error, so this always read "check your connection".
+            toast = Toast(message: "Upload failed again — \(reason)", style: .error)
+        case .deferred(let reason):
+            toast = Toast(message: "Upload not retried — \(reason).", style: .error)
+        }
+    }
+
+    /// Give up on the parked session(s) at the user's request.
+    private func discardPendingUpload() async {
+        let discarded = await UploadManager.shared.kickDiscardPending(api: api).value
+        refreshPendingUpload()
+        if discarded > 0 {
+            toast = Toast(message: "Scan discarded.", style: .success)
         }
     }
 
@@ -312,10 +373,17 @@ struct CaptureView: View {
     private func resumePendingOnce() async {
         guard !didResumePending else { return }
         didResumePending = true
-        let uploaded = await UploadManager.shared.kickResume(api: api).value
-        if !uploaded.isEmpty {
-            toast = Toast(message: "Resumed \(uploaded.count) pending scan upload\(uploaded.count == 1 ? "" : "s").", style: .success)
+        let outcome = await UploadManager.shared.kickResume(api: api).value
+        refreshPendingUpload()
+        if case .succeeded(let worlds) = outcome, !worlds.isEmpty {
+            toast = Toast(message: "Resumed \(worlds.count) pending scan upload\(worlds.count == 1 ? "" : "s").", style: .success)
         }
+    }
+
+    /// Re-read what's waiting on disk (pending / parked) for the affordances
+    /// on the start screen.
+    private func refreshPendingUpload() {
+        pendingUpload = UploadManager.shared.pendingSummary(api: api)
     }
 
     // MARK: - Quota

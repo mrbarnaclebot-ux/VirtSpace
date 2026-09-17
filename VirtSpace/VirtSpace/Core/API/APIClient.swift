@@ -105,9 +105,28 @@ final class APIClient {
 
     // MARK: - Endpoints (spec §7.1)
 
-    func createWorld(title: String, frameCount: Int, lat: Double? = nil, lng: Double? = nil) async throws -> (World, [FrameUpload]) {
+    /// Mint a world for a capture session.
+    ///
+    /// `idempotencyKey` is sent as the `Idempotency-Key` header: replaying a
+    /// request with the same key returns the SAME world (same response shape)
+    /// and charges quota/credits once, so a kill or retry between request and
+    /// response can never mint a second billable world (spec §10 R4). The
+    /// backend answers 409 when the world previously created for that key has
+    /// since been deleted — see `APIError.isIdempotencyConflict`; the caller
+    /// then persists a fresh key and retries.
+    func createWorld(
+        title: String,
+        frameCount: Int,
+        idempotencyKey: UUID? = nil,
+        lat: Double? = nil,
+        lng: Double? = nil
+    ) async throws -> (World, [FrameUpload]) {
         let body = try encoder.encode(CreateWorldRequest(title: title, frameCount: frameCount, lat: lat, lng: lng))
-        let data = try await send(request("POST", "v1/worlds", body: body))
+        var req = request("POST", "v1/worlds", body: body)
+        if let idempotencyKey {
+            req?.setValue(idempotencyKey.uuidString, forHTTPHeaderField: "Idempotency-Key")
+        }
+        let data = try await send(req)
         let resp: CreateWorldResponse = try decode(data)
         return (resp.world, resp.uploads)
     }

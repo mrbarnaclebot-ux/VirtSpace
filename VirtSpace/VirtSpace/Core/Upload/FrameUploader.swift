@@ -137,7 +137,14 @@ final class BackgroundUploadCoordinator: NSObject, URLSessionDataDelegate {
     }
 }
 
-struct FrameUploader {
+/// The one thing `CaptureUploader` needs from the frame-upload layer. A
+/// protocol so the uploader's state machine can be unit-tested with a fake
+/// that never touches the network (spec §10 R13).
+protocol FrameUploading {
+    func upload(fileURL: URL, to slot: FrameUpload) async throws
+}
+
+struct FrameUploader: FrameUploading {
     var maxAttempts: Int = 2
     var coordinator: BackgroundUploadCoordinator = .shared
 
