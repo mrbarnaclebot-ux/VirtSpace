@@ -18,6 +18,13 @@
 - `tools/spike/` — Phase 0 spike scripts + Spark viewer fixture
 - `video-example.mp4` — reference app walkthrough the product replicates
 
+## Knowledge graph (graphify) — keep it current
+
+- `graphify-out/` (gitignored) is the project map: query it first for architecture questions (`graphify query "…"`, `graphify explain "X"`).
+- A git **post-commit/post-checkout hook** (`graphify hook install`, per clone — re-run after a fresh clone) rebuilds the *code* graph after every commit, no LLM cost.
+- The hook ignores docs. After any session that changes `spec-doc.md`, `HANDOFF.md`, `CLAUDE.md` or a README, the orchestrator runs `/graphify . --update` before ending the session.
+- Keep the vendored `three.*.js` / `spark.module.js` / `Pass.js` bundles and `video-example.mp4` out of the graph.
+
 ## Git & CLI conventions
 
 - **Conventional Commits** with scope: `feat(ios-capture): …`, `fix(worker): …`, `chore:`, `docs:`, `refactor:`, `test:`. Imperative mood, ≤72-char subject, body explains *why* when non-obvious.
