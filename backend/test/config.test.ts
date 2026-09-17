@@ -37,6 +37,62 @@ describe('loadConfig', () => {
     ).toThrow(/DEV_AUTH_TOKEN/);
   });
 
+  // spec §10 R2 — AUTH_MODE defaults to 'dev', so a dropped env var must not
+  // silently serve shared-token auth to production traffic.
+  describe('dev auth in production', () => {
+    it('refuses to boot with AUTH_MODE=dev under NODE_ENV=production', () => {
+      expect(() =>
+        loadConfig({ ...base, NODE_ENV: 'production' } as NodeJS.ProcessEnv),
+      ).toThrow(/ALLOW_DEV_AUTH/);
+    });
+
+    it('refuses an explicitly-set AUTH_MODE=dev in production too', () => {
+      expect(() =>
+        loadConfig({
+          ...base,
+          NODE_ENV: 'production',
+          AUTH_MODE: 'dev',
+        } as NodeJS.ProcessEnv),
+      ).toThrow(/refused under NODE_ENV=production/);
+    });
+
+    it('boots when ALLOW_DEV_AUTH=1 makes it a deliberate choice', () => {
+      const cfg = loadConfig({
+        ...base,
+        NODE_ENV: 'production',
+        ALLOW_DEV_AUTH: '1',
+      } as NodeJS.ProcessEnv);
+      expect(cfg.AUTH_MODE).toBe('dev');
+    });
+
+    it('does not accept a truthy-but-not-1 ALLOW_DEV_AUTH', () => {
+      expect(() =>
+        loadConfig({
+          ...base,
+          NODE_ENV: 'production',
+          ALLOW_DEV_AUTH: 'true',
+        } as NodeJS.ProcessEnv),
+      ).toThrow(/ALLOW_DEV_AUTH/);
+    });
+
+    it('allows dev auth outside production without the flag', () => {
+      expect(
+        loadConfig({ ...base, NODE_ENV: 'development' } as NodeJS.ProcessEnv).AUTH_MODE,
+      ).toBe('dev');
+      expect(loadConfig(base as NodeJS.ProcessEnv).AUTH_MODE).toBe('dev');
+    });
+
+    it('apple mode boots in production untouched', () => {
+      const cfg = loadConfig({
+        ...base,
+        NODE_ENV: 'production',
+        AUTH_MODE: 'apple',
+        APPLE_BUNDLE_ID: 'com.example.app',
+      } as NodeJS.ProcessEnv);
+      expect(cfg.AUTH_MODE).toBe('apple');
+    });
+  });
+
   it('requires APPLE_BUNDLE_ID in apple mode', () => {
     expect(() =>
       loadConfig({ ...base, AUTH_MODE: 'apple' } as NodeJS.ProcessEnv),

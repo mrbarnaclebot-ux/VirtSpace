@@ -107,11 +107,27 @@ test/                vitest: config, storage, auth, quota/backoff
 - **dev** (`AUTH_MODE=dev`): send `Authorization: Bearer <DEV_AUTH_TOKEN>` **and**
   `x-dev-user: <email-ish id>`. The id upserts a user and is attached as
   `request.userId`. Header validation is a pure function (`parseDevAuth`) so
-  rejection never touches the DB.
+  rejection never touches the DB. The token is compared with
+  `crypto.timingSafeEqual` over SHA-256 digests (`secretEquals`) — constant-time
+  **and** length-safe, so neither the token's bytes nor its length leak through
+  response timing.
 - **apple** (`AUTH_MODE=apple`): the `Authorization: Bearer` value is a Sign in
   with Apple identity token, verified with `jose` against Apple's JWKS
   (`https://appleid.apple.com/auth/keys`), issuer `https://appleid.apple.com`,
   audience `APPLE_BUNDLE_ID`. The `sub` upserts a user.
+
+### `ALLOW_DEV_AUTH` — dev auth in production (spec §10 R2)
+
+`AUTH_MODE` **defaults to `dev`**, so a dropped or mistyped env var used to hand
+production traffic a shared-token auth mode silently. The config loader now
+**refuses to boot** when `NODE_ENV=production` and `AUTH_MODE=dev`, unless
+`ALLOW_DEV_AUTH=1` is set — the value must be exactly `1`.
+
+> ⚠️ **Deploy prerequisite.** Production currently runs dev auth on purpose (the
+> iOS build authenticates with `DEV_AUTH_TOKEN`; there is no paid Apple account
+> yet). `ALLOW_DEV_AUTH=1` **must be set on Railway before this change deploys**,
+> or both the API and the worker will exit at boot. Drop the variable the moment
+> `AUTH_MODE=apple` goes live.
 
 ## Migrations
 

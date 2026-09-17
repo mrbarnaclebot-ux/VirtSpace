@@ -14,10 +14,17 @@ const numberFromEnv = (def: number) =>
 const baseSchema = z.object({
   DATABASE_URL: z.string().min(1, 'DATABASE_URL is required'),
   PORT: numberFromEnv(8080),
+  // Deployment environment. Only 'production' is load-bearing (it gates dev
+  // auth, see refine()); anything else is treated as a non-production run.
+  NODE_ENV: z.string().optional(),
 
   AUTH_MODE: z.enum(['dev', 'apple']).default('dev'),
   DEV_AUTH_TOKEN: z.string().optional(),
   APPLE_BUNDLE_ID: z.string().optional(),
+  // Explicit, deliberate opt-in to shared-token dev auth in production
+  // (spec §10 R2). Set to '1' only while there is no paid Apple account and
+  // the iOS build still authenticates with DEV_AUTH_TOKEN.
+  ALLOW_DEV_AUTH: z.string().optional(),
 
   STORAGE_DRIVER: z.enum(['local', 's3']).default('local'),
   LOCAL_STORAGE_DIR: z.string().default('./data'),
@@ -77,6 +84,20 @@ function refine(cfg: z.infer<typeof baseSchema>): Config {
   }
   if (cfg.AUTH_MODE === 'dev' && !cfg.DEV_AUTH_TOKEN) {
     throw new Error('AUTH_MODE=dev requires DEV_AUTH_TOKEN');
+  }
+  // Fail-closed on the auth mode (spec §10 R2). AUTH_MODE defaults to 'dev', so
+  // a dropped/typo'd env var would otherwise silently serve shared-token auth to
+  // production traffic. Running dev auth in production must be a deliberate,
+  // recorded decision — ALLOW_DEV_AUTH=1 — never an accident.
+  if (
+    cfg.AUTH_MODE === 'dev' &&
+    cfg.NODE_ENV === 'production' &&
+    cfg.ALLOW_DEV_AUTH !== '1'
+  ) {
+    throw new Error(
+      'AUTH_MODE=dev refused under NODE_ENV=production: set AUTH_MODE=apple, ' +
+        'or set ALLOW_DEV_AUTH=1 to run shared-token dev auth deliberately',
+    );
   }
   return {
     ...cfg,

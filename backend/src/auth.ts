@@ -1,3 +1,4 @@
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { createRemoteJWKSet, jwtVerify } from 'jose';
 import type { FastifyReply, FastifyRequest, preHandlerHookHandler } from 'fastify';
 import type { Config } from './config.js';
@@ -17,6 +18,19 @@ export type DevAuthResult =
   | { ok: false; status: number; message: string };
 
 /**
+ * Constant-time secret comparison (spec §10 R2). `===` on a shared bearer token
+ * short-circuits at the first differing byte and leaks the token prefix through
+ * response timing. Both sides are SHA-256'd first so the comparison is also
+ * LENGTH-safe: digests are always 32 bytes, so timingSafeEqual never throws on
+ * a length mismatch and the attacker learns nothing from the token's length.
+ */
+export function secretEquals(a: string, b: string): boolean {
+  const ha = createHash('sha256').update(a, 'utf8').digest();
+  const hb = createHash('sha256').update(b, 'utf8').digest();
+  return timingSafeEqual(ha, hb);
+}
+
+/**
  * Validate dev-mode auth headers: `Authorization: Bearer <DEV_AUTH_TOKEN>` plus
  * an `x-dev-user` identity header. Returns the subject to upsert, or a rejection.
  */
@@ -32,7 +46,7 @@ export function parseDevAuth(
   const bearer = authHeader?.startsWith('Bearer ')
     ? authHeader.slice('Bearer '.length).trim()
     : undefined;
-  if (!bearer || bearer !== devToken) {
+  if (!bearer || !secretEquals(bearer, devToken)) {
     return { ok: false, status: 401, message: 'invalid or missing bearer token' };
   }
   const devUser = headers['x-dev-user'];
