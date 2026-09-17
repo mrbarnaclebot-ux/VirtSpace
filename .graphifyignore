@@ -1,0 +1,9 @@
+# Keep the knowledge graph about OUR code (see CLAUDE.md "Knowledge graph").
+# Vendored viewer bundles (~500k words of three.js/Spark) drown it out.
+VirtSpace/VirtSpace/Resources/SparkViewer/three.core.js
+VirtSpace/VirtSpace/Resources/SparkViewer/three.module.js
+VirtSpace/VirtSpace/Resources/SparkViewer/spark.module.js
+VirtSpace/VirtSpace/Resources/SparkViewer/Pass.js
+# No narration — Whisper hallucinates a transcript.
+video-example.mp4
+virtspace-logs.txt
