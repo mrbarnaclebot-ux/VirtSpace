@@ -184,15 +184,9 @@ final class CaptureEngine {
     @ObservationIgnored private var thermalPausedInternal = false
     @ObservationIgnored private var thermalObserver: NSObjectProtocol?
 
-    // Publish throttle (Stage B3 deliverable 2b): ARFrames arrive at 60 Hz;
-    // coalesce the HUD-state publish to ~30 Hz and only on meaningful change so
-    // we don't force a whole-HUD SwiftUI re-render every frame.
-    @ObservationIgnored private var lastPublishTime: TimeInterval = 0
-    @ObservationIgnored private var lastPublishedAngle: Double = .infinity
-    @ObservationIgnored private var lastPublishedSteady = false
-    @ObservationIgnored private var lastPublishedTargetIndex = -1
-    @ObservationIgnored private var lastPublishedDwell: Double = 0
-    @ObservationIgnored private var lastPublishedWarning: String?
+    /// Coalesces the HUD publish to ~30 Hz and to meaningful changes only
+    /// (Stage B3 deliverable 2b) — see HUDPublishThrottle.
+    @ObservationIgnored private var throttle = HUDPublishThrottle()
 
     init(store: CaptureStore = CaptureStore()) {
         self.store = store
@@ -318,12 +312,7 @@ final class CaptureEngine {
         exposureLockedInternal = false
         transientWarning = nil
         thermalPausedInternal = false
-        lastPublishTime = 0
-        lastPublishedAngle = .infinity
-        lastPublishedSteady = false
-        lastPublishedTargetIndex = -1
-        lastPublishedDwell = 0
-        lastPublishedWarning = nil
+        throttle.reset()
     }
 
     private func fail(_ message: String) {
@@ -470,29 +459,19 @@ final class CaptureEngine {
         }
 
         // Coalesce the HUD publish to ~30 Hz and only when something the HUD
-        // actually renders has moved: while the camera is turning (so all dots
-        // track), when the angle/steadiness/target/dwell/warning changes, or on
-        // the firing frame. A held-still, unchanged frame publishes nothing —
-        // no wasteful whole-HUD SwiftUI re-render (Stage B3 deliverable 2b).
-        let now = pose.timestamp
-        let due = (now - lastPublishTime) >= (1.0 / 30.0)
-        let moving = smoothedRate > 0.02 // rad/s (~1.1°/s)
-        let angleMoved = abs(distance - lastPublishedAngle) > 0.3
-        let steadyFlip = steady != lastPublishedSteady
-        let targetChanged = currentIndex != lastPublishedTargetIndex
-        let dwellMoved = abs(progress - lastPublishedDwell) > 0.01
-        let warningChanged = warningText != lastPublishedWarning
-        let meaningful = moving || angleMoved || steadyFlip || targetChanged
-            || dwellMoved || warningChanged || progress >= 1
+        // actually renders has moved (Stage B3 deliverable 2b) — the policy
+        // itself lives in HUDPublishThrottle so it can be unit-tested.
+        let sample = HUDPublishThrottle.Sample(
+            timestamp: pose.timestamp,
+            angleDegrees: distance,
+            isSteady: steady,
+            targetIndex: currentIndex,
+            dwellProgress: progress,
+            warning: warningText,
+            rotationRate: smoothedRate
+        )
 
-        if due && meaningful {
-            lastPublishTime = now
-            lastPublishedAngle = distance
-            lastPublishedSteady = steady
-            lastPublishedTargetIndex = currentIndex
-            lastPublishedDwell = progress
-            lastPublishedWarning = warningText
-
+        if throttle.shouldPublish(sample) {
             let transform = pose.transform
             let intrinsics = pose.intrinsics
             let resolution = pose.imageResolution
