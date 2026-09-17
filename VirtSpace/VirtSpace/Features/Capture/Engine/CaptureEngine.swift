@@ -608,10 +608,13 @@ final class CaptureEngine {
             Task { @MainActor in
                 UIImpactFeedbackGenerator(style: .medium).impactOccurred()
             }
-            // Ring-completion celebrations: horizon ring (index 7), upper
-            // ring (11), down pair (13). The final shot's success haptic
-            // fires below with `.finished`.
-            if index == 7 || index == 11 || index == 13 {
+            // Ring-completion celebrations, derived from TargetLayout's ring
+            // sizes (11 / 19 / 25 in today's 28-target pattern). These used to
+            // be the literals 7/11/13 from the dead 16-target layout, so two
+            // of the three fired mid-ring and the horizon ring never
+            // celebrated at all. The final shot's success haptic fires below
+            // with `.finished`.
+            if TargetLayout.ringCompletionIndices.contains(index) {
                 Task { @MainActor in
                     UINotificationFeedbackGenerator().notificationOccurred(.success)
                 }

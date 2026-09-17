@@ -48,9 +48,48 @@ struct CaptureTarget: Identifiable, Hashable {
 }
 
 enum TargetLayout {
+    // MARK: - Shape of the pattern (single source of truth)
+
+    /// Target counts per group, in capture order: horizon ring, upper ring,
+    /// lower ring, poles. EVERYTHING else in the layout — the targets, the
+    /// total, the ring boundaries the HUD/haptics celebrate — derives from
+    /// this. The 16→28 densification left the ring-completion haptics firing
+    /// at the dead literals 7/11/13 (mid-ring in the new pattern) precisely
+    /// because those indices were hardcoded elsewhere; deriving them here
+    /// means the next pattern change can't silently desync (spec §10 R12).
+    static let groupSizes: [Int] = [12, 8, 6, 2]
+
+    static var horizonCount: Int { groupSizes[0] }
+    static var upperCount: Int { groupSizes[1] }
+    static var lowerCount: Int { groupSizes[2] }
+    static var poleCount: Int { groupSizes[3] }
+
+    /// Total targets in the pattern (28 today).
+    static var targetCount: Int { groupSizes.reduce(0, +) }
+
+    /// Index of the LAST target of each group — the running sums of
+    /// `groupSizes`, minus one: [11, 19, 25, 27] for the 28-target pattern.
+    static var ringBoundaryIndices: [Int] {
+        var running = 0
+        return groupSizes.map { size in
+            running += size
+            return running - 1
+        }
+    }
+
+    /// Ring boundaries that earn a "ring complete" celebration haptic: every
+    /// boundary except the final target, whose completion is announced by the
+    /// end-of-capture success haptic the engine fires with `.finished`.
+    static var ringCompletionIndices: Set<Int> {
+        Set(ringBoundaryIndices.dropLast())
+    }
+
+    // MARK: - Targets
+
     /// The 28-frame capture pattern, in capture order: 12 horizon shots
     /// (every 30°), 8 at pitch +45° (every 45°), 6 at pitch −45° (every 60°),
-    /// zenith, nadir.
+    /// zenith, nadir. Ring yaw steps are 360° / ring size, so the ring sizes
+    /// above fully determine the pattern.
     static func targets() -> [CaptureTarget] {
         var result: [CaptureTarget] = []
         var index = 0
@@ -66,18 +105,19 @@ enum TargetLayout {
             index += 1
         }
 
+        func addRing(pitch: Double, count: Int, labelPrefix: String) {
+            let step = 360 / Double(count)
+            for i in 0..<count {
+                add(pitch: pitch, yaw: Double(i) * step, label: "\(labelPrefix) \(i + 1)")
+            }
+        }
+
         // Horizon ring — 12 shots, every 30° of yaw.
-        for i in 0..<12 {
-            add(pitch: 0, yaw: Double(i) * 30, label: "Horizon \(i + 1)")
-        }
+        addRing(pitch: 0, count: horizonCount, labelPrefix: "Horizon")
         // Upper ring — 8 shots at +45°, every 45° of yaw.
-        for i in 0..<8 {
-            add(pitch: 45, yaw: Double(i) * 45, label: "Up \(i + 1)")
-        }
+        addRing(pitch: 45, count: upperCount, labelPrefix: "Up")
         // Lower ring — 6 shots at −45°, every 60° of yaw.
-        for i in 0..<6 {
-            add(pitch: -45, yaw: Double(i) * 60, label: "Down \(i + 1)")
-        }
+        addRing(pitch: -45, count: lowerCount, labelPrefix: "Down")
         // Poles.
         add(pitch: 90, yaw: 0, label: "Sky")
         add(pitch: -90, yaw: 0, label: "Ground")
