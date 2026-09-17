@@ -1,9 +1,10 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { createRemoteJWKSet, jwtVerify } from 'jose';
-import type { FastifyReply, FastifyRequest, preHandlerHookHandler } from 'fastify';
+import type { FastifyReply, FastifyRequest, onRequestHookHandler } from 'fastify';
 import type { Config } from './config.js';
 import { getDb } from './db/client.js';
 import { upsertUserBySub } from './db/users.js';
+import type { FailureThrottle } from './throttle.js';
 
 declare module 'fastify' {
   interface FastifyRequest {
@@ -91,23 +92,58 @@ function bearerFrom(req: FastifyRequest): string | undefined {
 }
 
 /**
- * Build the auth preHandler for the configured mode. Attaches `request.userId`
- * (upserting the user) or replies 401/500.
+ * Build the auth hook for the configured mode. Attaches `request.userId`
+ * (upserting the user) or replies 401/403/500.
+ *
+ * Registered as an **onRequest** hook: it only reads headers, and running it
+ * before any preHandler is what lets the rate limiter key its buckets on
+ * `req.userId` (spec §10 R10).
+ *
+ * `throttle` (optional) blocks an IP that has produced too many FAILED auths in
+ * the window (spec §10 R10). It is checked before any work: a blocked caller
+ * costs us neither a JWKS fetch nor a user upsert. A successful auth clears the
+ * IP's history so one fat-fingered client never accumulates its way to a block.
  */
-export function makeAuthPreHandler(config: Config): preHandlerHookHandler {
+export function makeAuthPreHandler(
+  config: Config,
+  throttle?: FailureThrottle,
+): onRequestHookHandler {
   return async (req: FastifyRequest, reply: FastifyReply) => {
+    const ip = req.ip;
+
+    if (throttle?.isBlocked(ip)) {
+      const retryAfter = throttle.retryAfterSeconds(ip);
+      req.log.warn({ ip, retryAfter }, 'auth blocked: too many failed attempts');
+      return reply
+        .code(429)
+        .header('retry-after', String(retryAfter))
+        .send({ error: 'too_many_failed_auth_attempts', retry_after: retryAfter });
+    }
+
+    /** Record the failure before replying, so the next attempt sees it. */
+    const fail = (status: number, error: string) => {
+      throttle?.record(ip);
+      return reply.code(status).send({ error });
+    };
+
     if (config.AUTH_MODE === 'dev') {
       const res = parseDevAuth(req.headers, config.DEV_AUTH_TOKEN);
-      if (!res.ok) return reply.code(res.status).send({ error: res.message });
+      // A 500 here is OUR misconfiguration (no DEV_AUTH_TOKEN), not a failed
+      // credential — charging the caller's IP for it would be wrong.
+      if (!res.ok && res.status >= 500) {
+        return reply.code(res.status).send({ error: res.message });
+      }
+      if (!res.ok) return fail(res.status, res.message);
       const user = await upsertUserBySub(getDb(), res.subject, res.displayName);
       if (user.deletedAt) return replyAccountDeleted(reply);
+      throttle?.reset(ip);
       req.userId = user.id;
       return;
     }
 
     // apple mode
     const token = bearerFrom(req);
-    if (!token) return reply.code(401).send({ error: 'missing bearer token' });
+    if (!token) return fail(401, 'missing bearer token');
     let userId: string;
     try {
       const { subject, email } = await verifyAppleToken(
@@ -119,8 +155,9 @@ export function makeAuthPreHandler(config: Config): preHandlerHookHandler {
       userId = user.id;
     } catch (err) {
       req.log.warn({ err }, 'apple token verification failed');
-      return reply.code(401).send({ error: 'invalid apple identity token' });
+      return fail(401, 'invalid apple identity token');
     }
+    throttle?.reset(ip);
     req.userId = userId;
   };
 }

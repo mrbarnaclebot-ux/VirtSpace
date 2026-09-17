@@ -140,7 +140,21 @@ export function worldsRoutes(app: FastifyInstance, deps: RouteDeps): void {
   const { config, storage } = deps;
 
   // POST /v1/worlds — create world shell + capture, return presigned frame URLs.
-  app.post('/v1/worlds', async (req, reply) => {
+  //
+  // Carries its OWN rate-limit bucket (spec §10 R10), far tighter than the
+  // general per-user one: every accepted call can become a billable generation,
+  // and DAILY_SCAN_QUOTA is 10/day, so a minute's worth of creates is small by
+  // definition. Quota is the correctness guard; this is the cost guard in front
+  // of it, so a runaway client is refused before it touches the ledger at all.
+  app.post('/v1/worlds', {
+    config: {
+      rateLimit: {
+        max: config.RATE_LIMIT_CREATE_MAX,
+        timeWindow: config.RATE_LIMIT_WINDOW_MS,
+        keyGenerator: (req: FastifyRequest) => `create:${req.userId ?? req.ip}`,
+      },
+    },
+  }, async (req, reply) => {
     const userId = requireUserId(req, reply);
     if (!userId) return;
 

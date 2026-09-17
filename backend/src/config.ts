@@ -46,6 +46,21 @@ const baseSchema = z.object({
   // Worker loop poll interval (ms) between empty claim attempts (Stage 2).
   WORKER_POLL_MS: numberFromEnv(2000),
 
+  // --- Rate limiting (spec §10 R10) -----------------------------------------
+  // Window shared by every bucket below.
+  RATE_LIMIT_WINDOW_MS: numberFromEnv(60_000),
+  // Per AUTHENTICATED user. Must stay well clear of the iOS Library's 3 s poll
+  // of GET /v1/worlds (20 req/min) plus detail fetches — 300 is ~15x headroom.
+  RATE_LIMIT_MAX: numberFromEnv(300),
+  // Per IP, applied to everything including unauthenticated traffic. Higher than
+  // the per-user cap because a NAT or an office egress is legitimately many users.
+  RATE_LIMIT_IP_MAX: numberFromEnv(600),
+  // POST /v1/worlds only. Each accepted call can become a billable generation,
+  // and DAILY_SCAN_QUOTA is 10/day, so a minute's worth is deliberately tiny.
+  RATE_LIMIT_CREATE_MAX: numberFromEnv(12),
+  // FAILED authentications per IP per window before that IP is refused outright.
+  AUTH_FAIL_MAX: numberFromEnv(20),
+
   // Graceful shutdown budget (spec §10 R10). The API uses it as a hard ceiling
   // on draining in-flight HTTP requests; the worker as the deadline it gives the
   // in-flight job before exiting anyway. Keep it UNDER the platform's own

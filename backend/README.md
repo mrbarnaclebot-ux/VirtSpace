@@ -237,6 +237,49 @@ rollout, which is the point.
 > shipped idempotent-create path (spec §10 R4) reads. Set the pre-deploy command
 > **before** the next deploy so it lands.
 
+## Rate limiting (spec §10 R10)
+
+`@fastify/rate-limit`, registered globally at the **preHandler** stage. The auth
+hook is an `onRequest` hook precisely so `req.userId` exists by the time the
+limiter picks a key — Fastify runs every `onRequest` hook before any
+`preHandler`, so the ordering holds without depending on registration order.
+
+| Bucket | Key | Default | Env |
+|---|---|---|---|
+| General | `user:<id>` when authenticated | 300 / min | `RATE_LIMIT_MAX` |
+| General (anonymous) | `ip:<addr>` | 600 / min | `RATE_LIMIT_IP_MAX` |
+| `POST /v1/worlds` | `create:<user>` | 12 / min | `RATE_LIMIT_CREATE_MAX` |
+| Failed authentications | `<ip>` | 20 / min | `AUTH_FAIL_MAX` |
+
+Window: `RATE_LIMIT_WINDOW_MS` (default `60000`).
+
+**Why per user, not per IP.** A corporate NAT or carrier egress is legitimately
+many devices; keying the general bucket on the IP would let one heavy user
+exhaust everyone else's budget. Anonymous traffic has no better key, so it falls
+back to the IP with a looser cap.
+
+**The iOS Library poll is safe.** It calls `GET /v1/worlds` every 3 s — 20
+requests per 60 s window, against a 300 budget. ~15× headroom, and a test pins
+that relationship so a future tightening cannot silently break the app.
+
+**`POST /v1/worlds` is deliberately tiny.** Every accepted call can become a
+billable generation and `DAILY_SCAN_QUOTA` is 10/day, so a minute's worth of
+creates is small by definition. Quota is the correctness guard; this is the cost
+guard sitting in front of it, refusing a runaway client before it reaches the
+credit ledger at all.
+
+**Failed auth gets its own counter** (`src/throttle.ts`), not a share of the
+general bucket: it counts only requests that *failed* authentication, which is
+what distinguishes a credential guesser from a busy client. Auth failures never
+reach the plugin anyway — the auth hook short-circuits first. A successful auth
+clears the IP's history.
+
+> **Single replica assumption.** Both the plugin's store and the failed-auth
+> counter are **in-memory and per-process**. That is correct for today's
+> single-replica api service and avoids a Redis dependency bought for nothing.
+> **Scaling the api past one replica requires moving both to a shared store** —
+> otherwise each replica enforces its own copy of every limit.
+
 ## Graceful shutdown (spec §10 R10)
 
 Both services handle `SIGTERM`/`SIGINT`, bounded by `SHUTDOWN_GRACE_MS`

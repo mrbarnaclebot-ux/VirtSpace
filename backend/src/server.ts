@@ -35,7 +35,10 @@ export async function buildServer(): Promise<FastifyInstance> {
 export function installErrorHandler(app: FastifyInstance): void {
   app.setErrorHandler((rawErr: unknown, req, reply) => {
     const err = rawErr as FastifyError;
-    const status = err.statusCode ?? 500;
+    // Fall back to a status already staged on the reply — some plugins set it
+    // before throwing — so a deliberate 4xx never gets laundered into a 500.
+    const status =
+      err?.statusCode ?? (reply.statusCode >= 400 ? reply.statusCode : 500);
 
     if (status >= 500) {
       req.log.error({ err, url: req.url, method: req.method }, 'unhandled request error');
@@ -43,9 +46,17 @@ export function installErrorHandler(app: FastifyInstance): void {
     }
 
     req.log.warn(
-      { code: err.code, status, url: req.url, method: req.method },
+      { code: err?.code, status, url: req.url, method: req.method },
       'request rejected',
     );
+
+    // A plugin may throw a ready-made response body rather than an Error —
+    // @fastify/rate-limit throws exactly that. It is ours, and already safe, so
+    // pass it through instead of flattening it to a generic message.
+    if (rawErr && typeof rawErr === 'object' && !(rawErr instanceof Error)) {
+      return reply.code(status).send(rawErr);
+    }
+
     return reply.code(status).send({
       // Fastify's own machine-readable code (FST_ERR_CTP_BODY_TOO_LARGE, …),
       // falling back to the generic label the routes already use.
