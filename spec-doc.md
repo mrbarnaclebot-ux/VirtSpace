@@ -292,6 +292,25 @@ Everything else scales cheaply: Neon scale-to-zero, serverless workers (jobs are
 | Marble CDN URL longevity | Mitigated by design (copy to R2 immediately); no longer blocking |
 | Does World Labs use API inputs for training? (privacy disclosure wording) | Phase 1 — ToS/DPA read before TestFlight |
 
+**Hardening ledger — full-project review 2026-09-17** (graphify map + iOS/backend audits; tick when the fix lands on `main`):
+
+| # | Finding | Fix |
+|---|---|---|
+| R1 | `worlds:generate` can bill twice: provider timeout is retryable, and a kill between the generate call and persisting `provider_operation_id` re-generates (§14 claim was false) | Persist a `pending:<jobId>` intent marker *before* the call; on resume reconcile against the provider by a unique `display_name` embedding the job id; a failed generate call is non-retryable |
+| R2 | `AUTH_MODE` defaults to `dev`; a dropped env var silently serves dev auth in production | Refuse to boot with `AUTH_MODE=dev` under `NODE_ENV=production` unless `ALLOW_DEV_AUTH=1`; constant-time token compare |
+| R3 | `users.deleted_at` is written but never read — deleted accounts keep working; `captures.poses_json` never purged (§13) | Reject/ignore deleted users at auth; null `poses_json` in purge |
+| R4 | iOS retries a complete-but-failing session forever, minting a fresh billable world per attempt; `POST /v1/worlds` has no idempotency key | Attempt counter + backoff + park after 5 with a user prompt; `Idempotency-Key: <session UUID>` header honoured by the backend (same world returned, quota charged once) |
+| R5 | Debug/sim builds default to the production backend (`Secrets.swift.example` ships the prod URL) | Example defaults to localhost; DEBUG builds hard-fail on a production base URL unless `VIRTSPACE_ALLOW_PROD=1` |
+| R6 | Job lease (600 s) < generate timeout (900 s) and no job heartbeat — a second worker can re-claim a live job | `heartbeatJob` refreshing `locked_at` from the poll tick + stitch progress; idempotent finalize |
+| R7 | Presigned frame uploads have no enforced size cap on R2 | Sign `ContentLength` (or presigned POST policy) |
+| R8 | 8192-wide stitch peaks >1.5 GB RSS; OOM/undecodable-frame exits retried 5× | Band-chunk the reprojection; cap width; classify exit 137 / decode failure as non-retryable |
+| R9 | Quota check is read-then-write (race at the limit) | Single conditional `UPDATE … RETURNING` |
+| R10 | Migrations manual and not in the image; no graceful shutdown, error handler, or rate limit; asset download sends the API key to any provider-returned host, unbounded | Release-phase migrate; SIGTERM → `app.close()`; `setErrorHandler`; `@fastify/rate-limit`; host allowlist + byte cap |
+| R11 | Stale pins: `jose` 5 (EOL), Docker `node:22` vs engines `>=24`, opencv/numpy, fastify/drizzle-kit patches | Upgrade |
+| R12 | iOS: ring haptics use the dead 16-target indices; one stuck background upload wedges all flows; byte-at-a-time asset downloads; SPZ re-read per range request; no WKWebView navigation policy; swallowed resume errors | Fix each (derive ring boundaries from `TargetLayout`; resource timeout + per-session chain; download tasks; cached mapped data; scheme allowlist) |
+| R13 | No iOS test target | Swift Testing target; move `CaptureEngine.debugValidation` into it; cover the uploader resume state machine, `APIError.isWorldGone`, manifest round-trip, range parsing |
+| R14 | Swift 5 language mode + default `MainActor` isolation while capture code runs on private queues — isolation is unchecked | Migrate to Swift 6 language mode; split `CaptureEngine` (HUD state, publish throttle, thermal governor, shot pipeline) |
+
 ---
 
 ## 11. Build phases (v1 = Phases 0–4)
@@ -357,7 +376,7 @@ Everything else scales cheaply: Neon scale-to-zero, serverless workers (jobs are
 
 ## 14. Reliability & operations
 
-- **Credit safety (the money-touching path):** jobs row transitions persisted around every `worlds:generate`; `provider_operation_id` saved atomically; resumed workers never blind-resubmit. Daily credit budget cap (env var) + low-balance alerts.
+- **Credit safety (the money-touching path):** jobs row transitions persisted around every `worlds:generate`; a `pending:<jobId>` intent marker is persisted **before** the call and replaced by the real `provider_operation_id` immediately after; a worker resuming from a pending marker reconciles against the provider (unique `display_name` embedding the job id) and never blind-resubmits; a failed/timed-out generate call is non-retryable (§10 R1 — the 2026-09-17 review found the earlier "saved atomically" claim had a crash/timeout window). Daily credit budget cap (env var) + low-balance alerts.
 - **Durability:** queue with retries + DLQ; every job phase idempotent; client uploads resumable; app relaunch resumes pending uploads and re-polls pending worlds.
 - **Observability:** Sentry (app + backend); structured job logs; metrics: generations/day, credit spend/day, failure rate by phase, job latency p50/p95; alerts on DLQ depth and credit balance.
 - **Asset ownership:** provider outputs copied to R2 the moment a job completes; the app and share pages only ever reference our signed URLs.
