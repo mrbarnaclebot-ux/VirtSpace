@@ -6,8 +6,19 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXContainerItemProxy section */
+		17ABAA073002B5B400C7802C /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 17ABA9DD3002B5B400C7802C /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 17ABA9E43002B5B400C7802C;
+			remoteInfo = VirtSpace;
+		};
+/* End PBXContainerItemProxy section */
+
 /* Begin PBXFileReference section */
 		17ABA9E53002B5B400C7802C /* VirtSpace.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = VirtSpace.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		17ABAA003002B5B400C7802C /* VirtSpaceTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = VirtSpaceTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -16,10 +27,22 @@
 			path = VirtSpace;
 			sourceTree = "<group>";
 		};
+		17ABAA013002B5B400C7802C /* VirtSpaceTests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = VirtSpaceTests;
+			sourceTree = "<group>";
+		};
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
 		17ABA9E23002B5B400C7802C /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		17ABAA043002B5B400C7802C /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -33,6 +56,7 @@
 			isa = PBXGroup;
 			children = (
 				17ABA9E73002B5B400C7802C /* VirtSpace */,
+				17ABAA013002B5B400C7802C /* VirtSpaceTests */,
 				17ABA9E63002B5B400C7802C /* Products */,
 			);
 			sourceTree = "<group>";
@@ -41,6 +65,7 @@
 			isa = PBXGroup;
 			children = (
 				17ABA9E53002B5B400C7802C /* VirtSpace.app */,
+				17ABAA003002B5B400C7802C /* VirtSpaceTests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -70,6 +95,29 @@
 			productReference = 17ABA9E53002B5B400C7802C /* VirtSpace.app */;
 			productType = "com.apple.product-type.application";
 		};
+		17ABAA023002B5B400C7802C /* VirtSpaceTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 17ABAA083002B5B400C7802C /* Build configuration list for PBXNativeTarget "VirtSpaceTests" */;
+			buildPhases = (
+				17ABAA033002B5B400C7802C /* Sources */,
+				17ABAA043002B5B400C7802C /* Frameworks */,
+				17ABAA053002B5B400C7802C /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				17ABAA063002B5B400C7802C /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				17ABAA013002B5B400C7802C /* VirtSpaceTests */,
+			);
+			name = VirtSpaceTests;
+			packageProductDependencies = (
+			);
+			productName = VirtSpaceTests;
+			productReference = 17ABAA003002B5B400C7802C /* VirtSpaceTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -82,6 +130,10 @@
 				TargetAttributes = {
 					17ABA9E43002B5B400C7802C = {
 						CreatedOnToolsVersion = 26.4;
+					};
+					17ABAA023002B5B400C7802C = {
+						CreatedOnToolsVersion = 26.4;
+						TestTargetID = 17ABA9E43002B5B400C7802C;
 					};
 				};
 			};
@@ -100,12 +152,20 @@
 			projectRoot = "";
 			targets = (
 				17ABA9E43002B5B400C7802C /* VirtSpace */,
+				17ABAA023002B5B400C7802C /* VirtSpaceTests */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
 		17ABA9E33002B5B400C7802C /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		17ABAA053002B5B400C7802C /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -122,7 +182,22 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		17ABAA033002B5B400C7802C /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		17ABAA063002B5B400C7802C /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 17ABA9E43002B5B400C7802C /* VirtSpace */;
+			targetProxy = 17ABAA073002B5B400C7802C /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		17ABA9EE3002B5B700C7802C /* Debug */ = {
@@ -318,6 +393,50 @@
 			};
 			name = Release;
 		};
+		17ABAA093002B5B400C7802C /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 7G2CQMAK7G;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.uzmanshafifassy.VirtSpaceTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/VirtSpace.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/VirtSpace";
+			};
+			name = Debug;
+		};
+		17ABAA0A3002B5B400C7802C /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 7G2CQMAK7G;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.uzmanshafifassy.VirtSpaceTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/VirtSpace.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/VirtSpace";
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -335,6 +454,15 @@
 			buildConfigurations = (
 				17ABA9F13002B5B700C7802C /* Debug */,
 				17ABA9F23002B5B700C7802C /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		17ABAA083002B5B400C7802C /* Build configuration list for PBXNativeTarget "VirtSpaceTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				17ABAA093002B5B400C7802C /* Debug */,
+				17ABAA0A3002B5B400C7802C /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

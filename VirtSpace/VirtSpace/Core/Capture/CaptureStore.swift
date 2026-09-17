@@ -75,8 +75,9 @@ final class CaptureStore {
         /// an explicit user "Retry upload" or "Discard".
         static let maxAutomaticAttempts = 5
 
-        /// Delay before automatic attempt n+1, indexed by `attemptCount`:
-        /// 1 min, 5 min, 30 min, 2 h, 6 h.
+        /// How long to wait after the nth failed attempt before trying again:
+        /// 1 min, 5 min, 30 min, 2 h, 6 h. (Parking at 5 attempts means the
+        /// last entry only applies if that budget is ever raised.)
         static let backoffDelays: [TimeInterval] = [60, 300, 1_800, 7_200, 21_600]
 
         var isComplete: Bool { frames.count >= expectedFrameCount }
@@ -87,10 +88,12 @@ final class CaptureStore {
         var isParked: Bool { attemptCount >= Self.maxAutomaticAttempts }
 
         /// Earliest time an automatic retry may run again; nil when no attempt
-        /// has been made yet (retry immediately).
+        /// has been made yet (retry immediately). An attempt that didn't count
+        /// toward parking (quota/offline, `attemptCount` still 0) still waits
+        /// out the first tier, so a foreground kick can't hammer the backend.
         var nextAutomaticAttemptAt: Date? {
             guard let lastAttemptAt else { return nil }
-            let index = min(attemptCount, Self.backoffDelays.count - 1)
+            let index = min(max(attemptCount - 1, 0), Self.backoffDelays.count - 1)
             return lastAttemptAt.addingTimeInterval(Self.backoffDelays[index])
         }
 
