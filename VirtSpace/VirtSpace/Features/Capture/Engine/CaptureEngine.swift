@@ -150,7 +150,7 @@ final class CaptureEngine {
 
     // MARK: Engine-queue state (never touched from the main queue)
 
-    @ObservationIgnored private let queue = DispatchQueue(label: "com.virtspace.capture-engine")
+    @ObservationIgnored private let queue: DispatchQueue
     @ObservationIgnored private var source: CaptureSource?
     @ObservationIgnored private let store: CaptureStore
     @ObservationIgnored private var session: CaptureStore.Session?
@@ -180,29 +180,33 @@ final class CaptureEngine {
     /// Background queue for downscaling paint thumbnails — never the main actor.
     @ObservationIgnored private let thumbnailQueue = DispatchQueue(label: "com.virtspace.capture-thumbnails", qos: .utility)
 
-    /// Whether the session is paused for thermal reasons (engine-queue mirror).
-    @ObservationIgnored private var thermalPausedInternal = false
-    @ObservationIgnored private var thermalObserver: NSObjectProtocol?
+    /// Thermal mitigation: owns the thermal observer, the cool-down pause and
+    /// the pure state→policy mapping (see ThermalGovernor).
+    @ObservationIgnored private let thermal: ThermalGovernor
 
     /// Coalesces the HUD publish to ~30 Hz and to meaningful changes only
     /// (Stage B3 deliverable 2b) — see HUDPublishThrottle.
     @ObservationIgnored private var throttle = HUDPublishThrottle()
 
     init(store: CaptureStore = CaptureStore()) {
+        let queue = DispatchQueue(label: "com.virtspace.capture-engine")
+        self.queue = queue
         self.store = store
-        // React to thermal pressure even before capture starts.
-        thermalObserver = NotificationCenter.default.addObserver(
-            forName: ProcessInfo.thermalStateDidChangeNotification,
-            object: nil,
-            queue: nil
-        ) { [weak self] _ in
-            self?.handleThermalStateChange()
-        }
-    }
+        self.thermal = ThermalGovernor(queue: queue)
 
-    deinit {
-        if let thermalObserver {
-            NotificationCenter.default.removeObserver(thermalObserver)
+        // Wire the governor to this engine's session. Every hook below is
+        // invoked on `queue`, where the engine's own state already lives.
+        thermal.isCapturing = { [weak self] in self?.running ?? false }
+        thermal.pauseFeed = { [weak self] in self?.source?.pause() }
+        thermal.resumeFeed = { [weak self] in self?.source?.resume() }
+        thermal.onThermalChange = { [weak self] state, paused in
+            self?.publish {
+                $0.thermalState = state
+                $0.isThermallyPaused = paused
+            }
+        }
+        thermal.onResume = { [weak self] in
+            self?.publish { $0.isThermallyPaused = false }
         }
     }
 
@@ -287,8 +291,8 @@ final class CaptureEngine {
         AppLog.engine.log("Capture started: session \(self.session?.id.uuidString ?? "?", privacy: .public)")
 
         // Seed the published thermal state so the HUD reflects reality on entry.
-        let thermal = ProcessInfo.processInfo.thermalState
-        publish { $0.thermalState = thermal }
+        let thermalState = thermal.currentState
+        publish { $0.thermalState = thermalState }
 
         // Hand the live session to the HUD's camera preview (device only).
         if let arSource = source as? ARKitCaptureSource {
@@ -311,7 +315,7 @@ final class CaptureEngine {
         firstShotPosition = nil
         exposureLockedInternal = false
         transientWarning = nil
-        thermalPausedInternal = false
+        thermal.reset()
         throttle.reset()
     }
 
@@ -325,72 +329,9 @@ final class CaptureEngine {
 
     // MARK: - Thermal mitigation (Stage B3 deliverable 2e)
 
-    /// Called on the notification queue when `ProcessInfo.thermalState` changes.
-    /// Hops to the engine queue to mutate session state safely.
-    private func handleThermalStateChange() {
-        let state = ProcessInfo.processInfo.thermalState
-        queue.async { [weak self] in self?.applyThermalState(state) }
-    }
-
-    private func applyThermalState(_ state: ProcessInfo.ThermalState) {
-        AppLog.engine.log("Thermal state: \(Self.thermalName(state), privacy: .public)")
-        // At .critical, pause the live session to let the device cool. We keep
-        // the world/heading basis (source.pause(), not a reset) so resume picks
-        // up where we left off. Below .critical we leave resume to the user.
-        if state == .critical, running, !thermalPausedInternal {
-            thermalPausedInternal = true
-            source?.pause()
-            AppLog.engine.error("Thermal critical — session paused")
-        }
-        let paused = thermalPausedInternal
-        publish {
-            $0.thermalState = state
-            $0.isThermallyPaused = paused
-        }
-    }
-
     /// User-driven resume from a thermal-critical pause (see resume UI).
     func resumeFromThermal() {
-        queue.async { [weak self] in
-            guard let self, self.thermalPausedInternal else { return }
-            self.thermalPausedInternal = false
-            self.source?.resume()
-            AppLog.engine.log("Thermal resume requested by user")
-            self.publish { $0.isThermallyPaused = false }
-        }
-    }
-
-    // MARK: Thermal decision mapping (pure — DEBUG-assertable)
-
-    /// Viewfinder frame rate for a thermal state: 24 fps at serious/critical to
-    /// shed load + heat, else 30. Extracted as a pure function so it can be
-    /// asserted in DEBUG (the simulator can never raise the real thermalState).
-    static func previewFrameRate(for state: ProcessInfo.ThermalState) -> Int {
-        switch state {
-        case .serious, .critical: return 24
-        default: return 30
-        }
-    }
-
-    /// Whether the "warming up" coaching banner shows (serious only; critical is
-    /// the full-screen pause UI, not a banner).
-    static func showsWarmingBanner(for state: ProcessInfo.ThermalState) -> Bool {
-        state == .serious
-    }
-
-    /// Whether we pause the session for cool-down (critical only).
-    static func pausesSession(for state: ProcessInfo.ThermalState) -> Bool {
-        state == .critical
-    }
-
-    private static func thermalName(_ state: ProcessInfo.ThermalState) -> String {
-        switch state {
-        case .nominal: return "nominal"
-        case .fair: return "fair"
-        case .serious: return "serious"
-        case .critical: return "critical"
-        @unknown default: return "unknown"
-        }
+        queue.async { [weak self] in self?.thermal.resumeFromPause() }
     }
 
     // MARK: - Engine queue: per-frame

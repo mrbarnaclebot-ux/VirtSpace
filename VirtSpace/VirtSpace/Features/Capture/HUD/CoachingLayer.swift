@@ -50,7 +50,7 @@ struct CoachingLayer: View {
     private var conditions: Conditions {
         Conditions(
             trackingWarning: engine.warning,
-            thermalWarming: CaptureEngine.showsWarmingBanner(for: engine.thermalState),
+            thermalWarming: ThermalGovernor.showsWarmingBanner(for: engine.thermalState),
             driftTier: engine.driftMeters > AlignmentMath.driftHardWarnMeters ? 2
                 : (engine.driftMeters > AlignmentMath.driftWarnMeters ? 1 : 0),
             wantsExposureNotice: engine.capturedCount > 0 && !engine.exposureLocked

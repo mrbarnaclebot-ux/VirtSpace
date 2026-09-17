@@ -3,8 +3,8 @@
 //  VirtSpaceTests
 //
 //  The rest of `CaptureEngine.debugValidation`, moved into real tests
-//  (spec §10 R13): alignment math, the dwell tracker, HUD projection, the
-//  thermal governor's pure mapping and paint-quad sizing.
+//  (spec §10 R13): alignment math, the dwell tracker, HUD projection and
+//  paint-quad sizing. The thermal mapping now lives in ThermalGovernorTests.
 //
 
 import CoreGraphics
@@ -111,23 +111,3 @@ struct TargetProjectionTests {
     }
 }
 
-@Suite("Thermal governor mapping")
-struct ThermalMappingTests {
-    @Test("Preview frame rate drops under thermal pressure")
-    func frameRate() {
-        #expect(CaptureEngine.previewFrameRate(for: .nominal) == 30)
-        #expect(CaptureEngine.previewFrameRate(for: .fair) == 30)
-        #expect(CaptureEngine.previewFrameRate(for: .serious) == 24)
-        #expect(CaptureEngine.previewFrameRate(for: .critical) == 24)
-    }
-
-    @Test("Only `serious` shows the warming banner; `critical` pauses")
-    func banners() {
-        #expect(!CaptureEngine.showsWarmingBanner(for: .nominal))
-        #expect(!CaptureEngine.showsWarmingBanner(for: .fair))
-        #expect(CaptureEngine.showsWarmingBanner(for: .serious))
-        #expect(!CaptureEngine.showsWarmingBanner(for: .critical))
-        #expect(!CaptureEngine.pausesSession(for: .serious))
-        #expect(CaptureEngine.pausesSession(for: .critical))
-    }
-}

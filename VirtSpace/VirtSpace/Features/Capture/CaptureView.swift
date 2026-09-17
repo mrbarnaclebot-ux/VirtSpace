@@ -166,7 +166,7 @@ struct CaptureView: View {
     /// Viewfinder frame rate: 30 fps normally, dropped to 24 under thermal
     /// pressure to shed load and heat (Stage B3 deliverable 2d/2e).
     private var previewFPS: Int {
-        CaptureEngine.previewFrameRate(for: engine.thermalState)
+        ThermalGovernor.previewFrameRate(for: engine.thermalState)
     }
 
     // MARK: - Idle / failed
