@@ -180,7 +180,10 @@ function routeDb() {
             : [{ id: 'cap-1', worldId: 'w-1', frameCount: 2, r2FramesPrefix: null }],
       }),
     }),
-    execute: async () => ({ rows: [{ id: 'user-1', daily_scan_count: 1, quota_reset_at: null }] }),
+    // Shape chargeScanQuota reads: a charged row (§10 R9).
+    execute: async () => ({
+      rows: [{ user_id: 'user-1', new_count: 1, reset_at: new Date('2026-09-18T00:00:00Z') }],
+    }),
   };
 }
 

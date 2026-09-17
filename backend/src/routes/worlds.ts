@@ -2,9 +2,9 @@ import { and, desc, eq, isNull } from 'drizzle-orm';
 import { z } from 'zod';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { getDb } from '../db/client.js';
-import { captures, users, worlds, type World } from '../db/schema.js';
+import { captures, worlds, type World } from '../db/schema.js';
 import { enqueue } from '../queue.js';
-import { evaluateQuota } from '../quota.js';
+import { chargeScanQuota } from '../quota.js';
 import { MAX_FRAME_BYTES, type StorageDriver } from '../storage/index.js';
 import type { RouteDeps } from './deps.js';
 
@@ -145,24 +145,17 @@ export function worldsRoutes(app: FastifyInstance, deps: RouteDeps): void {
     const body = parsed.data;
     const db = getDb();
 
-    // Daily scan quota check (spec §7).
-    const [user] = await db.select().from(users).where(eq(users.id, userId)).limit(1);
-    if (!user) return reply.code(401).send({ error: 'unknown_user' });
-
-    const decision = evaluateQuota(
-      { dailyScanCount: user.dailyScanCount, quotaResetAt: user.quotaResetAt },
-      config.DAILY_SCAN_QUOTA,
-    );
-    if (!decision.allowed) {
+    // Daily scan quota (spec §7). ONE conditional UPDATE … RETURNING — the
+    // old read-then-write let two concurrent creates both pass at the limit
+    // (spec §10 R9).
+    const charge = await chargeScanQuota(db, userId, config.DAILY_SCAN_QUOTA);
+    if (!charge.userFound) return reply.code(401).send({ error: 'unknown_user' });
+    if (!charge.allowed) {
       return reply.code(429).send({
         error: 'daily_scan_quota_exceeded',
-        retry_at: decision.retryAt,
+        retry_at: charge.resetAt,
       });
     }
-    await db
-      .update(users)
-      .set({ dailyScanCount: decision.newCount, quotaResetAt: decision.newResetAt })
-      .where(eq(users.id, userId));
 
     // Create the world shell in the uploading state.
     const [world] = await db

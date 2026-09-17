@@ -1,5 +1,10 @@
-// Daily scan quota (spec §7 / task requirement 6). Pure logic so it can be unit
-// tested without a DB; the route applies the returned counter to the user row.
+import { sql } from 'drizzle-orm';
+import type { Db } from './db/client.js';
+
+// Daily scan quota (spec §7 / task requirement 6). The pure logic below is the
+// readable specification of the window (and backs GET /v1/me/quota); the
+// money-adjacent *charge* is a single conditional UPDATE (chargeScanQuota) so
+// concurrent creates cannot both slip past the limit (spec §10 R9).
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -63,6 +68,77 @@ export function evaluateQuota(
   }
 
   return { allowed: true, newCount: state.dailyScanCount + 1, newResetAt: activeResetAt };
+}
+
+/** Outcome of an atomic quota charge. */
+export interface QuotaChargeResult {
+  /** False when no such user row exists (the caller answers 401). */
+  userFound: boolean;
+  /** True when this request consumed a scan. */
+  allowed: boolean;
+  /** The persisted counter after the charge (null when denied). */
+  newCount: number | null;
+  /** The active window's reset time — `retry_at` for a denied request. */
+  resetAt: Date | null;
+}
+
+/**
+ * Atomically check-and-increment the daily scan quota (spec §10 R9).
+ *
+ * The previous SELECT-then-UPDATE let two concurrent creates both read
+ * `count = max - 1` and both write `max`, handing out one scan too many at the
+ * limit — the exact boundary where the quota is protecting real generation
+ * spend. This is one statement: the UPDATE's own WHERE clause is the limit test,
+ * so Postgres serializes the two writers on the row lock and the loser matches
+ * no row.
+ *
+ * Rolling-window semantics are preserved verbatim from evaluateQuota: an absent
+ * or elapsed `quota_reset_at` opens a fresh 24 h window at count 1; otherwise the
+ * window's reset time stands and the counter increments.
+ *
+ * The outer SELECT is joined so one round trip answers all three cases — user
+ * missing, charged, or refused (with the window's reset for `retry_at`).
+ */
+export async function chargeScanQuota(
+  db: Db,
+  userId: string,
+  max: number,
+): Promise<QuotaChargeResult> {
+  const windowExpiredSql = sql`(quota_reset_at IS NULL OR quota_reset_at <= now())`;
+  const result = await db.execute<{
+    user_id: string;
+    new_count: number | string | null;
+    reset_at: Date | string | null;
+  }>(sql`
+    WITH charged AS (
+      UPDATE users
+      SET daily_scan_count = CASE WHEN ${windowExpiredSql} THEN 1 ELSE daily_scan_count + 1 END,
+          quota_reset_at = CASE WHEN ${windowExpiredSql}
+                                THEN now() + interval '24 hours'
+                                ELSE quota_reset_at END
+      WHERE id = ${userId}
+        AND (${windowExpiredSql} OR daily_scan_count < ${max})
+      RETURNING id, daily_scan_count, quota_reset_at
+    )
+    SELECT u.id AS user_id,
+           c.daily_scan_count AS new_count,
+           COALESCE(c.quota_reset_at, u.quota_reset_at) AS reset_at
+    FROM users u
+    LEFT JOIN charged c ON c.id = u.id
+    WHERE u.id = ${userId}
+  `);
+  const rows = (result as unknown as { rows: Record<string, unknown>[] }).rows;
+  const row = rows[0];
+  if (!row) return { userFound: false, allowed: false, newCount: null, resetAt: null };
+
+  const rawCount = row['new_count'];
+  const rawReset = row['reset_at'];
+  const resetAt =
+    rawReset == null ? null : rawReset instanceof Date ? rawReset : new Date(String(rawReset));
+  if (rawCount == null) {
+    return { userFound: true, allowed: false, newCount: null, resetAt };
+  }
+  return { userFound: true, allowed: true, newCount: Number(rawCount), resetAt };
 }
 
 /**

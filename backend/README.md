@@ -81,8 +81,12 @@ test/                vitest: config, storage, auth, quota/backoff
 - `GET  /healthz` — liveness, no auth, no DB.
 - `POST /v1/worlds` — create world (`status=uploading`) + capture; returns N
   presigned frame upload URLs (`captures/{captureId}/frame_{i}.heic`). Enforces
-  the daily scan quota. Optional `frames: [{ index, bytes }]` declares each
-  frame's exact size (see [Upload size caps](#upload-size-caps-spec-10-r7)).
+  the daily scan quota with a single conditional `UPDATE … RETURNING`
+  (`chargeScanQuota`) — the check and the increment are one statement, so
+  concurrent creates cannot both pass at the limit (spec §10 R9); a refusal is
+  `429 {"error":"daily_scan_quota_exceeded","retry_at":…}`. Optional
+  `frames: [{ index, bytes }]` declares each frame's exact size (see
+  [Upload size caps](#upload-size-caps-spec-10-r7)).
 - `POST /v1/worlds/:id/frames:done` — verify ownership, set `status=stitching`,
   enqueue a `stitch` job. Optionally accepts
   `{ poses: [{ index, timestamp, transform[16], intrinsics[9], exposureLocked }] }`
