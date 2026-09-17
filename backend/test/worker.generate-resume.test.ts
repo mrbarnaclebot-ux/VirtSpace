@@ -13,6 +13,7 @@ import {
   ProviderTimeoutError,
   type WorldGenProvider,
 } from '../src/provider/index.js';
+import { BudgetExceededError } from '../src/budget.js';
 import { createMockProvider } from '../src/provider/mock.js';
 
 // spec §10 R1 / §14 — the worlds:generate double-bill window.
@@ -43,20 +44,38 @@ function fakeProvider(overrides: Partial<WorldGenProvider> = {}): WorldGenProvid
   } as WorldGenProvider;
 }
 
-function fakeIO(
-  overrides: Partial<GenerationIO> = {},
-): GenerationIO & { saved: string[]; reserved: number[] } {
+interface FakeIO extends GenerationIO {
+  /** Every value written to provider_operation_id, in order. */
+  saved: string[];
+  reserved: number[];
+  released: number[];
+  /** Current persisted value — null once the marker is cleared. */
+  persisted: () => string | null;
+}
+
+function fakeIO(overrides: Partial<GenerationIO> = {}): FakeIO {
   const saved: string[] = [];
   const reserved: number[] = [];
+  const released: number[] = [];
+  let current: string | null = null;
   return {
     saved,
     reserved,
+    released,
+    persisted: () => current,
     reserveCredits: vi.fn(async (amount: number) => {
       reserved.push(amount);
+    }),
+    releaseCredits: vi.fn(async (amount: number) => {
+      released.push(amount);
     }),
     getPanoBytes: vi.fn(async () => Buffer.from('pano')),
     saveOperationId: vi.fn(async (opId: string) => {
       saved.push(opId);
+      current = opId;
+    }),
+    clearPendingMarker: vi.fn(async () => {
+      if (current !== null && current.startsWith('pending:')) current = null;
     }),
     storeAsset: vi.fn(async (name: string) => `worlds/${WORLD_ID}/${name}`),
     ...overrides,
@@ -121,7 +140,7 @@ describe('pending intent marker', () => {
     expect(io.reserved).toEqual([150]);
   });
 
-  it('a crash after the marker but before generate returns leaves the marker behind', async () => {
+  it('a throw from generateWorld itself leaves the marker behind', async () => {
     const io = fakeIO();
     const provider = fakeProvider({
       generateWorld: vi.fn(async () => {
@@ -131,6 +150,155 @@ describe('pending intent marker', () => {
 
     await expect(runGeneration(provider, io, input(null), instantClock)).rejects.toThrow();
     expect(io.saved).toEqual([pendingOperationMarker(JOB_ID)]);
+    // The call may have reached the provider, so the marker MUST survive.
+    expect(io.persisted()).toBe(pendingOperationMarker(JOB_ID));
+    expect(io.clearPendingMarker).not.toHaveBeenCalled();
+    expect(io.releaseCredits).not.toHaveBeenCalled();
+  });
+});
+
+// --- pre-generate failures unwind (QA regression on the R1 fix) --------------
+//
+// The marker lands before reserve/read/upload so a process death resumes into
+// reconciliation. But a THROWN failure from any of those three proves generate
+// was never submitted — pano upload is an ordinary network call and the likeliest
+// failure in the whole path. Those must unwind and stay retryable, or a routine
+// 5xx permanently parks the job and needs an operator.
+
+describe('pre-generate failures unwind the marker', () => {
+  it('a transient uploadPano failure clears the marker and stays retryable', async () => {
+    const io = fakeIO();
+    const provider = fakeProvider({
+      uploadPano: vi.fn(async () => {
+        throw new ProviderError('media upload failed: 503');
+      }),
+    });
+
+    const err = await runGeneration(provider, io, input(null), instantClock).catch(
+      (e: unknown) => e,
+    );
+
+    // Original error, original retryability — NOT parked.
+    expect(err).toBeInstanceOf(ProviderError);
+    expect(err).not.toBeInstanceOf(NonRetryableJobError);
+    expect((err as Error).message).toContain('503');
+    // Marker gone, reservation given back.
+    expect(io.persisted()).toBeNull();
+    expect(io.clearPendingMarker).toHaveBeenCalledOnce();
+    expect(io.released).toEqual([150]);
+    expect(provider.generateWorld).not.toHaveBeenCalled();
+  });
+
+  it('a getPanoBytes failure likewise clears the marker and releases the reservation', async () => {
+    const io = fakeIO({
+      getPanoBytes: vi.fn(async () => {
+        throw new Error('R2 read blip');
+      }),
+    });
+    const provider = fakeProvider();
+
+    const err = await runGeneration(provider, io, input(null), instantClock).catch(
+      (e: unknown) => e,
+    );
+
+    expect(err).not.toBeInstanceOf(NonRetryableJobError);
+    expect((err as Error).message).toBe('R2 read blip');
+    expect(io.persisted()).toBeNull();
+    expect(io.released).toEqual([150]);
+    expect(provider.uploadPano).not.toHaveBeenCalled();
+    expect(provider.generateWorld).not.toHaveBeenCalled();
+  });
+
+  it('the retry after a cleared marker generates ONCE and reserves ONCE', async () => {
+    // Attempt 1: upload blips.
+    const io1 = fakeIO();
+    const provider1 = fakeProvider({
+      uploadPano: vi.fn(async () => {
+        throw new ProviderError('media upload failed: 503');
+      }),
+    });
+    await expect(
+      runGeneration(provider1, io1, input(null), instantClock),
+    ).rejects.toBeInstanceOf(ProviderError);
+    expect(io1.persisted()).toBeNull();
+    // Net ledger effect of the failed attempt is zero: reserved then released.
+    expect(io1.reserved).toEqual([150]);
+    expect(io1.released).toEqual([150]);
+
+    // Attempt 2 starts clean (operation id is NULL again) — a normal fresh run,
+    // not a reconciliation, and certainly not a park.
+    const io2 = fakeIO();
+    const provider2 = fakeProvider();
+    const result = await runGeneration(provider2, io2, input(null), instantClock);
+
+    expect(provider2.findWorldByDisplayName).not.toHaveBeenCalled();
+    expect(provider2.generateWorld).toHaveBeenCalledOnce();
+    expect(io2.reserved).toEqual([150]); // exactly one reservation for this attempt
+    expect(io2.released).toEqual([]);
+    expect(io2.saved).toEqual([pendingOperationMarker(JOB_ID), 'op-1']);
+    expect(result.worldId).toBe('provider-world-1');
+  });
+
+  it('BudgetExceeded still parks, and releases nothing (no reservation was taken)', async () => {
+    const io = fakeIO({
+      reserveCredits: vi.fn(async () => {
+        throw new BudgetExceededError(150, 400, 500);
+      }),
+    });
+    const provider = fakeProvider();
+
+    const err = await runGeneration(provider, io, input(null), instantClock).catch(
+      (e: unknown) => e,
+    );
+
+    expect(err).toBeInstanceOf(BudgetExceededError); // handleJobError parks this
+    expect(io.released).toEqual([]);
+    // The marker is still cleared — nothing is pending for a retry to reconcile.
+    expect(io.persisted()).toBeNull();
+    expect(provider.generateWorld).not.toHaveBeenCalled();
+  });
+
+  it('a failing marker-clear leaves the marker and still rethrows the ORIGINAL error', async () => {
+    const io = fakeIO({
+      clearPendingMarker: vi.fn(async () => {
+        throw new Error('db unavailable');
+      }),
+    });
+    const provider = fakeProvider({
+      uploadPano: vi.fn(async () => {
+        throw new ProviderError('media upload failed: 503');
+      }),
+    });
+
+    const err = await runGeneration(provider, io, input(null), instantClock).catch(
+      (e: unknown) => e,
+    );
+
+    // Fail safe: the caller sees the upload failure, and the marker survives, so
+    // the retry reconciles (and at worst parks) instead of risking a re-bill.
+    expect((err as Error).message).toContain('503');
+    expect(io.persisted()).toBe(pendingOperationMarker(JOB_ID));
+  });
+
+  it('a failing credit release does not mask the original error either', async () => {
+    const io = fakeIO({
+      releaseCredits: vi.fn(async () => {
+        throw new Error('ledger insert failed');
+      }),
+    });
+    const provider = fakeProvider({
+      uploadPano: vi.fn(async () => {
+        throw new ProviderError('media upload failed: 503');
+      }),
+    });
+
+    const err = await runGeneration(provider, io, input(null), instantClock).catch(
+      (e: unknown) => e,
+    );
+
+    expect((err as Error).message).toContain('503');
+    // The marker is still cleared, so the retry is a clean fresh attempt.
+    expect(io.persisted()).toBeNull();
   });
 });
 

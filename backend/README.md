@@ -358,10 +358,28 @@ once** per job. `jobs.provider_operation_id` drives three entry states:
 3. **Null** → a fresh generation: (a) persist the `pending:<jobId>` marker,
    (b) `reserveCredits(cost)` against the **daily budget**, (c) upload the pano,
    (d) call `generateWorld`, (e) persist the real operation id. The marker lands
-   **before** the reservation, so no crash in the window can reserve twice or
-   generate twice. A failure or timeout **of the generate call itself** is
-   **non-retryable** (`NonRetryableJobError` → parked dead): the provider may
+   **before** the reservation, so no *process death* in the window can reserve
+   twice or generate twice. A failure or timeout **of the generate call itself**
+   is **non-retryable** (`NonRetryableJobError` → parked dead): the provider may
    have accepted it. Poll-phase timeouts stay retryable — they resume by id.
+
+   **Pre-generate failures unwind.** A *thrown* error from (b), (c) or (d)'s
+   upload — the pano PUT is an ordinary network call and the likeliest failure in
+   the path — proves no generation was submitted. Those release the reservation
+   (`releaseCredits`) and clear the marker (`clearProviderOperationId`,
+   conditional on it still being this job's), then rethrow the **original** error
+   with its **original retryability**, so a transient 5xx retries normally instead
+   of parking the job for an operator. `BudgetExceededError` still parks. If the
+   unwind itself fails, the marker stays — the retry then reconciles and at worst
+   parks, which is the safe direction. Only a process death inside the window, or
+   a throw from `generateWorld`, leaves a marker behind on purpose.
+
+   A released reservation is a **compensating `-amount` entry** in
+   `credit_events`, not a deletion: the ledger is append-only and the guard is a
+   daily SUM, so both halves stay visible and the day's total comes out right.
+   Reservations are deliberately **not** made idempotent per job — a job retried
+   on a later day must be re-checked against *that* day's budget, and one world
+   legitimately reserves twice (draft + HQ).
 
 > `findWorldByDisplayName`'s live implementation targets a
 > `GET /marble/v1/worlds` listing that the Phase 0 spike never exercised, so the

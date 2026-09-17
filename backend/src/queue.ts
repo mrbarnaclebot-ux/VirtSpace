@@ -229,6 +229,32 @@ export async function heartbeatJob(
 }
 
 /**
+ * Clear a `pending:<jobId>` intent marker (spec §10 R1) after a failure that
+ * happened strictly BEFORE `worlds:generate` — i.e. where no generation can
+ * possibly have been submitted, so the next attempt should start cleanly instead
+ * of reconciling and parking.
+ *
+ * Conditional on the stored value still being `expected`: if a concurrent worker
+ * has since written a real operation id (or its own marker), this must not wipe
+ * it. Returns whether the marker was actually cleared.
+ */
+export async function clearProviderOperationId(
+  db: Db,
+  jobId: string,
+  expected: string,
+): Promise<boolean> {
+  const result = await db.execute<{ id: string }>(sql`
+    UPDATE jobs
+    SET provider_operation_id = NULL, updated_at = now()
+    WHERE id = ${jobId}
+      AND provider_operation_id = ${expected}
+    RETURNING id
+  `);
+  const rows = (result as unknown as { rows: { id: string }[] }).rows;
+  return rows.length > 0;
+}
+
+/**
  * Persist the provider operation id atomically (spec §14) so a resumed worker
  * never blind-resubmits a credit-spending worlds:generate call.
  */

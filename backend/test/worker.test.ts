@@ -124,6 +124,8 @@ function fakeIO(): GenerationIO & { saved: string[]; reserved: number[] } {
       reserved.push(amount);
     }),
     getPanoBytes: vi.fn(async () => Buffer.from('pano')),
+    releaseCredits: vi.fn(async () => undefined),
+    clearPendingMarker: vi.fn(async () => undefined),
     saveOperationId: vi.fn(async (opId: string) => {
       saved.push(opId);
     }),

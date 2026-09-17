@@ -74,3 +74,31 @@ export async function reserveCredits(
     });
   });
 }
+
+/**
+ * Give back a reservation that provably bought nothing (spec §10 R1).
+ *
+ * The ledger is append-only and the daily guard is a SUM, so a release is a
+ * COMPENSATING entry (`-amount`) rather than a deletion or an update: the day's
+ * total comes out right, and both halves stay visible for audit.
+ *
+ * Deliberately NOT "make the reservation idempotent per job": a job retried on a
+ * later day must be re-checked against THAT day's budget, and a single world
+ * legitimately reserves twice (draft + HQ). Reusing an old reservation would let
+ * a retry slip past the cap entirely.
+ *
+ * Only called when the failure happened strictly BEFORE `worlds:generate`, i.e.
+ * when no credits can possibly have been spent. No advisory lock: this only ever
+ * lowers the running total, so it cannot race another reserver past the cap.
+ */
+export async function releaseCredits(
+  db: Db,
+  amount: number,
+  worldId?: string,
+): Promise<void> {
+  if (amount <= 0) return; // mock mode reserves 0 — nothing to give back.
+  await db.insert(creditEvents).values({
+    amount: -amount,
+    worldId: worldId ?? null,
+  });
+}

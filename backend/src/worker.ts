@@ -9,6 +9,7 @@ import { getDb, closeDb, type Db } from './db/client.js';
 import { captures, worlds, type Job, type JobKind, type World } from './db/schema.js';
 import {
   claimNextJob,
+  clearProviderOperationId,
   completeJob,
   enqueue,
   failJob,
@@ -16,7 +17,7 @@ import {
   parkJobDead,
   setProviderOperationId,
 } from './queue.js';
-import { reserveCredits, BudgetExceededError } from './budget.js';
+import { reserveCredits, releaseCredits, BudgetExceededError } from './budget.js';
 import { createStorage, MAX_FRAME_BYTES, type StorageDriver } from './storage/index.js';
 import {
   createProvider,
@@ -328,8 +329,19 @@ export interface GenerationInput {
 /** Side-effect surface runGeneration needs — real impl hits db + storage. */
 export interface GenerationIO {
   reserveCredits(amount: number): Promise<void>;
+  /**
+   * Give back a reservation that provably bought nothing — only used when a step
+   * strictly BEFORE `worlds:generate` failed (spec §10 R1).
+   */
+  releaseCredits(amount: number): Promise<void>;
   getPanoBytes(): Promise<Buffer>;
   saveOperationId(operationId: string): Promise<void>;
+  /**
+   * Clear this job's `pending:<jobId>` marker after a pre-generate failure, so
+   * the retry starts clean instead of reconciling. Must be conditional on the
+   * marker still being ours.
+   */
+  clearPendingMarker(): Promise<void>;
   /** Persist asset bytes; returns the storage key. */
   storeAsset(name: string, bytes: Buffer): Promise<string>;
 }
@@ -359,12 +371,21 @@ export interface GenerationResult {
  *    double-bill this ledger item exists to close.
  * 3. **null** → fresh generation: persist the marker, reserve, upload, generate,
  *    persist the real id. The marker lands FIRST (before the reservation) so no
- *    crash anywhere in the window can produce a second reserve or a second
- *    generate.
+ *    *process death* anywhere in the window can produce a second reserve or a
+ *    second generate.
  *
  * A failure of the generate call itself is NON-retryable (`NonRetryableJobError`):
  * the call may have been received by the provider, so a retry could bill twice.
  * Poll-phase failures stay retryable — they resume by operation id.
+ *
+ * A THROWN failure from a step strictly before generate (reserve, pano read,
+ * pano upload — the last is an ordinary network call and the likeliest failure
+ * in the path) proves no generation was submitted. Those unwind: the reservation
+ * is released and the marker cleared, and the original error is rethrown with its
+ * original retryability, so a transient blip retries normally instead of parking
+ * the job for an operator. Only a process death inside the window, or a throw
+ * from generateWorld itself, may leave the marker behind. If the unwind itself
+ * fails, the marker stays (fail safe toward parking, never toward re-billing).
  */
 export async function runGeneration(
   provider: WorldGenProvider,
@@ -419,9 +440,22 @@ export async function runGeneration(
     // BEFORE anything else, so every later crash point resumes into (2) instead
     // of reserving credits or calling generate a second time.
     await io.saveOperationId(pendingOperationMarker(input.jobId));
-    await io.reserveCredits(input.cost);
-    const panoBytes = await io.getPanoBytes();
-    const mediaAssetId = await provider.uploadPano(panoBytes, 'pano.jpg');
+
+    // Steps before the money call. A THROW here proves nothing was submitted, so
+    // it unwinds the marker (and any reservation) and keeps its own
+    // retryability — a 5xx from the pano upload must not park the job.
+    let mediaAssetId: string;
+    let reserved = false;
+    try {
+      await io.reserveCredits(input.cost);
+      reserved = true;
+      const panoBytes = await io.getPanoBytes();
+      mediaAssetId = await provider.uploadPano(panoBytes, 'pano.jpg');
+    } catch (err) {
+      await unwindPendingGeneration(io, input, reserved);
+      throw err; // original error, original retryability (budget still parks).
+    }
+
     try {
       operationId = await provider.generateWorld(mediaAssetId, input.model, input.displayName);
     } catch (err) {
@@ -472,6 +506,42 @@ export async function runGeneration(
   if (!status.worldId) throw new ProviderError('operation done but returned no world_id');
 
   return collectAssets(provider, io, status.worldId);
+}
+
+/**
+ * Undo the pre-generate half of a fresh generation (spec §10 R1) after a step
+ * before `worlds:generate` threw: release the reservation (if one was taken) and
+ * clear the intent marker, so the retry starts clean rather than reconciling and
+ * parking.
+ *
+ * Both steps are best-effort and never mask the original failure. If clearing
+ * the marker fails the marker STAYS — the next attempt then reconciles and, at
+ * worst, parks the job for an operator. That is the safe direction: the only
+ * thing this code must never do is make a second generate look allowed.
+ */
+async function unwindPendingGeneration(
+  io: GenerationIO,
+  input: GenerationInput,
+  reserved: boolean,
+): Promise<void> {
+  if (reserved) {
+    try {
+      await io.releaseCredits(input.cost);
+    } catch (err) {
+      // Over-counting today's budget is harmless (it spends less, never more).
+      console.error(
+        `[worker] job ${input.jobId}: failed to release an unused reservation: ${String(err)}`,
+      );
+    }
+  }
+  try {
+    await io.clearPendingMarker();
+  } catch (err) {
+    console.error(
+      `[worker] job ${input.jobId}: failed to clear the pending marker after a ` +
+        `pre-generate failure; the retry will reconcile instead: ${String(err)}`,
+    );
+  }
 }
 
 /**
@@ -784,8 +854,12 @@ async function handleGenerate(
   const io: GenerationIO = {
     reserveCredits: (amount) =>
       reserveCredits(db, amount, config.DAILY_CREDIT_BUDGET, world.id),
+    releaseCredits: (amount) => releaseCredits(db, amount, world.id),
     getPanoBytes: () => storage.getObject(panoKey),
     saveOperationId: (opId) => setProviderOperationId(db, job.id, opId),
+    clearPendingMarker: async () => {
+      await clearProviderOperationId(db, job.id, pendingOperationMarker(job.id));
+    },
     storeAsset: async (name, bytes) => {
       const key = assetKeyFor(world.id, name);
       await storage.putObject(key, bytes);
