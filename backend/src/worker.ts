@@ -230,6 +230,86 @@ export interface StitcherRun {
   stdout: string;
   stderr: string;
   timedOut: boolean;
+  /** POSIX signal that reaped the child, when it exited via one. */
+  signal?: NodeJS.Signals | null;
+}
+
+// --- Stitcher failure classification (spec §10 R8) ---------------------------
+
+/**
+ * `reproject.py` EXIT_INPUT_ERROR: the capture payload itself is unusable
+ * (undecodable/genuinely-HEIC frames, no usable frames, bad arguments). Keep in
+ * sync with stitcher/reproject.py.
+ */
+export const STITCHER_EXIT_INPUT_ERROR = 2;
+
+/**
+ * 128 + SIGKILL(9). The kernel OOM-killer reaps the child with SIGKILL and no
+ * exit code, which `stitcherExitCode` normalises to this POSIX shell convention.
+ */
+export const STITCHER_EXIT_OOM_KILLED = 137;
+
+/**
+ * Attempts after which a repeated OOM-kill or timeout stops being worth
+ * retrying. Resource failures on a FIXED payload are deterministic: the same
+ * frames at the same width will exhaust the same memory. One retry covers the
+ * genuinely transient case (a co-tenant spike on the box); a second identical
+ * failure is the payload telling us it does not fit.
+ */
+export const STITCH_RESOURCE_MAX_ATTEMPTS = 2;
+
+/**
+ * Normalise a child exit into a single number. Node reports `code: null` when a
+ * signal reaped the process, which would otherwise erase the OOM-killer's
+ * fingerprint — so a signal becomes 128 + signum (SIGKILL -> 137), matching the
+ * shell convention the rest of the stack already speaks.
+ */
+export function stitcherExitCode(
+  code: number | null,
+  signal: NodeJS.Signals | null,
+): number {
+  if (code !== null) return code;
+  if (signal) {
+    const num = (os.constants.signals as Record<string, number>)[signal];
+    if (typeof num === 'number') return 128 + num;
+  }
+  return -1;
+}
+
+/**
+ * Turn a non-zero stitcher exit into the right error TYPE for the retry policy.
+ * Classification is by exit CODE, never by matching message text — the message
+ * is a human artifact that changes; the code is a contract.
+ */
+export function classifyStitcherFailure(
+  code: number,
+  attempts: number,
+  detail: string,
+): Error {
+  const base = `stitcher exited ${code}: ${detail}`;
+  if (code === STITCHER_EXIT_INPUT_ERROR) {
+    // The frames are bad. Every retry decodes the same bytes and fails the same
+    // way, so retrying only burns attempts and delays the user's error.
+    return new NonRetryableJobError(`${base} (unusable capture input; not retryable)`);
+  }
+  if (code === STITCHER_EXIT_OOM_KILLED && attempts >= STITCH_RESOURCE_MAX_ATTEMPTS) {
+    return new NonRetryableJobError(
+      `${base} (OOM-killed on attempt ${attempts} of ` +
+        `${STITCH_RESOURCE_MAX_ATTEMPTS}; not retryable)`,
+    );
+  }
+  return new Error(base);
+}
+
+/** Same policy for a stitch that blew the wall-clock ceiling. */
+export function classifyStitcherTimeout(timeoutMs: number, attempts: number): Error {
+  const base = `stitcher timed out after ${timeoutMs}ms`;
+  if (attempts >= STITCH_RESOURCE_MAX_ATTEMPTS) {
+    return new NonRetryableJobError(
+      `${base} on attempt ${attempts} of ${STITCH_RESOURCE_MAX_ATTEMPTS}; not retryable`,
+    );
+  }
+  return new Error(base);
 }
 
 /** Injectable stitcher runner (real impl spawns Python; tests mock it).
@@ -265,9 +345,9 @@ export const realStitcherSpawner: StitcherSpawner = (bin, args, timeoutMs, onStd
       clearTimeout(timer);
       reject(err);
     });
-    child.on('close', (code) => {
+    child.on('close', (code, signal) => {
       clearTimeout(timer);
-      resolve({ code: code ?? -1, stdout, stderr, timedOut });
+      resolve({ code: stitcherExitCode(code, signal), stdout, stderr, timedOut, signal });
     });
   });
 
@@ -721,13 +801,19 @@ async function finalizeStitch(db: Db, worldId: string, panoKey: string): Promise
  * frame_count > 1 → real stitch: download every frame to a temp dir, write
  * poses.json when captures.poses_json is present, then spawn
  * stitcher/reproject.py (5-min timeout). On success upload pano.jpg (+ optional
- * pano_preview.jpg) and advance to generating_draft. On Python failure the job
- * fails RETRYABLE (transient disk/memory pressure is real). Temp dir is always
- * cleaned in finally.
+ * pano_preview.jpg) and advance to generating_draft. Temp dir is always cleaned
+ * in finally.
  *
- * NOTE (documented gap, shared with the passthrough path): frames are written
- * to the temp dir as frame_<i>.jpg from the stored bytes. The winning pipeline
- * assumes JPEG-decodable frames; a true HEIC→JPEG transcode is a follow-up.
+ * Failure handling is driven by the stitcher's EXIT CODE (spec §10 R8): an
+ * input error (exit 2) parks the job dead at once, a repeated OOM-kill (137) or
+ * timeout parks it after STITCH_RESOURCE_MAX_ATTEMPTS, and anything else stays
+ * retryable because transient disk/memory pressure is real.
+ *
+ * NOTE (client contract, not a bug): the capture app uploads JPEG bytes under
+ * `frame_<i>.heic` keys with an `image/heic` content-type, so frames are staged
+ * as frame_<i>.jpg from the stored bytes and the extension means nothing. The
+ * stitcher sniffs the real container by magic bytes and fails with the
+ * input-error code — naming the format — if a frame is genuinely HEIF.
  */
 export async function handleStitch(deps: WorkerDeps, job: Job): Promise<void> {
   const { db, storage, config } = deps;
@@ -807,12 +893,14 @@ export async function handleStitch(deps: WorkerDeps, job: Job): Promise<void> {
           'abandoning without finalizing',
       );
     }
+    // Retryability comes from the exit CODE (spec §10 R8): bad input is parked
+    // immediately, a repeated OOM-kill/timeout is parked after the second
+    // attempt, everything else keeps the normal backoff.
     if (run.timedOut) {
-      throw new Error(`stitcher timed out after ${config.STITCHER_TIMEOUT_MS}ms`);
+      throw classifyStitcherTimeout(config.STITCHER_TIMEOUT_MS, job.attempts);
     }
     if (run.code !== 0) {
-      // Retryable: transient disk/memory issues can clear on a re-run.
-      throw new Error(`stitcher exited ${run.code}: ${tail(run.stderr)}`);
+      throw classifyStitcherFailure(run.code, job.attempts, tail(run.stderr));
     }
 
     const panoBytes = await readFile(outPath);

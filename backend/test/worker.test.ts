@@ -7,6 +7,13 @@ import {
   buildStitcherArgs,
   handleStitch,
   runGeneration,
+  stitcherExitCode,
+  classifyStitcherFailure,
+  classifyStitcherTimeout,
+  NonRetryableJobError,
+  STITCHER_EXIT_INPUT_ERROR,
+  STITCHER_EXIT_OOM_KILLED,
+  STITCH_RESOURCE_MAX_ATTEMPTS,
   type GenerationIO,
   type GenerationClock,
   type WorkerDeps,
@@ -434,5 +441,114 @@ describe('handleStitch dispatch', () => {
     await expect(handleStitch(deps(db, storage, failing), stitchJob)).rejects.toThrow(/boom/);
     // Not a NonRetryableJobError → the loop's handleJobError will retry it.
     expect(sink.updates.some((u) => u.patch['status'] === 'generating_draft')).toBe(false);
+  });
+});
+
+// --- stitcher failure classification (spec §10 R8) ---------------------------
+
+describe('stitcherExitCode', () => {
+  it('passes a real exit code through', () => {
+    expect(stitcherExitCode(0, null)).toBe(0);
+    expect(stitcherExitCode(2, null)).toBe(2);
+  });
+
+  it('maps a reaping signal to 128 + signum so SIGKILL reads as 137', () => {
+    // Node reports code: null when a signal reaps the child. Without this the
+    // OOM-killer's fingerprint is erased and every OOM looks like a generic -1.
+    expect(stitcherExitCode(null, 'SIGKILL')).toBe(STITCHER_EXIT_OOM_KILLED);
+    expect(stitcherExitCode(null, 'SIGTERM')).toBe(143);
+  });
+
+  it('falls back to -1 when there is neither a code nor a known signal', () => {
+    expect(stitcherExitCode(null, null)).toBe(-1);
+  });
+});
+
+describe('classifyStitcherFailure', () => {
+  it('input error (exit 2) is non-retryable on the FIRST attempt', () => {
+    const err = classifyStitcherFailure(STITCHER_EXIT_INPUT_ERROR, 1, 'bad frame');
+    expect(err).toBeInstanceOf(NonRetryableJobError);
+    expect(err.message).toContain('unusable capture input');
+  });
+
+  it('OOM-kill is retryable once, then non-retryable', () => {
+    const first = classifyStitcherFailure(STITCHER_EXIT_OOM_KILLED, 1, 'killed');
+    expect(first).not.toBeInstanceOf(NonRetryableJobError);
+
+    const second = classifyStitcherFailure(STITCHER_EXIT_OOM_KILLED, 2, 'killed');
+    expect(second).toBeInstanceOf(NonRetryableJobError);
+    expect(second.message).toContain('OOM-killed on attempt 2');
+  });
+
+  it('an internal error (exit 1) stays retryable even late', () => {
+    // Transient disk/memory pressure can genuinely clear on a re-run, so exit 1
+    // keeps the queue's normal backoff until MAX_ATTEMPTS parks it.
+    const err = classifyStitcherFailure(1, 5, 'transient boom');
+    expect(err).not.toBeInstanceOf(NonRetryableJobError);
+    expect(err.message).toContain('transient boom');
+  });
+
+  it('classifies by code, never by message text', () => {
+    // A message that merely MENTIONS memory must not be treated as an OOM.
+    const err = classifyStitcherFailure(1, 3, 'boom: out of memory');
+    expect(err).not.toBeInstanceOf(NonRetryableJobError);
+  });
+});
+
+describe('classifyStitcherTimeout', () => {
+  it('is retryable once, then non-retryable', () => {
+    expect(classifyStitcherTimeout(1000, 1)).not.toBeInstanceOf(NonRetryableJobError);
+    const parked = classifyStitcherTimeout(1000, STITCH_RESOURCE_MAX_ATTEMPTS);
+    expect(parked).toBeInstanceOf(NonRetryableJobError);
+    expect(parked.message).toContain('timed out after 1000ms');
+  });
+});
+
+describe('handleStitch failure classification', () => {
+  const jobWithAttempts = (attempts: number) =>
+    ({ id: 'job-1', kind: 'stitch', worldId: 'w-1', attempts }) as unknown as Job;
+
+  async function runFailing(
+    run: { code: number; timedOut?: boolean; stderr?: string },
+    attempts: number,
+  ) {
+    const sink: Sink = { updates: [], inserts: [], executes: 0 };
+    const db = makeStitchDb(fakeWorld(), fakeCapture(2, null), sink);
+    const { storage } = fakeStorage();
+    const failing: StitcherSpawner = async () => ({
+      code: run.code,
+      stdout: '',
+      stderr: run.stderr ?? 'stderr tail',
+      timedOut: run.timedOut ?? false,
+    });
+    const err = await handleStitch(deps(db, storage, failing), jobWithAttempts(attempts)).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    return { err, sink };
+  }
+
+  it('an undecodable frame (exit 2) parks the job immediately', async () => {
+    const { err, sink } = await runFailing({ code: STITCHER_EXIT_INPUT_ERROR }, 1);
+    expect(err).toBeInstanceOf(NonRetryableJobError);
+    expect(sink.updates.some((u) => u.patch['status'] === 'generating_draft')).toBe(false);
+  });
+
+  it('an OOM-kill (137) retries once then parks', async () => {
+    expect((await runFailing({ code: STITCHER_EXIT_OOM_KILLED }, 1)).err).not.toBeInstanceOf(
+      NonRetryableJobError,
+    );
+    expect((await runFailing({ code: STITCHER_EXIT_OOM_KILLED }, 2)).err).toBeInstanceOf(
+      NonRetryableJobError,
+    );
+  });
+
+  it('a timeout retries once then parks', async () => {
+    expect(
+      (await runFailing({ code: 137, timedOut: true }, 1)).err,
+    ).not.toBeInstanceOf(NonRetryableJobError);
+    const late = await runFailing({ code: 137, timedOut: true }, 2);
+    expect(late.err).toBeInstanceOf(NonRetryableJobError);
+    expect((late.err as Error).message).toContain('timed out');
   });
 });

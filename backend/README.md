@@ -302,22 +302,59 @@ Intrinsics (native-landscape `fx,fy,cx,cy`) yield resolution-independent FOVs;
 after rotation the upright **width** spans the native **vertical** FOV and the
 upright **height** the native **horizontal** FOV.
 
-**CLI** (deterministic; progress on stdout; non-zero exit + stderr on failure):
+**Memory (spec §10 R8).** The equirect is filled in **horizontal row bands**
+(`BAND_TARGET_PIXELS`, 1 Mpx → 128 rows at 8192 wide) rather than allocating the
+ray grid, accumulator and output at sphere resolution. `--width` is capped at
+**8192**. Measured peak RSS at 8192×4096 on a 28-frame capture: **4.53 GB →
+397 MB** (full coverage) and **4.24 GB → 447 MB** (36.9 % coverage, inpaint
+exercised), with no runtime regression. Output is unchanged — the 8192-wide
+panos are byte-identical to the pre-banding implementation, which is kept in
+`test/fixtures/reproject_legacy.py` purely so `test/stitcher.banding.test.ts`
+can keep proving it.
+
+**CLI** (deterministic; progress on stdout; stderr + an EXIT CODE on failure):
 
 ```bash
 python3 stitcher/reproject.py \
   --frames-dir DIR --out pano.jpg \
-  [--poses poses.json] [--width 8192] [--preview-out pano_preview.jpg]
+  [--poses poses.json] [--width 8192] [--preview-out pano_preview.jpg] \
+  [--band-rows N]
 ```
+
+**Exit codes** — the worker classifies retryability from the code, never by
+matching message text:
+
+| Code | Meaning | Worker policy |
+|---|---|---|
+| `0` | success | — |
+| `1` | internal/transient (failed write, unexpected exception) | retry with backoff |
+| `2` | **input error** — undecodable or genuinely-HEIF frames, no usable frames, bad args | **park dead immediately** |
+| `137` | `128 + SIGKILL` — OOM-killed (or timed out) | retry once, then park (`STITCH_RESOURCE_MAX_ATTEMPTS = 2`) |
 
 **Worker integration.** For `frame_count > 1` the handler downloads every
 `frame_i.heic` to a temp dir (as `frame_i.jpg`), writes `poses.json` when the
 capture carries poses, spawns `PYTHON_BIN` with a `STITCHER_TIMEOUT_MS` ceiling,
 and on success uploads `pano.jpg` (+ optional `pano_preview.jpg`). The temp dir
 is always cleaned. Config: `STITCHER_TIMEOUT_MS` (300000), `STITCHER_WIDTH`
-(8192), `PYTHON_BIN` (`python3`). *Known gap (shared with the passthrough path):
-frames are staged with a `.jpg` name from the stored bytes; a true HEIC→JPEG
-transcode is a follow-up — the winning pipeline assumes JPEG-decodable frames.*
+(8192), `PYTHON_BIN` (`python3`).
+
+**About the `.heic` frame keys.** Frames are presigned, stored and downloaded as
+`frame_<i>.heic` with an `image/heic` content-type, but **the bytes the iOS app
+uploads are JPEG**. The key and content-type are a client contract we
+deliberately do *not* rename (renaming them would break shipped clients), so the
+extension carries no information and staging the bytes as `frame_<i>.jpg` is
+correct, not a workaround. Earlier revisions of this README described this as a
+"missing HEIC→JPEG transcode"; that was wrong — there is nothing to transcode on
+the current client.
+
+What *was* missing is a clear failure when a frame really is HEIF. The stitcher
+now sniffs the container by **magic bytes** (`ftyp` brand) whenever a decode
+fails and exits with the input-error code and a message naming the format, so a
+genuinely-HEIC capture parks the job immediately instead of burning five
+retries. `pillow-heif` was deliberately **not** added: it drags libheif/HEVC into
+the image to decode a format no shipped client produces. If a client ever does
+send HEIF, adding the decoder is a contained follow-up — the detection and the
+error path are already there.
 
 **Docker.** The single `Dockerfile` (both services, selected by `SERVICE_ENTRY`)
 installs Python 3 + `stitcher/requirements.txt` (numpy, opencv-python-headless)
@@ -432,4 +469,6 @@ at a venv with `stitcher/requirements.txt` installed; see
   contract), incl. `media_asset.media_asset_id`, the `WLT-Api-Key` header, and
   the `is_pano: true` generate body. It is exercised only when `PROVIDER_MODE=live`.
 - Multi-frame stitching is live (Phase 0.5, see [Stitcher](#stitcher-spec-5--phase-05));
-  real APNs delivery and a HEIC→JPEG frame transcode remain future phases.
+  real APNs delivery remains a future phase. The `.heic` frame keys hold JPEG
+  bytes by client contract — see [Stitcher](#stitcher-spec-5--phase-05); there is
+  no transcode to add.
