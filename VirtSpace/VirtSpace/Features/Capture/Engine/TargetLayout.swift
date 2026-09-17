@@ -47,7 +47,9 @@ struct CaptureTarget: Identifiable, Hashable {
     var id: Int { index }
 }
 
-enum TargetLayout {
+/// Pure layout math with no isolation of its own: the engine queue, the
+/// thumbnail queue and the main actor all read it.
+nonisolated enum TargetLayout {
     // MARK: - Shape of the pattern (single source of truth)
 
     /// Target counts per group, in capture order: horizon ring, upper ring,

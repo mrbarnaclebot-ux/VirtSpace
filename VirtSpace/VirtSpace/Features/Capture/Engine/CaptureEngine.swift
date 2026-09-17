@@ -11,18 +11,20 @@
 //  is derived from the first tracked frame's camera yaw so target 0 is
 //  "straight ahead of wherever the user started looking".
 //
+//  This is the coordinator, not the whole capture: the shot I/O lives in
+//  ShotPipeline, thermal mitigation in ThermalGovernor, the HUD publish
+//  coalescing in HUDPublishThrottle, and every property the UI renders in
+//  CaptureHUDState.
+//
 //  Threading: pose callbacks and all internal mutation happen on a private
-//  serial queue; the @Observable properties SwiftUI reads are only ever
-//  mutated on the main queue via `publish`.
+//  serial queue; the observable HUD state SwiftUI reads is only ever mutated
+//  on the main queue via `publish`.
 //
 
 import ARKit
 import Foundation
-import ImageIO
-import Observation
 import OSLog
 import simd
-import UIKit
 
 // MARK: - State
 
@@ -43,150 +45,56 @@ struct CaptureResult: Equatable {
     let frameCount: Int
 }
 
-// MARK: - PaintedShot
-
-/// A per-shot "paint the sphere" event (Stage B3 deliverable 1): the captured
-/// camera pose plus a small thumbnail of what was shot, so the capture layer
-/// can hang a textured quad on the virtual sphere in that direction. Emitted
-/// once per successful shot; the thumbnail is generated off the main actor.
-struct PaintedShot: Identifiable {
-    let index: Int
-    /// The CAPTURED camera-to-world transform (ARKit portrait convention).
-    let transform: simd_float4x4
-    /// Intrinsics of the captured frame — used to size the quad to the FOV.
-    let intrinsics: simd_float3x3
-    /// Downscaled (~512 px) copy of the captured JPEG.
-    let thumbnail: UIImage
-
-    var id: Int { index }
-
-    /// Image width the intrinsics refer to, approximated from the principal
-    /// point (cx ≈ width/2). Avoids threading the sensor resolution through.
-    var approxImageWidth: Float { 2 * intrinsics.columns.2.x }
-    var approxImageHeight: Float { 2 * intrinsics.columns.2.y }
-}
-
-extension PaintedShot: Equatable {
-    // Index is unique per capture; identity is enough (UIImage isn't Equatable).
-    static func == (lhs: PaintedShot, rhs: PaintedShot) -> Bool { lhs.index == rhs.index }
-}
-
 // MARK: - Engine
 
-@Observable
 final class CaptureEngine {
-    // MARK: Published state (mutated on the main queue only)
+    /// Everything the capture UI renders. Main-actor-isolated and written ONLY
+    /// through `publish`; the views observe it directly.
+    let hud = CaptureHUDState()
 
-    private(set) var state: CaptureEngineState = .idle
-    private(set) var targets: [CaptureTarget] = TargetLayout.targets()
-    /// Per-target captured flag, indexed like `targets`.
-    private(set) var capturedFlags: [Bool] = Array(repeating: false, count: TargetLayout.targets().count)
-    /// Degrees between the camera forward and the current target.
-    private(set) var angularDistanceDegrees: Double = 180
-    /// Signed aim hints, degrees: yaw > 0 → turn right; pitch > 0 → look up.
-    private(set) var yawDeltaDegrees: Double = 0
-    private(set) var pitchDeltaDegrees: Double = 0
-    private(set) var isSteady = false
-    /// Meters of translation from the first shot's position (parallax coaching).
-    private(set) var driftMeters: Float = 0
-    /// Whether AE/AWB/AF locked successfully after the first shot.
-    private(set) var exposureLocked = false
-    /// Tracking/thermal warning to surface, or nil.
-    private(set) var warning: String?
-
-    // MARK: HUD state (Stage B2)
-
-    /// Latest camera-to-world transform (ARKit portrait camera convention).
-    private(set) var cameraTransform: simd_float4x4 = matrix_identity_float4x4
-    /// Latest camera intrinsics + the sensor resolution they refer to.
-    private(set) var cameraIntrinsics: simd_float3x3 = matrix_identity_float3x3
-    private(set) var imageResolution: CGSize = .zero
-    /// World-space direction per target (empty until the heading basis locks).
-    private(set) var targetDirections: [simd_float3] = []
-    /// Dwell completion [0, 1] for the reticle's ring fill.
-    private(set) var dwellProgress: Double = 0
-    /// The live ARSession for the camera preview (device only, nil in sim).
-    private(set) var previewSession: ARSession?
-
-    // MARK: Paint-the-sphere state (Stage B3)
-
-    /// Accumulated painted shots, one per successful capture. The camera-layer
-    /// (device SceneKit / simulator Canvas) observes this and hangs a textured
-    /// quad on the virtual sphere for each new entry.
-    private(set) var paintedShots: [PaintedShot] = []
-
-    // MARK: Thermal state (Stage B3)
-
-    /// Latest `ProcessInfo.thermalState`, mirrored onto the main actor so the
-    /// HUD can coach ("warming up") and the preview can drop its frame rate.
-    private(set) var thermalState: ProcessInfo.ThermalState = .nominal
-    /// True when we've paused the session because the device hit `.critical`.
-    /// Cleared by `resumeFromThermal()`.
-    private(set) var isThermallyPaused = false
-
-    var capturedCount: Int { capturedFlags.lazy.filter { $0 }.count }
-
-    var currentTarget: CaptureTarget? {
-        switch state {
-        case .ready(let i), .capturing(let i):
-            return targets.indices.contains(i) ? targets[i] : nil
-        default:
-            return nil
-        }
-    }
-
-    var isAligned: Bool { AlignmentMath.isAligned(angularDistanceDegrees: angularDistanceDegrees) }
-
-    /// Parallax coaching text (spec §9), or nil while the user stays put.
-    var driftWarning: String? {
-        if driftMeters > AlignmentMath.driftHardWarnMeters {
-            return "You've moved \(String(format: "%.1f", driftMeters)) m — go back to your spot"
-        }
-        if driftMeters > AlignmentMath.driftWarnMeters {
-            return "Stay on your spot — pivot, don't walk"
-        }
-        return nil
-    }
+    /// The capture pattern. Immutable, so both the engine queue and the main
+    /// actor read the same array without coordination.
+    private var targets: [CaptureTarget] { hud.targets }
 
     // MARK: Engine-queue state (never touched from the main queue)
 
-    @ObservationIgnored private let queue: DispatchQueue
-    @ObservationIgnored private var source: CaptureSource?
-    @ObservationIgnored private let store: CaptureStore
-    @ObservationIgnored private var session: CaptureStore.Session?
+    private let queue: DispatchQueue
+    private var source: CaptureSource?
+    private let store: CaptureStore
+    private var session: CaptureStore.Session?
 
     /// Target directions rotated into ARKit world space (set once the heading
     /// basis is established from the first tracked frame).
-    @ObservationIgnored private var worldTargets: [simd_float3] = []
-    @ObservationIgnored private var currentIndex = 0
-    @ObservationIgnored private var running = false
+    private var worldTargets: [simd_float3] = []
+    private var currentIndex = 0
+    private var running = false
     /// Fired (on the engine queue) with the backend world id when a session
     /// that already minted a world is permanently discarded (abandon flow).
     /// The owner (CaptureView) uses it for a best-effort server-side delete;
     /// the worker's 24 h uploading reaper is the backstop.
-    @ObservationIgnored var onSessionDiscarded: ((String) -> Void)?
+    var onSessionDiscarded: ((String) -> Void)?
     /// True from dwell-fire until the next target is ready — gates the dwell
     /// machine while a still is in flight.
-    @ObservationIgnored private var isTakingStill = false
-    @ObservationIgnored private var previousTransform: simd_float4x4?
-    @ObservationIgnored private var previousTimestamp: TimeInterval?
-    @ObservationIgnored private var smoothedRate: Double = 0
-    @ObservationIgnored private var dwell = DwellTracker()
-    @ObservationIgnored private var firstShotPosition: simd_float3?
+    private var isTakingStill = false
+    private var previousTransform: simd_float4x4?
+    private var previousTimestamp: TimeInterval?
+    private var smoothedRate: Double = 0
+    private var dwell = DwellTracker()
+    private var firstShotPosition: simd_float3?
     /// Transient (non-pose) warnings stay visible this long (engine queue).
-    @ObservationIgnored private var transientWarning: (text: String, until: TimeInterval)?
+    private var transientWarning: (text: String, until: TimeInterval)?
 
     /// Takes, persists and post-processes one still per fired dwell, and
     /// reports the outcome back here (see ShotPipeline).
-    @ObservationIgnored private let shots: ShotPipeline
+    private let shots: ShotPipeline
 
     /// Thermal mitigation: owns the thermal observer, the cool-down pause and
     /// the pure state→policy mapping (see ThermalGovernor).
-    @ObservationIgnored private let thermal: ThermalGovernor
+    private let thermal: ThermalGovernor
 
     /// Coalesces the HUD publish to ~30 Hz and to meaningful changes only
     /// (Stage B3 deliverable 2b) — see HUDPublishThrottle.
-    @ObservationIgnored private var throttle = HUDPublishThrottle()
+    private var throttle = HUDPublishThrottle()
 
     init(store: CaptureStore = CaptureStore()) {
         let queue = DispatchQueue(label: "com.virtspace.capture-engine")
@@ -231,11 +139,11 @@ final class CaptureEngine {
     /// Begin a capture. Caller is responsible for camera permission on device.
     /// Callable from `.idle` or `.failed` (retry).
     func start() {
-        switch state {
+        switch hud.state {
         case .idle, .failed: break
         default: return
         }
-        state = .starting
+        hud.state = .starting
         queue.async { [weak self] in
             guard let self else { return }
             self.resetOnQueue()
@@ -540,32 +448,19 @@ final class CaptureEngine {
 
     // MARK: - Publishing
 
-    /// Apply a mutation to the observable surface on the main queue.
-    private func publish(_ mutation: @escaping (CaptureEngine) -> Void) {
+    /// Apply a mutation to the observable HUD state on the main queue. This is
+    /// the ONE door between the engine queue and the main actor — nothing else
+    /// in the engine touches `hud`.
+    ///
+    /// `DispatchQueue.main.async` rather than a `Task { @MainActor }` on
+    /// purpose: publishes must stay strictly FIFO with respect to each other
+    /// (a `.capturing` must never land after the `.ready` that follows it), and
+    /// only the queue guarantees that. `assumeIsolated` is therefore a fact,
+    /// not a wish — the block is already running on the main queue.
+    private func publish(_ mutation: @escaping @MainActor (CaptureHUDState) -> Void) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            mutation(self)
+            MainActor.assumeIsolated { mutation(self.hud) }
         }
-    }
-
-    private func applyReset(state: CaptureEngineState) {
-        self.state = state
-        capturedFlags = Array(repeating: false, count: targets.count)
-        angularDistanceDegrees = 180
-        yawDeltaDegrees = 0
-        pitchDeltaDegrees = 0
-        isSteady = false
-        driftMeters = 0
-        exposureLocked = false
-        warning = nil
-        cameraTransform = matrix_identity_float4x4
-        cameraIntrinsics = matrix_identity_float3x3
-        imageResolution = .zero
-        targetDirections = []
-        dwellProgress = 0
-        previewSession = nil
-        paintedShots = []
-        isThermallyPaused = false
-        // thermalState is left as-is: it reflects the hardware, not the session.
     }
 }

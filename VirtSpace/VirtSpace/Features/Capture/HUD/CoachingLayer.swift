@@ -30,7 +30,7 @@ struct CoachingBanner: Equatable, Identifiable {
 }
 
 struct CoachingLayer: View {
-    let engine: CaptureEngine
+    let hud: CaptureHUDState
 
     @State private var banner: CoachingBanner?
     @State private var softDriftCooldownUntil = Date.distantPast
@@ -49,11 +49,11 @@ struct CoachingLayer: View {
 
     private var conditions: Conditions {
         Conditions(
-            trackingWarning: engine.warning,
-            thermalWarming: ThermalGovernor.showsWarmingBanner(for: engine.thermalState),
-            driftTier: engine.driftMeters > AlignmentMath.driftHardWarnMeters ? 2
-                : (engine.driftMeters > AlignmentMath.driftWarnMeters ? 1 : 0),
-            wantsExposureNotice: engine.capturedCount > 0 && !engine.exposureLocked
+            trackingWarning: hud.warning,
+            thermalWarming: ThermalGovernor.showsWarmingBanner(for: hud.thermalState),
+            driftTier: hud.driftMeters > AlignmentMath.driftHardWarnMeters ? 2
+                : (hud.driftMeters > AlignmentMath.driftWarnMeters ? 1 : 0),
+            wantsExposureNotice: hud.capturedCount > 0 && !hud.exposureLocked
         )
     }
 

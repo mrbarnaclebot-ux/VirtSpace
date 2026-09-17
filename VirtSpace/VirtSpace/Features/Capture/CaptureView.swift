@@ -23,6 +23,10 @@ struct CaptureView: View {
     var switchToLibrary: () -> Void = {}
 
     @State private var engine = CaptureEngine()
+    /// Read-only view of the capture. `engine` is for actions (start / cancel /
+    /// reset / thermal resume); everything this view renders comes from here.
+    private var hud: CaptureHUDState { engine.hud }
+
     @State private var toast: Toast?
     @State private var isRunningTestScan = false
     /// Non-nil while an upload is in flight (frames done so far) — drives the
@@ -50,15 +54,15 @@ struct CaptureView: View {
             ZStack {
                 backdrop
                 content
-                if engine.isThermallyPaused {
+                if hud.isThermallyPaused {
                     thermalPauseOverlay
                 }
                 if let uploadedFrames {
-                    UploadOverlayView(uploaded: uploadedFrames, total: engine.targets.count)
+                    UploadOverlayView(uploaded: uploadedFrames, total: hud.targets.count)
                 }
             }
             .animation(.easeOut(duration: 0.25), value: uploadedFrames == nil)
-            .animation(.easeOut(duration: 0.25), value: engine.isThermallyPaused)
+            .animation(.easeOut(duration: 0.25), value: hud.isThermallyPaused)
             .navigationBarHidden(true)
             .toast($toast)
             #if DEBUG
@@ -70,7 +74,7 @@ struct CaptureView: View {
                 }
             }
             #endif
-            .onChange(of: engine.state) { _, newState in
+            .onChange(of: hud.state) { _, newState in
                 if case .finished(let result) = newState {
                     Task { await upload(result) }
                 }
@@ -101,7 +105,7 @@ struct CaptureView: View {
     /// idle timer is restored the moment we return to idle / the overlay clears.
     private var shouldKeepScreenAwake: Bool {
         if uploadedFrames != nil { return true }
-        switch engine.state {
+        switch hud.state {
         case .idle, .failed: return false
         default: return true // starting / ready / capturing / advancing / finished
         }
@@ -113,7 +117,7 @@ struct CaptureView: View {
 
     @ViewBuilder
     private var content: some View {
-        switch engine.state {
+        switch hud.state {
         case .idle:
             startScreen(failure: nil)
         case .failed(let message):
@@ -128,7 +132,7 @@ struct CaptureView: View {
         case .ready, .capturing, .advancing:
             ZStack {
                 cameraLayer
-                CaptureHUDView(engine: engine, onCancel: { engine.cancel() })
+                CaptureHUDView(hud: hud, onCancel: { engine.cancel() })
             }
         case .finished:
             // The upload overlay (top-level ZStack) covers this state.
@@ -144,16 +148,16 @@ struct CaptureView: View {
     private var cameraLayer: some View {
         #if targetEnvironment(simulator)
         SimulatedCameraBackdrop(
-            paintedShots: engine.paintedShots,
-            cameraTransform: engine.cameraTransform,
-            intrinsics: engine.cameraIntrinsics,
-            imageResolution: engine.imageResolution
+            paintedShots: hud.paintedShots,
+            cameraTransform: hud.cameraTransform,
+            intrinsics: hud.cameraIntrinsics,
+            imageResolution: hud.imageResolution
         )
         #else
-        if let session = engine.previewSession {
+        if let session = hud.previewSession {
             CameraPreviewView(
                 session: session,
-                paintedShots: engine.paintedShots,
+                paintedShots: hud.paintedShots,
                 preferredFPS: previewFPS
             )
             .ignoresSafeArea()
@@ -166,7 +170,7 @@ struct CaptureView: View {
     /// Viewfinder frame rate: 30 fps normally, dropped to 24 under thermal
     /// pressure to shed load and heat (Stage B3 deliverable 2d/2e).
     private var previewFPS: Int {
-        ThermalGovernor.previewFrameRate(for: engine.thermalState)
+        ThermalGovernor.previewFrameRate(for: hud.thermalState)
     }
 
     // MARK: - Idle / failed

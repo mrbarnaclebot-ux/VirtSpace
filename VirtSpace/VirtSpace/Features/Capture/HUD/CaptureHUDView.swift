@@ -6,15 +6,15 @@
 //  from the engine's live camera transform, a snapping reticle with a dwell
 //  ring, edge chevrons for off-screen targets, the filling-sphere progress
 //  hero, coaching banners and session chrome. Renders on top of the camera
-//  layer; owns no capture logic — everything is driven by CaptureEngine's
-//  published state.
+//  layer; owns no capture logic — everything is driven by the engine's
+//  published CaptureHUDState.
 //
 
 import simd
 import SwiftUI
 
 struct CaptureHUDView: View {
-    let engine: CaptureEngine
+    let hud: CaptureHUDState
     var onCancel: () -> Void = {}
 
     @State private var showAbandonDialog = false
@@ -34,13 +34,13 @@ struct CaptureHUDView: View {
             }
         }
         .overlay(alignment: .top) {
-            CoachingLayer(engine: engine)
+            CoachingLayer(hud: hud)
                 .padding(.top, 64)
         }
         .overlay(alignment: .topLeading) { closeButton.padding(.leading, 20) }
         .overlay(alignment: .topTrailing) { exposurePill.padding(.trailing, 20) }
         .overlay(alignment: .bottom) { bottomBar.padding(.bottom, 14) }
-        .onChange(of: engine.capturedCount) { old, new in
+        .onChange(of: hud.capturedCount) { old, new in
             guard new > old else { return }
             fireShotFlash()
         }
@@ -52,31 +52,31 @@ struct CaptureHUDView: View {
             Button("Abandon scan", role: .destructive) { onCancel() }
             Button("Keep capturing", role: .cancel) {}
         } message: {
-            Text("The \(engine.capturedCount) shots taken so far will be discarded.")
+            Text("The \(hud.capturedCount) shots taken so far will be discarded.")
         }
     }
 
     // MARK: - World-locked target dots
 
     private func targetDotsLayer(viewSize: CGSize) -> some View {
-        let transform = engine.cameraTransform
-        let directions = engine.targetDirections
+        let transform = hud.cameraTransform
+        let directions = hud.targetDirections
         let forward = AlignmentMath.forward(of: transform)
-        let currentIndex = engine.currentTarget?.index
+        let currentIndex = hud.currentTarget?.index
 
         return ZStack {
-            ForEach(engine.targets) { target in
+            ForEach(hud.targets) { target in
                 if directions.indices.contains(target.index) {
                     let projected = TargetProjection.project(
                         worldDirection: directions[target.index],
                         cameraTransform: transform,
-                        intrinsics: engine.cameraIntrinsics,
-                        imageResolution: engine.imageResolution,
+                        intrinsics: hud.cameraIntrinsics,
+                        imageResolution: hud.imageResolution,
                         viewSize: viewSize
                     )
                     if projected.isOnScreen {
-                        let captured = engine.capturedFlags.indices.contains(target.index)
-                            && engine.capturedFlags[target.index]
+                        let captured = hud.capturedFlags.indices.contains(target.index)
+                            && hud.capturedFlags[target.index]
                         let degreesOff = AlignmentMath.angularDistanceDegrees(forward, directions[target.index])
                         targetDot(
                             captured: captured,
@@ -93,8 +93,8 @@ struct CaptureHUDView: View {
                 let projected = TargetProjection.project(
                     worldDirection: directions[currentIndex],
                     cameraTransform: transform,
-                    intrinsics: engine.cameraIntrinsics,
-                    imageResolution: engine.imageResolution,
+                    intrinsics: hud.cameraIntrinsics,
+                    imageResolution: hud.imageResolution,
                     viewSize: viewSize
                 )
                 if !projected.isOnScreen {
@@ -103,7 +103,7 @@ struct CaptureHUDView: View {
                         viewSize: viewSize,
                         padding: 58
                     )
-                    edgeChevron(angle: anchor.angle, degrees: engine.angularDistanceDegrees)
+                    edgeChevron(angle: anchor.angle, degrees: hud.angularDistanceDegrees)
                         .position(anchor.point)
                 }
             }
@@ -170,9 +170,9 @@ struct CaptureHUDView: View {
     // MARK: - Reticle
 
     private var reticle: some View {
-        let aligned = engine.isAligned
+        let aligned = hud.isAligned
         let capturing: Bool = {
-            if case .capturing = engine.state { return true }
+            if case .capturing = hud.state { return true }
             return false
         }()
         let tint: Color = aligned ? .green : .white
@@ -185,7 +185,7 @@ struct CaptureHUDView: View {
 
             // Dwell fill: sweeps closed over the 300 ms hold.
             Circle()
-                .trim(from: 0, to: engine.dwellProgress)
+                .trim(from: 0, to: hud.dwellProgress)
                 .stroke(Color.green, style: StrokeStyle(lineWidth: 4.5, lineCap: .round))
                 .rotationEffect(.degrees(-90))
                 .frame(width: 82, height: 82)
@@ -232,7 +232,7 @@ struct CaptureHUDView: View {
 
     @ViewBuilder
     private var exposurePill: some View {
-        if engine.exposureLocked {
+        if hud.exposureLocked {
             HStack(spacing: 5) {
                 Image(systemName: "lock.fill")
                     .font(.system(size: 10, weight: .semibold))
@@ -244,13 +244,13 @@ struct CaptureHUDView: View {
             .padding(.vertical, 8)
             .background(.ultraThinMaterial, in: Capsule())
             .transition(.opacity.combined(with: .scale(scale: 0.85)))
-            .animation(.spring(response: 0.35), value: engine.exposureLocked)
+            .animation(.spring(response: 0.35), value: hud.exposureLocked)
         }
     }
 
     private var bottomBar: some View {
         VStack(spacing: 12) {
-            if let target = engine.currentTarget {
+            if let target = hud.currentTarget {
                 VStack(spacing: 3) {
                     Text(target.label)
                         .font(.headline.weight(.bold))
@@ -258,19 +258,19 @@ struct CaptureHUDView: View {
                         .contentTransition(.opacity)
                     Text(statusLine)
                         .font(.footnote.weight(.medium))
-                        .foregroundStyle(engine.isAligned ? .green : .white.opacity(0.55))
+                        .foregroundStyle(hud.isAligned ? .green : .white.opacity(0.55))
                         .monospacedDigit()
                 }
                 .animation(.easeOut(duration: 0.2), value: target.index)
-            } else if case .advancing = engine.state {
+            } else if case .advancing = hud.state {
                 Text("Got it")
                     .font(.headline.weight(.bold))
                     .foregroundStyle(.green)
             }
 
             ProgressSphereView(
-                capturedFlags: engine.capturedFlags,
-                currentIndex: engine.currentTarget?.index
+                capturedFlags: hud.capturedFlags,
+                currentIndex: hud.currentTarget?.index
             )
             .padding(.horizontal, 14)
             .padding(.vertical, 9)
@@ -280,11 +280,11 @@ struct CaptureHUDView: View {
     }
 
     private var statusLine: String {
-        if case .capturing = engine.state { return "Capturing…" }
-        if engine.isAligned {
-            return engine.isSteady ? "Hold still…" : "Steady…"
+        if case .capturing = hud.state { return "Capturing…" }
+        if hud.isAligned {
+            return hud.isSteady ? "Hold still…" : "Steady…"
         }
-        return "\(Int(engine.angularDistanceDegrees.rounded()))° away"
+        return "\(Int(hud.angularDistanceDegrees.rounded()))° away"
     }
 
     // MARK: - Vignette
@@ -313,7 +313,7 @@ struct CaptureHUDView: View {
 #Preview {
     ZStack {
         SimulatedCameraBackdrop()
-        CaptureHUDView(engine: CaptureEngine())
+        CaptureHUDView(hud: CaptureHUDState())
     }
     .preferredColorScheme(.dark)
 }
