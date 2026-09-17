@@ -5,6 +5,7 @@ import {
   type OperationStatus,
   type WorldAssets,
   type WorldGenProvider,
+  type WorldMatch,
   type WorldModel,
 } from './types.js';
 
@@ -182,6 +183,52 @@ export function createWorldLabsProvider(opts: WorldLabsOptions): WorldGenProvide
           typeof error === 'string' ? error : JSON.stringify(error);
       }
       return result;
+    },
+
+    async findWorldByDisplayName(displayName): Promise<WorldMatch | null> {
+      // Reconciliation lookup for a `pending:<jobId>` marker (spec §10 R1). FREE
+      // — it lists worlds this key already owns; it never generates.
+      //
+      // ⚠️ UNVERIFIED SHAPE. Unlike every other call in this file, the list
+      // endpoint was NOT exercised by tools/spike/spike.py against the live API,
+      // so both the path and the response envelope are best-effort guesses at
+      // the documented `GET /marble/v1/worlds` listing, parsed tolerantly (any
+      // of `worlds` / `items` / `results`, and id/display-name aliases). If the
+      // endpoint 404s or the shape differs, requestJson throws a ProviderError,
+      // which the worker treats as RETRYABLE reconciliation failure — the job
+      // retries the lookup and is eventually parked; it NEVER re-generates. So
+      // a wrong guess costs a stalled job, never a double bill. Verify against
+      // the live API before relying on automatic recovery.
+      const body = await requestJson<Record<string, unknown>>(
+        'GET',
+        '/marble/v1/worlds?page_size=100',
+      );
+      const list =
+        (body['worlds'] as unknown[] | undefined) ??
+        (body['items'] as unknown[] | undefined) ??
+        (body['results'] as unknown[] | undefined) ??
+        [];
+      for (const entry of list) {
+        const w = entry as Record<string, unknown>;
+        const name =
+          (w['display_name'] as string | undefined) ?? (w['name'] as string | undefined);
+        if (name !== displayName) continue;
+        const worldId =
+          (w['world_id'] as string | undefined) ?? (w['id'] as string | undefined);
+        if (!worldId) continue;
+        const match: WorldMatch = { worldId };
+        const operationId = w['operation_id'] as string | undefined;
+        if (operationId) match.operationId = operationId;
+        const status = (w['status'] as string | undefined) ?? (w['state'] as string | undefined);
+        if (status) {
+          // Anything that isn't an explicit terminal-success state is treated as
+          // "still running" → reconcile again later rather than adopt an
+          // unfinished world.
+          match.done = /^(done|complete|completed|succeeded|ready)$/i.test(status);
+        }
+        return match;
+      }
+      return null;
     },
 
     async getWorld(worldId): Promise<WorldAssets> {

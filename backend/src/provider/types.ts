@@ -38,6 +38,25 @@ export interface WorldAssets {
   caption?: string;
 }
 
+/**
+ * A provider-side world found by reconciliation (spec §10 R1). Returned when a
+ * worker resumes a job whose `provider_operation_id` is still the
+ * `pending:<jobId>` intent marker and must find out whether its
+ * credit-spending `worlds:generate` actually went through.
+ */
+export interface WorldMatch {
+  /** The provider's world id. */
+  worldId: string;
+  /** The operation to resume polling on, when the provider still exposes one. */
+  operationId?: string;
+  /**
+   * Whether generation has finished. `false` means "exists but still running"
+   * (reconcile again later); `undefined` means the listing doesn't say, and the
+   * caller treats the world as adoptable.
+   */
+  done?: boolean;
+}
+
 export interface WorldGenProvider {
   readonly mode: 'mock' | 'live';
   /** prepare_upload + PUT the pano (FREE). Returns the media_asset_id. */
@@ -53,6 +72,15 @@ export interface WorldGenProvider {
   ): Promise<string>;
   /** Poll an operation (FREE). */
   getOperation(operationId: string): Promise<OperationStatus>;
+  /**
+   * Reconciliation lookup (FREE): find a world this account already owns whose
+   * display name matches exactly. Used ONLY to resolve a `pending:<jobId>`
+   * intent marker — i.e. to learn whether a `worlds:generate` that we could not
+   * confirm actually spent credits (spec §10 R1). Returns null when no such
+   * world is listed. A thrown error means "could not determine" and MUST leave
+   * the money path untouched.
+   */
+  findWorldByDisplayName(displayName: string): Promise<WorldMatch | null>;
   /** Fetch a finished world's asset URLs (FREE). */
   getWorld(worldId: string): Promise<WorldAssets>;
   /**

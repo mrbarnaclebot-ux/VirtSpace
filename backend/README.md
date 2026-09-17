@@ -274,16 +274,38 @@ lacks the deps; point it at a venv with `STITCHER_TEST_PYTHON=/path/to/python`.
 
 ### Credit safety (spec §14) — the money-touching path
 
-`worlds:generate` is the only step that spends credits, and it runs **exactly
-once** per job:
+`worlds:generate` is the only step that spends credits, and it runs **at most
+once** per job. `jobs.provider_operation_id` drives three entry states:
 
-1. If the job already has a `provider_operation_id`, the worker **resumes at
-   polling** — no reserve, no upload, no second `generateWorld`, no re-bill.
-2. Otherwise it (a) `reserveCredits(cost)` against the **daily budget**, (b)
-   uploads the pano, (c) calls `generateWorld`, and (d) **persists the
-   operation id immediately** — so a crash between generate and completion
-   resumes via step 1.
-3. `reserveCredits` (`budget.ts`) sums today's `credit_events.amount` inside a
+1. **A real operation id** → the worker **resumes at polling**: no reserve, no
+   upload, no second `generateWorld`, no re-bill.
+2. **A `pending:<jobId>` intent marker** → a previous attempt died *inside* the
+   generate window, so whether credits were spent is unknown. The worker
+   **reconciles**: `provider.findWorldByDisplayName(displayName)` looks the job
+   up by its deterministic, job-unique `display_name`
+   (`VirtSpace world <worldId> [job:<jobId>]`, see `generationDisplayName`).
+   - match with an operation id → adopt it, replace the marker, keep polling;
+   - match that is a finished world → adopt the world and re-host its assets;
+   - match still generating → retryable, reconcile again next attempt;
+   - **no match** → the job is **parked dead**. A listing can lag a
+     just-accepted generation, so "not listed" does not prove nothing was
+     billed, and an unprovable state is never resolved by re-submitting.
+   - a lookup *error* is retryable and likewise never re-generates.
+3. **Null** → a fresh generation: (a) persist the `pending:<jobId>` marker,
+   (b) `reserveCredits(cost)` against the **daily budget**, (c) upload the pano,
+   (d) call `generateWorld`, (e) persist the real operation id. The marker lands
+   **before** the reservation, so no crash in the window can reserve twice or
+   generate twice. A failure or timeout **of the generate call itself** is
+   **non-retryable** (`NonRetryableJobError` → parked dead): the provider may
+   have accepted it. Poll-phase timeouts stay retryable — they resume by id.
+
+> `findWorldByDisplayName`'s live implementation targets a
+> `GET /marble/v1/worlds` listing that the Phase 0 spike never exercised, so the
+> path/response shape is an **unverified** best-effort guess parsed tolerantly.
+> A wrong guess degrades to "reconciliation fails → job parked", never to a
+> double bill. Verify it against the live API before relying on auto-recovery.
+
+4. `reserveCredits` (`budget.ts`) sums today's `credit_events.amount` inside a
    transaction (with a `pg_advisory_xact_lock` so parallel workers can't both
    slip past) and inserts a new event iff `sum + cost <= DAILY_CREDIT_BUDGET`;
    else it throws `BudgetExceededError` and the job is **parked dead (no

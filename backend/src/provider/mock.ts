@@ -6,6 +6,7 @@ import {
   type OperationStatus,
   type WorldAssets,
   type WorldGenProvider,
+  type WorldMatch,
   type WorldModel,
 } from './types.js';
 
@@ -71,10 +72,14 @@ function fixtureFor(url: string): Buffer {
 
 interface MockState {
   operations: Map<string, string>; // operationId -> worldId
+  // display_name -> the world/operation generated under it. Mirrors the live
+  // provider's world listing so the §10 R1 reconciliation path (resume from a
+  // `pending:<jobId>` marker) is exercised offline.
+  byDisplayName: Map<string, WorldMatch>;
 }
 
 export function createMockProvider(): WorldGenProvider {
-  const state: MockState = { operations: new Map() };
+  const state: MockState = { operations: new Map(), byDisplayName: new Map() };
   // Every URL we mint lives here so downloadAsset resolves offline.
   const assetBytes = new Map<string, Buffer>();
 
@@ -103,11 +108,20 @@ export function createMockProvider(): WorldGenProvider {
       return `mock-media-${randomUUID()}`;
     },
 
-    async generateWorld(_mediaAssetId, _model: WorldModel, _displayName): Promise<string> {
+    async generateWorld(_mediaAssetId, _model: WorldModel, displayName): Promise<string> {
       const operationId = `mock-op-${randomUUID()}`;
       const worldId = `mock-world-${randomUUID()}`;
       state.operations.set(operationId, worldId);
+      state.byDisplayName.set(displayName, { worldId, operationId, done: true });
       return operationId;
+    },
+
+    async findWorldByDisplayName(displayName): Promise<WorldMatch | null> {
+      // In-process only: a mock provider in a FRESH process has no memory of an
+      // earlier run's generation, so a cross-restart resume reconciles to null
+      // and the job is parked dead — exactly the conservative behavior the live
+      // path takes when it cannot prove a generation happened.
+      return state.byDisplayName.get(displayName) ?? null;
     },
 
     async getOperation(operationId): Promise<OperationStatus> {

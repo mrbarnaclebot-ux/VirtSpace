@@ -266,11 +266,48 @@ const realClock: GenerationClock = {
   sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
 };
 
+// --- Credit-safety identifiers (pure, spec §10 R1 / §14) ---------------------
+
+const PENDING_MARKER_PREFIX = 'pending:';
+
+/**
+ * The intent marker persisted into jobs.provider_operation_id *before* the
+ * credit-spending `worlds:generate` call. Its presence on resume means "a
+ * generate may or may not have gone out for this job" — the worker must
+ * reconcile against the provider, never re-generate.
+ */
+export function pendingOperationMarker(jobId: string): string {
+  return `${PENDING_MARKER_PREFIX}${jobId}`;
+}
+
+/** True when a persisted provider_operation_id is an intent marker, not an id. */
+export function isPendingOperationMarker(value: string | null | undefined): boolean {
+  return typeof value === 'string' && value.startsWith(PENDING_MARKER_PREFIX);
+}
+
+/**
+ * Provider-side `display_name` for a generation: deterministic per job and
+ * unique across jobs, because it is the ONLY key reconciliation has to decide
+ * whether a job's generate call already spent credits. Derived from the job id
+ * (uniqueness + traceability) and the world id (operator legibility) alone —
+ * deliberately NOT from the user's title, which can change between attempts and
+ * would make the same job unrecoverable (and would ship user text to the
+ * provider for no benefit).
+ */
+export function generationDisplayName(jobId: string, worldId: string): string {
+  return `VirtSpace world ${worldId} [job:${jobId}]`;
+}
+
 export interface GenerationInput {
+  /** Job id — embedded in the intent marker and the provider display name. */
+  jobId: string;
   model: WorldModel;
   displayName: string;
   cost: number;
-  /** Persisted provider_operation_id — non-null means RESUME (never re-bill). */
+  /**
+   * Persisted provider_operation_id. A real id means RESUME at polling; a
+   * `pending:<jobId>` marker means RECONCILE; null means a fresh generation.
+   */
   existingOperationId: string | null;
 }
 
@@ -295,9 +332,25 @@ export interface GenerationResult {
 }
 
 /**
- * Credit-safe generation sequence (spec §14). The ONLY money-touching step is
- * generateWorld, and it runs exactly once per job: if an operation id already
- * exists we skip reserve+upload+generate entirely and resume at polling.
+ * Credit-safe generation sequence (spec §14, hardened per §10 R1).
+ *
+ * `worlds:generate` is the only money-touching step and it runs **at most once
+ * per job**. Three entry states, decided by the persisted operation id:
+ *
+ * 1. **real operation id** → resume at polling. No reserve, no generate.
+ * 2. **`pending:<jobId>` marker** → a previous attempt was inside the generate
+ *    window when it died. RECONCILE against the provider by the job's unique
+ *    display name: adopt the operation/world if one exists, otherwise park the
+ *    job dead. A re-generate here is never allowed — it is exactly the
+ *    double-bill this ledger item exists to close.
+ * 3. **null** → fresh generation: persist the marker, reserve, upload, generate,
+ *    persist the real id. The marker lands FIRST (before the reservation) so no
+ *    crash anywhere in the window can produce a second reserve or a second
+ *    generate.
+ *
+ * A failure of the generate call itself is NON-retryable (`NonRetryableJobError`):
+ * the call may have been received by the provider, so a retry could bill twice.
+ * Poll-phase failures stay retryable — they resume by operation id.
  */
 export async function runGeneration(
   provider: WorldGenProvider,
@@ -315,14 +368,67 @@ export async function runGeneration(
   const timeoutMs = opts.timeoutMs ?? GENERATE_TIMEOUT_MS;
 
   let operationId = input.existingOperationId;
-  if (!operationId) {
-    // (a→b→c→d→e) Reserve BEFORE spending; persist the op id IMMEDIATELY after
-    // generate so a crash resumes via the id instead of re-billing.
+
+  if (isPendingOperationMarker(operationId)) {
+    // (2) Reconcile: did the previous attempt's generate actually go through?
+    // A lookup failure propagates as-is (retryable) — we simply do not know yet,
+    // and guessing costs real money.
+    const match = await provider.findWorldByDisplayName(input.displayName);
+    if (!match) {
+      // Nothing matched. A listing can lag a just-accepted generation, so this
+      // does NOT prove no credits were spent — and an unprovable state must
+      // never be resolved by re-submitting. Park the job for a human.
+      throw new NonRetryableJobError(
+        `generation state unresolved for job ${input.jobId}: a worlds:generate may have ` +
+          `been submitted as "${input.displayName}" but no matching world is listed. ` +
+          'Refusing to re-generate (would risk a double bill) — inspect the provider account.',
+      );
+    }
+    if (match.operationId) {
+      // Adopt the operation and replace the marker so the next resume skips
+      // reconciliation entirely.
+      operationId = match.operationId;
+      await io.saveOperationId(operationId);
+    } else if (match.done === false) {
+      // Exists but still running and no operation to poll → come back later.
+      // Retryable: reconciliation is free and re-runs safely.
+      throw new ProviderError(
+        `world ${match.worldId} for job ${input.jobId} is still generating; ` +
+          'will reconcile again on the next attempt',
+      );
+    } else {
+      // Finished world, no operation id exposed → adopt it directly.
+      return collectAssets(provider, io, match.worldId);
+    }
+  } else if (!operationId) {
+    // (3) Fresh generation. Order is load-bearing: the intent marker is durable
+    // BEFORE anything else, so every later crash point resumes into (2) instead
+    // of reserving credits or calling generate a second time.
+    await io.saveOperationId(pendingOperationMarker(input.jobId));
     await io.reserveCredits(input.cost);
     const panoBytes = await io.getPanoBytes();
     const mediaAssetId = await provider.uploadPano(panoBytes, 'pano.jpg');
-    operationId = await provider.generateWorld(mediaAssetId, input.model, input.displayName);
+    try {
+      operationId = await provider.generateWorld(mediaAssetId, input.model, input.displayName);
+    } catch (err) {
+      // The provider may have accepted the call before the failure/timeout, so a
+      // retry could bill twice. Park dead; the marker stays behind so a manual
+      // re-queue reconciles instead of re-generating.
+      const message = err instanceof Error ? err.message : String(err);
+      throw new NonRetryableJobError(
+        `worlds:generate failed for job ${input.jobId} and must NOT be retried ` +
+          `(it may have been billed): ${message}`,
+      );
+    }
     await io.saveOperationId(operationId);
+  }
+
+  // Invariant: every branch above either set a real operation id, returned, or
+  // threw. Belt-and-braces so the poll below can never be handed a marker/null.
+  if (!operationId || isPendingOperationMarker(operationId)) {
+    throw new NonRetryableJobError(
+      `internal: job ${input.jobId} reached polling without a provider operation id`,
+    );
   }
 
   // (f) Poll until done — in-process loop; the job lease outlives this via
@@ -348,8 +454,19 @@ export async function runGeneration(
   if (status.error) throw new ProviderError(`operation failed: ${status.error}`);
   if (!status.worldId) throw new ProviderError('operation done but returned no world_id');
 
-  // (g) Fetch + re-host every asset onto OUR storage (spec §14 asset ownership).
-  const worldId = status.worldId;
+  return collectAssets(provider, io, status.worldId);
+}
+
+/**
+ * (g) Fetch + re-host every asset of a finished provider world onto OUR storage
+ * (spec §14 asset ownership). Shared by the normal poll path and the §10 R1
+ * reconciliation path, which adopts an already-finished world.
+ */
+async function collectAssets(
+  provider: WorldGenProvider,
+  io: GenerationIO,
+  worldId: string,
+): Promise<GenerationResult> {
   const assets = await provider.getWorld(worldId);
   const assetKeys: GenerationResult['assetKeys'] = {};
   if (assets.spzUrls.k500) {
@@ -588,8 +705,11 @@ async function handleGenerate(
     provider,
     io,
     {
+      jobId: job.id,
       model,
-      displayName: world.title ?? `VirtSpace world ${world.id}`,
+      // Deterministic + unique per job — it is the reconciliation key (§10 R1),
+      // not a user-facing label, so the world's title is deliberately not used.
+      displayName: generationDisplayName(job.id, world.id),
       cost,
       existingOperationId: job.providerOperationId,
     },

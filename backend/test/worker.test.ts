@@ -109,6 +109,7 @@ function fakeProvider(overrides: Partial<WorldGenProvider> = {}): WorldGenProvid
     getOperation: vi.fn(async () => ({ done: true, worldId: 'world-1' })),
     getWorld: vi.fn(async () => ({ spzUrls: { k500: 'u500' }, caption: 'cap' })),
     downloadAsset: vi.fn(async () => Buffer.from('bytes')),
+    findWorldByDisplayName: vi.fn(async () => null),
     ...overrides,
   } as WorldGenProvider;
 }
@@ -138,14 +139,15 @@ describe('runGeneration credit safety', () => {
     const result = await runGeneration(
       provider,
       io,
-      { model: 'marble-1.0-draft', displayName: 'W', cost: 150, existingOperationId: null },
+      { jobId: 'job-1', model: 'marble-1.0-draft', displayName: 'W', cost: 150, existingOperationId: null },
       instantClock,
     );
 
     expect(io.reserveCredits).toHaveBeenCalledWith(150);
     expect(provider.uploadPano).toHaveBeenCalledOnce();
     expect(provider.generateWorld).toHaveBeenCalledOnce();
-    expect(io.saveOperationId).toHaveBeenCalledWith('op-1');
+    // Intent marker first, then the real operation id (spec §10 R1).
+    expect(io.saved).toEqual(['pending:job-1', 'op-1']);
     expect(result.worldId).toBe('world-1');
     expect(result.assetKeys.spz500kUrl).toBe('worlds/world-1/splat_500k.spz');
     expect(result.caption).toBe('cap');
@@ -158,7 +160,7 @@ describe('runGeneration credit safety', () => {
     await runGeneration(
       provider,
       io,
-      { model: 'marble-1.0-draft', displayName: 'W', cost: 150, existingOperationId: 'op-existing' },
+      { jobId: 'job-1', model: 'marble-1.0-draft', displayName: 'W', cost: 150, existingOperationId: 'op-existing' },
       instantClock,
     );
 
@@ -183,7 +185,7 @@ describe('runGeneration credit safety', () => {
     await runGeneration(
       provider,
       io,
-      { model: 'marble-1.1', displayName: 'W', cost: 1500, existingOperationId: null },
+      { jobId: 'job-1', model: 'marble-1.1', displayName: 'W', cost: 1500, existingOperationId: null },
       instantClock,
     );
     expect(getOperation).toHaveBeenCalledTimes(2);
@@ -203,7 +205,7 @@ describe('runGeneration credit safety', () => {
       runGeneration(
         provider,
         io,
-        { model: 'marble-1.0-draft', displayName: 'W', cost: 150, existingOperationId: null },
+        { jobId: 'job-1', model: 'marble-1.0-draft', displayName: 'W', cost: 150, existingOperationId: null },
         clock,
         { timeoutMs: 1 },
       ),
@@ -233,7 +235,7 @@ describe('mock provider billing', () => {
     const result = await runGeneration(
       provider,
       io,
-      { model: 'marble-1.0-draft', displayName: 'W', cost, existingOperationId: null },
+      { jobId: 'job-1', model: 'marble-1.0-draft', displayName: 'W', cost, existingOperationId: null },
       instantClock,
     );
 

@@ -150,6 +150,67 @@ describe('worldlabs provider request shaping', () => {
     });
   });
 
+  // spec §10 R1 — reconciliation lookup for a `pending:<jobId>` marker. The
+  // listing endpoint is NOT spike-verified, so the contract that matters here is
+  // (a) it is a plain GET that never touches worlds:generate, and (b) a bad
+  // response surfaces as a ProviderError (retryable) rather than a re-generate.
+  describe('findWorldByDisplayName', () => {
+    it('GETs the worlds listing with the API key and matches on display_name', async () => {
+      const { fetch, calls } = mockFetch([
+        jsonResponse({
+          worlds: [
+            { world_id: 'w_other', display_name: 'something else' },
+            {
+              world_id: 'w_match',
+              display_name: 'VirtSpace world row-1 [job:job-9]',
+              operation_id: 'op_9',
+              status: 'done',
+            },
+          ],
+        }),
+      ]);
+      const provider = createWorldLabsProvider({ apiKey: KEY, fetchImpl: fetch });
+
+      const match = await provider.findWorldByDisplayName(
+        'VirtSpace world row-1 [job:job-9]',
+      );
+
+      expect(calls[0]!.method).toBe('GET');
+      expect(calls[0]!.url).toContain('/marble/v1/worlds');
+      expect(calls[0]!.url).not.toContain('generate');
+      expect(calls[0]!.headers['WLT-Api-Key']).toBe(KEY);
+      expect(match).toEqual({ worldId: 'w_match', operationId: 'op_9', done: true });
+    });
+
+    it('marks a still-running world as not done so the worker reconciles again', async () => {
+      const { fetch } = mockFetch([
+        jsonResponse({
+          items: [{ id: 'w_running', name: 'nm', status: 'generating' }],
+        }),
+      ]);
+      const provider = createWorldLabsProvider({ apiKey: KEY, fetchImpl: fetch });
+      expect(await provider.findWorldByDisplayName('nm')).toEqual({
+        worldId: 'w_running',
+        done: false,
+      });
+    });
+
+    it('returns null when nothing matches', async () => {
+      const { fetch } = mockFetch([jsonResponse({ worlds: [] })]);
+      const provider = createWorldLabsProvider({ apiKey: KEY, fetchImpl: fetch });
+      expect(await provider.findWorldByDisplayName('nope')).toBeNull();
+    });
+
+    it('surfaces a listing failure as a ProviderError (retryable, never re-generates)', async () => {
+      const { fetch } = mockFetch([new Response('nope', { status: 404 })]);
+      const provider = createWorldLabsProvider({ apiKey: KEY, fetchImpl: fetch });
+      await expect(provider.findWorldByDisplayName('nm')).rejects.toMatchObject({
+        name: 'ProviderError',
+        status: 404,
+      });
+    });
+  });
+
   it('credits: draft=150, hq=1500', () => {
     const provider = createWorldLabsProvider({ apiKey: KEY, fetchImpl: mockFetch([]).fetch });
     expect(provider.creditsForModel('marble-1.0-draft')).toBe(150);
