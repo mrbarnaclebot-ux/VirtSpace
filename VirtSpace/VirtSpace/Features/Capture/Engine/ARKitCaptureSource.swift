@@ -24,7 +24,11 @@ import Foundation
 import ImageIO
 import simd
 
-final class ARKitCaptureSource: NSObject, CaptureSource, ARSessionDelegate {
+/// Confined to the engine queue, which is also the ARSession's `delegateQueue`
+/// — so `didUpdate frame:` and the engine's own mutation are already serialized
+/// against each other. The still encode hops to `encodeQueue` and touches only
+/// immutable state (`ciContext`, the constants) from there.
+nonisolated final class ARKitCaptureSource: NSObject, CaptureSource, ARSessionDelegate, @unchecked Sendable {
     var onPose: ((CapturePose) -> Void)?
     var onError: ((String) -> Void)?
 
@@ -112,7 +116,7 @@ final class ARKitCaptureSource: NSObject, CaptureSource, ARSessionDelegate {
         session.run(configuration)
     }
 
-    func captureStill(_ completion: @escaping (Result<CapturedStill, Error>) -> Void) {
+    func captureStill(_ completion: @escaping @Sendable (Result<CapturedStill, Error>) -> Void) {
         guard isRunning else {
             completion(.failure(CaptureSourceError.notRunning))
             return

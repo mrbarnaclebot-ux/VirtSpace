@@ -16,7 +16,7 @@
 
 import Foundation
 
-struct HUDPublishThrottle {
+nonisolated struct HUDPublishThrottle {
     // MARK: Policy constants
 
     /// Publish cadence ceiling: at most one publish per this interval.

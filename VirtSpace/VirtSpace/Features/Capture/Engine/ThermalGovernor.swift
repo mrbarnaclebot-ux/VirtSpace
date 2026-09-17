@@ -23,7 +23,11 @@
 import Foundation
 import OSLog
 
-final class ThermalGovernor {
+/// Confined to the engine queue: every mutable member (`isPaused`, `observer`
+/// and the hooks) is read and written only there — the notification callback
+/// hops onto it before touching anything, and the engine wires the hooks in
+/// `init` before the object is shared.
+nonisolated final class ThermalGovernor: @unchecked Sendable {
     // MARK: - Decision mapping (pure)
 
     /// Viewfinder frame rate for a thermal state: 24 fps at serious/critical to

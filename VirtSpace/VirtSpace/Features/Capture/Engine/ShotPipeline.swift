@@ -24,7 +24,7 @@ import UIKit
 import simd
 
 /// What one shot did. Delivered on the engine queue.
-enum ShotOutcome {
+nonisolated enum ShotOutcome: Sendable {
     /// Captured and written to disk. `transform` is the CAPTURED camera pose —
     /// the engine pins the pivot origin from the first shot's.
     case saved(index: Int, transform: simd_float4x4)
@@ -36,7 +36,10 @@ enum ShotOutcome {
     case saveFailed(index: Int, message: String)
 }
 
-final class ShotPipeline {
+/// Confined to the engine queue, except `onPaintedShot`, which is called on
+/// `thumbnailQueue` (and is only ever written during the engine's `init`,
+/// before this object is shared with any other thread).
+nonisolated final class ShotPipeline: @unchecked Sendable {
     /// Long edge of the paint-the-sphere thumbnail, in pixels.
     static let thumbnailMaxDimension: CGFloat = 512
 
@@ -84,7 +87,7 @@ final class ShotPipeline {
         from source: CaptureSource,
         into session: CaptureStore.Session,
         totalTargets: Int,
-        completion: @escaping (ShotOutcome) -> Void
+        completion: @escaping @Sendable (ShotOutcome) -> Void
     ) {
         source.captureStill { [weak self] result in
             guard let self else { return }

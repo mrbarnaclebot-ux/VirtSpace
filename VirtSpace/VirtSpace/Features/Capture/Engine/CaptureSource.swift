@@ -19,7 +19,7 @@ import QuartzCore
 #endif
 
 /// One tracked camera pose, delivered per frame on the engine's queue.
-struct CapturePose {
+nonisolated struct CapturePose: Sendable {
     var timestamp: TimeInterval
     var transform: simd_float4x4
     var intrinsics: simd_float3x3
@@ -32,14 +32,14 @@ struct CapturePose {
 
 /// One captured still: encoded JPEG plus the pose metadata the server
 /// stitcher needs (spec §5: pose-assisted reprojection).
-struct CapturedStill {
+nonisolated struct CapturedStill: Sendable {
     var jpegData: Data
     var timestamp: TimeInterval
     var transform: simd_float4x4
     var intrinsics: simd_float3x3
 }
 
-enum CaptureSourceError: LocalizedError {
+nonisolated enum CaptureSourceError: LocalizedError {
     case notRunning
     case noFrame
     case encodingFailed
@@ -55,7 +55,8 @@ enum CaptureSourceError: LocalizedError {
     }
 }
 
-protocol CaptureSource: AnyObject {
+/// Implementations are confined to the engine queue they are created with.
+nonisolated protocol CaptureSource: AnyObject, Sendable {
     /// Per-frame pose stream. Called on the queue the source was created with.
     var onPose: ((CapturePose) -> Void)? { get set }
     /// Fatal session errors (camera unavailable, ARKit failure).
@@ -71,7 +72,7 @@ protocol CaptureSource: AnyObject {
     func resume()
 
     /// Take one still. Completion may arrive on any queue.
-    func captureStill(_ completion: @escaping (Result<CapturedStill, Error>) -> Void)
+    func captureStill(_ completion: @escaping @Sendable (Result<CapturedStill, Error>) -> Void)
 
     /// Lock AE/AWB/AF at their current values (called after the first shot —
     /// spec §9: exposure/WB seams). Returns whether the lock actually took.
@@ -91,7 +92,10 @@ protocol CaptureSource: AnyObject {
 /// Transforms follow the ARKit *portrait* camera convention (camera +X =
 /// screen-down, +Y = screen-right, -Z = forward, right-handed) so the HUD's
 /// projection math is identical on device and simulator.
-final class SimulatedCaptureSource: CaptureSource {
+///
+/// Confined to the engine queue: the timer fires on it, and `captureStill` and
+/// the attitude state are only touched from there.
+nonisolated final class SimulatedCaptureSource: CaptureSource, @unchecked Sendable {
     var onPose: ((CapturePose) -> Void)?
     var onError: ((String) -> Void)?
     /// Engine-provided: world direction the fake camera should drift toward.
@@ -178,7 +182,7 @@ final class SimulatedCaptureSource: CaptureSource {
         return max(-maxStep, min(maxStep, delta))
     }
 
-    func captureStill(_ completion: @escaping (Result<CapturedStill, Error>) -> Void) {
+    func captureStill(_ completion: @escaping @Sendable (Result<CapturedStill, Error>) -> Void) {
         shotCount += 1
         let hue = CGFloat((shotCount * 61) % 360) / 360
         let color = UIColor(hue: hue, saturation: 0.55, brightness: 0.8, alpha: 1)

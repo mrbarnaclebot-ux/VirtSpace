@@ -12,7 +12,13 @@
 import Foundation
 import simd
 
-final class CaptureStore {
+/// Confined to whichever single queue its owner uses — the engine queue for a
+/// live capture, the upload flow's task for a resume. `manifests` is the only
+/// mutable state and is never shared between the two: an engine's store and an
+/// uploader's store are separate instances. The blocking disk I/O is the whole
+/// point (see `saveFrame`), so this is deliberately NOT an actor and
+/// deliberately NOT main-actor isolated.
+nonisolated final class CaptureStore: @unchecked Sendable {
     // MARK: - Types
 
     /// Per-frame pose metadata for the server stitcher (spec §5:
@@ -320,7 +326,13 @@ final class CaptureStore {
 
     /// Read-modify-write poses.json atomically. Reads the on-disk manifest first
     /// (resume sessions from a previous launch aren't in the in-memory cache),
-    /// falling back to the cache. Runs off the main actor from the upload flow.
+    /// falling back to the cache.
+    ///
+    /// NOTE: this used to claim it "runs off the main actor from the upload
+    /// flow". It does not — UploadManager's flows are @MainActor (see
+    /// `UploadManager.enqueue`), so every manifest read/write during an upload
+    /// is synchronous disk I/O on the main thread. Left as-is here because
+    /// moving it is a behaviour change, not a migration; see spec §10.
     private func mutateManifest(id: UUID, in directory: URL, _ body: (inout Manifest) -> Void) {
         guard var manifest = (try? readManifest(in: directory)) ?? manifests[id] else { return }
         body(&manifest)
@@ -387,7 +399,9 @@ final class CaptureStore {
         // never see a purged session and re-send frames:done for it. The slow
         // recursive removal stays off-thread below.
         try? fileManager.removeItem(at: manifestURL(in: url))
-        let fm = fileManager
+        // FileManager is documented thread-safe for file operations when no
+        // delegate is set (none is here); the SDK simply doesn't mark it Sendable.
+        nonisolated(unsafe) let fm = fileManager
         ioQueue.async { try? fm.removeItem(at: url) }
     }
 

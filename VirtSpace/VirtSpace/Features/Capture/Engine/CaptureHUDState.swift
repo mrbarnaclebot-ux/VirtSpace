@@ -55,6 +55,10 @@ extension PaintedShot: Equatable {
 @MainActor
 @Observable
 final class CaptureHUDState {
+    /// Constructing the state touches no main-actor state — only the defaults
+    /// below — so the engine can own one from its own (nonisolated) init.
+    nonisolated init() {}
+
     // MARK: - Session
 
     var state: CaptureEngineState = .idle

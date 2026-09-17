@@ -20,7 +20,9 @@
 import Foundation
 import OSLog
 
-enum AppLog {
+/// Logged from every queue in the app — the engine queue, the thumbnail queue,
+/// URLSession delegate queues and the main actor. `Logger` is thread-safe.
+nonisolated enum AppLog {
     /// One subsystem for the whole app; categories fan out by area.
     static let subsystem = "com.uzmanshafifassy.VirtSpace"
 

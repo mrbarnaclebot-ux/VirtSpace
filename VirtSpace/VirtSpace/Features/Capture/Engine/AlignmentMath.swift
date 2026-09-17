@@ -12,7 +12,8 @@
 import Foundation
 import simd
 
-enum AlignmentMath {
+/// Pure math, no isolation: the engine queue and the main actor both use it.
+nonisolated enum AlignmentMath {
     /// Camera counts as "on target" within this cone half-angle.
     static let alignmentThresholdDegrees: Double = 6
     /// Camera counts as "steady" below this rotation rate (rad/s) — shots
@@ -118,7 +119,7 @@ enum AlignmentMath {
 
 /// Fires once when aligned + steady have held continuously for
 /// `AlignmentMath.dwellSeconds`. Any lapse resets the clock.
-struct DwellTracker {
+nonisolated struct DwellTracker {
     private var satisfiedSince: TimeInterval?
 
     /// Feed one frame; returns true exactly once per completed dwell.

@@ -47,7 +47,10 @@ struct CaptureResult: Equatable {
 
 // MARK: - Engine
 
-final class CaptureEngine {
+/// Confined to `queue` (the engine queue): every mutable member below the
+/// `hud` reference is read and written only there. `hud` is a @MainActor class
+/// (itself Sendable) and is only ever touched through `publish`.
+nonisolated final class CaptureEngine: @unchecked Sendable {
     /// Everything the capture UI renders. Main-actor-isolated and written ONLY
     /// through `publish`; the views observe it directly.
     let hud = CaptureHUDState()
@@ -138,6 +141,11 @@ final class CaptureEngine {
 
     /// Begin a capture. Caller is responsible for camera permission on device.
     /// Callable from `.idle` or `.failed` (retry).
+    ///
+    /// Main actor because it reads and writes `hud.state` synchronously: the
+    /// `.starting` transition has to be visible to the caller's next render,
+    /// so it cannot wait for a hop.
+    @MainActor
     func start() {
         switch hud.state {
         case .idle, .failed: break
@@ -337,6 +345,11 @@ final class CaptureEngine {
         )
 
         if throttle.shouldPublish(sample) {
+            // Bind the two locals that are `var` above to immutable copies:
+            // the publish closure runs later, on the main queue, and must
+            // capture this frame's values rather than the variables.
+            let publishedWarning = warningText
+            let publishedProgress = progress
             let transform = pose.transform
             let intrinsics = pose.intrinsics
             let resolution = pose.imageResolution
@@ -346,11 +359,11 @@ final class CaptureEngine {
                 $0.pitchDeltaDegrees = deltas.pitch
                 $0.isSteady = steady
                 $0.driftMeters = drift
-                $0.warning = warningText
+                $0.warning = publishedWarning
                 $0.cameraTransform = transform
                 $0.cameraIntrinsics = intrinsics
                 $0.imageResolution = resolution
-                $0.dwellProgress = progress
+                $0.dwellProgress = publishedProgress
             }
         }
 
