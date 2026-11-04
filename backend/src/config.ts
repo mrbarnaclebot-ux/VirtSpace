@@ -133,6 +133,13 @@ function refine(cfg: z.infer<typeof baseSchema>): Config {
         'or set ALLOW_DEV_AUTH=1 to run shared-token dev auth deliberately',
     );
   }
+  // Same fail-closed rule for storage (spec §10 R33). STORAGE_DRIVER defaults
+  // to 'local', whose /dev-storage route serves objects unauthenticated; a
+  // dropped env var must not turn that on in production. No opt-in: there is
+  // no legitimate production use of the local driver.
+  if (cfg.STORAGE_DRIVER === 'local' && cfg.NODE_ENV === 'production') {
+    throw new Error('STORAGE_DRIVER=local refused under NODE_ENV=production: set STORAGE_DRIVER=s3');
+  }
   return {
     ...cfg,
     PUBLIC_BASE_URL: cfg.PUBLIC_BASE_URL ?? `http://localhost:${cfg.PORT}`,

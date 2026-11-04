@@ -6,6 +6,15 @@ const base = {
   DEV_AUTH_TOKEN: 'dev-token',
 };
 
+// Production refuses the local storage driver (R33), so booting prod configs need s3.
+const s3 = {
+  STORAGE_DRIVER: 's3',
+  S3_ENDPOINT: 'https://r2.example.com',
+  S3_BUCKET: 'worlds',
+  S3_ACCESS_KEY_ID: 'ak',
+  S3_SECRET_ACCESS_KEY: 'sk',
+};
+
 describe('loadConfig', () => {
   it('applies defaults', () => {
     const cfg = loadConfig(base as NodeJS.ProcessEnv);
@@ -63,6 +72,7 @@ describe('loadConfig', () => {
     it('boots when ALLOW_DEV_AUTH=1 makes it a deliberate choice', () => {
       const cfg = loadConfig({
         ...base,
+        ...s3,
         NODE_ENV: 'production',
         ALLOW_DEV_AUTH: '1',
       } as NodeJS.ProcessEnv);
@@ -89,11 +99,33 @@ describe('loadConfig', () => {
     it('apple mode boots in production untouched', () => {
       const cfg = loadConfig({
         ...base,
+        ...s3,
         NODE_ENV: 'production',
         AUTH_MODE: 'apple',
         APPLE_BUNDLE_ID: 'com.example.app',
       } as NodeJS.ProcessEnv);
       expect(cfg.AUTH_MODE).toBe('apple');
+    });
+  });
+
+  // spec §10 R33 — the local driver serves /dev-storage unauthenticated.
+  describe('local storage in production', () => {
+    const prod = { ...base, NODE_ENV: 'production', ALLOW_DEV_AUTH: '1' };
+
+    it('refuses the defaulted local driver', () => {
+      expect(() => loadConfig(prod as NodeJS.ProcessEnv)).toThrow(
+        /STORAGE_DRIVER=local refused/,
+      );
+    });
+
+    it('refuses an explicit local driver too', () => {
+      expect(() =>
+        loadConfig({ ...prod, STORAGE_DRIVER: 'local' } as NodeJS.ProcessEnv),
+      ).toThrow(/STORAGE_DRIVER=local refused/);
+    });
+
+    it('boots with s3', () => {
+      expect(loadConfig({ ...prod, ...s3 } as NodeJS.ProcessEnv).STORAGE_DRIVER).toBe('s3');
     });
   });
 
