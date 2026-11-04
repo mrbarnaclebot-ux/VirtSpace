@@ -31,6 +31,8 @@ nonisolated struct CapturePose: Sendable {
     /// This frame's shutter time, seconds: longer exposures blur at a lower
     /// rotation rate, so the steadiness gate scales with it.
     var exposureDuration: Double
+    /// ARKit is relocalizing after an interruption (R31/R39).
+    var isRelocalizing = false
 }
 
 /// One captured still: encoded JPEG plus the pose metadata the server

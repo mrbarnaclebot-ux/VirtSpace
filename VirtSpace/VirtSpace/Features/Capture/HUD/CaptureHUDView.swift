@@ -17,6 +17,7 @@ struct CaptureHUDView: View {
     let hud: CaptureHUDState
     var onCancel: () -> Void = {}
     var onContinueInLowLight: () -> Void = {}
+    var onRestart: () -> Void = {}
 
     @State private var showAbandonDialog = false
     @State private var flashOpacity: Double = 0
@@ -42,9 +43,14 @@ struct CaptureHUDView: View {
         .overlay(alignment: .topTrailing) { exposurePill.padding(.trailing, 20) }
         .overlay(alignment: .bottom) { bottomBar.padding(.bottom, 14) }
         .overlay {
-            if hud.isTooDark { lowLightCard.transition(.opacity) }
+            if hud.isOfferingRestart {
+                restartCard.transition(.opacity)
+            } else if hud.isTooDark {
+                lowLightCard.transition(.opacity)
+            }
         }
         .animation(.easeOut(duration: 0.25), value: hud.isTooDark)
+        .animation(.easeOut(duration: 0.25), value: hud.isOfferingRestart)
         .onChange(of: hud.capturedCount) { old, new in
             guard new > old else { return }
             fireShotFlash()
@@ -319,6 +325,32 @@ struct CaptureHUDView: View {
                 .padding(.vertical, 10)
                 .background(Color.white.opacity(0.15), in: Capsule())
                 .foregroundStyle(.white)
+        }
+        .multilineTextAlignment(.center)
+        .padding(22)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .padding(.horizontal, 40)
+    }
+
+    /// ARKit lost the room after an interruption and hasn't found it again.
+    /// Withdrawn automatically if tracking recovers.
+    private var restartCard: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "location.slash")
+                .font(.system(size: 30, weight: .light))
+                .foregroundStyle(.orange)
+            Text("Lost track of the room")
+                .font(.headline.weight(.bold))
+                .foregroundStyle(.white)
+            Text("Point at what you were scanning, or start over. Restarting discards the shots so far.")
+                .font(.footnote)
+                .foregroundStyle(.white.opacity(0.7))
+            Button("Restart scan", action: onRestart)
+                .font(.subheadline.weight(.semibold))
+                .padding(.horizontal, 20)
+                .padding(.vertical, 10)
+                .background(Color.orange, in: Capsule())
+                .foregroundStyle(.black)
         }
         .multilineTextAlignment(.center)
         .padding(22)

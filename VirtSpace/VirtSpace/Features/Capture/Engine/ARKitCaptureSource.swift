@@ -50,6 +50,20 @@ nonisolated final class ARKitCaptureSource: NSObject, CaptureSource, ARSessionDe
     /// Retained so a thermal `resume()` can re-run the SAME configuration
     /// without `.resetTracking` — preserving the world frame + heading basis.
     private var configuration: ARWorldTrackingConfiguration?
+    /// Set when the capture device may have been reconfigured under us
+    /// (interruption end, thermal resume): the next frame re-applies the
+    /// stored AE/AWB lock, so the rest of the capture matches shot 0.
+    private var needsLockReapply = false
+
+    /// iOS 26.0's first `captureHighResolutionFrame` can return a wrong camera
+    /// transform (Apple forum thread 801508, fixed in 26.1), and the
+    /// deployment target is 26.0. On 26.0.x only, that first still takes its
+    /// transform from the live frame instead.
+    private static let firstHighResTransformIsUnreliable: Bool = {
+        let version = ProcessInfo.processInfo.operatingSystemVersion
+        return version.majorVersion == 26 && version.minorVersion == 0
+    }()
+    private var hasRequestedHighRes = false
 
     /// Off-main queue for the heavy still encode (Lanczos downscale + JPEG).
     /// `captureHighResolutionFrame`'s completion is delivered on the main
@@ -111,6 +125,7 @@ nonisolated final class ARKitCaptureSource: NSObject, CaptureSource, ARSessionDe
     func resume() {
         guard let configuration else { start(); return }
         isRunning = true
+        needsLockReapply = true
         // No options → ARKit relocalizes into the existing world; the engine's
         // established heading basis and captured poses stay valid.
         session.run(configuration)
@@ -122,6 +137,8 @@ nonisolated final class ARKitCaptureSource: NSObject, CaptureSource, ARSessionDe
             return
         }
         if supportsHighResCapture {
+            let replaceTransform = Self.firstHighResTransformIsUnreliable && !hasRequestedHighRes
+            hasRequestedHighRes = true
             // Benign device-log noise: at high-res still capture the camera
             // stack emits `FigCaptureSourceRemote ... err=-17281` and CoreMedia
             // `-12710` bursts. Captures succeed regardless — these are Apple's
@@ -135,7 +152,15 @@ nonisolated final class ARKitCaptureSource: NSObject, CaptureSource, ARSessionDe
                 // the Lanczos+JPEG work is expensive (deliverable 2c).
                 self.encodeQueue.async {
                     if let frame {
-                        completion(self.encode(frame, live: live))
+                        var result = self.encode(frame, live: live)
+                        if replaceTransform, let live {
+                            result = result.map { still in
+                                var still = still
+                                still.transform = live.camera.transform
+                                return still
+                            }
+                        }
+                        completion(result)
                     } else {
                         // High-res capture can transiently fail (e.g. one
                         // already in flight) — degrade to the live feed rather
@@ -233,13 +258,18 @@ nonisolated final class ARKitCaptureSource: NSObject, CaptureSource, ARSessionDe
     // MARK: - ARSessionDelegate (called on `delegateQueue`)
 
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
+        if needsLockReapply {
+            needsLockReapply = false
+            camera.reapply()
+        }
         onPose?(CapturePose(
             timestamp: frame.timestamp,
             transform: frame.camera.transform,
             intrinsics: frame.camera.intrinsics,
             imageResolution: frame.camera.imageResolution,
             trackingWarning: Self.warning(for: frame.camera.trackingState),
-            exposureDuration: frame.camera.exposureDuration
+            exposureDuration: frame.camera.exposureDuration,
+            isRelocalizing: frame.camera.trackingState == .limited(.relocalizing)
         ))
     }
 
@@ -250,6 +280,17 @@ nonisolated final class ARKitCaptureSource: NSObject, CaptureSource, ARSessionDe
 
     func sessionWasInterrupted(_ session: ARSession) {
         // No-op: interruptions surface via trackingState once frames resume.
+    }
+
+    func sessionInterruptionEnded(_ session: ARSession) {
+        needsLockReapply = true
+    }
+
+    /// Relocalize into the existing world after an interruption instead of
+    /// resetting it: the heading basis and every captured pose stay valid
+    /// (R31). The engine offers a restart if this doesn't succeed.
+    func sessionShouldAttemptRelocalization(_ session: ARSession) -> Bool {
+        true
     }
 
     private static func warning(for state: ARCamera.TrackingState) -> String? {

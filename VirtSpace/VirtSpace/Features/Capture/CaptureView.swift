@@ -78,7 +78,8 @@ struct CaptureView: View {
                     CaptureHUDView(
                         hud: hud,
                         onCancel: { model.engine.cancel() },
-                        onContinueInLowLight: { model.engine.continueInLowLight() }
+                        onContinueInLowLight: { model.engine.continueInLowLight() },
+                        onRestart: { model.engine.restart() }
                     )
                 }
             }

@@ -96,6 +96,11 @@ nonisolated final class CaptureEngine: @unchecked Sendable {
     /// the drift coaching and the soft gate measure from (R37).
     private var shotPositions: [simd_float3] = []
     private var pivotGate = PivotGate()
+    /// When the current relocalization began; past the timeout the HUD offers
+    /// "Restart scan" (R31/R39).
+    private var relocalizingSince: TimeInterval?
+    private var isOfferingRestart = false
+    private static let relocalizationTimeout: TimeInterval = 10
     /// Transient (non-pose) warnings stay visible this long (engine queue).
     private var transientWarning: (text: String, until: TimeInterval)?
 
@@ -195,18 +200,37 @@ nonisolated final class CaptureEngine: @unchecked Sendable {
     func cancel() {
         queue.async { [weak self] in
             guard let self else { return }
-            self.running = false
-            self.source?.stop()
-            self.source = nil
-            if let session = self.session {
-                if let worldId = self.store.createdWorldId(forSession: session.id, in: session.directory) {
-                    self.onSessionDiscarded(worldId)
-                }
-                self.store.purge(id: session.id)
-            }
-            self.resetOnQueue()
+            self.discardOnQueue()
             self.publish { $0.applyReset(state: .idle) }
         }
+    }
+
+    /// Discard the scan and start a fresh one — offered when ARKit can't
+    /// relocalize after an interruption. Goes through `.idle` exactly like
+    /// cancel-then-Start, so the camera layer's lifecycle is the one the
+    /// cancel path already has (R16).
+    func restart() {
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.discardOnQueue()
+            self.publish { hud in
+                hud.applyReset(state: .idle)
+                self.start()
+            }
+        }
+    }
+
+    private func discardOnQueue() {
+        running = false
+        source?.stop()
+        source = nil
+        if let session {
+            if let worldId = store.createdWorldId(forSession: session.id, in: session.directory) {
+                onSessionDiscarded(worldId)
+            }
+            store.purge(id: session.id)
+        }
+        resetOnQueue()
     }
 
     /// Return to idle after `.finished` or `.failed` (e.g. once the upload is
@@ -272,6 +296,8 @@ nonisolated final class CaptureEngine: @unchecked Sendable {
         dwell.reset()
         shotPositions = []
         pivotGate.reset()
+        relocalizingSince = nil
+        isOfferingRestart = false
         exposurePhase = .metering
         meter.reset()
         isShowingLowLight = false
@@ -340,6 +366,8 @@ nonisolated final class CaptureEngine: @unchecked Sendable {
         }
         previousTransform = pose.transform
         previousTimestamp = pose.timestamp
+
+        trackRelocalization(pose)
 
         if exposurePhase == .metering {
             if meter.isTooDark, !lowLightAcknowledged {
@@ -433,6 +461,26 @@ nonisolated final class CaptureEngine: @unchecked Sendable {
 
         if progress >= 1 {
             takeStill()
+        }
+    }
+
+    /// Offer "Restart scan" once relocalization has run past the timeout;
+    /// withdraw it the moment tracking recovers.
+    private func trackRelocalization(_ pose: CapturePose) {
+        guard pose.isRelocalizing else {
+            relocalizingSince = nil
+            if isOfferingRestart {
+                isOfferingRestart = false
+                publish { $0.isOfferingRestart = false }
+            }
+            return
+        }
+        let since = relocalizingSince ?? pose.timestamp
+        relocalizingSince = since
+        if !isOfferingRestart, pose.timestamp - since >= Self.relocalizationTimeout {
+            isOfferingRestart = true
+            AppLog.engine.error("Relocalization still failing after \(Self.relocalizationTimeout, privacy: .public) s, offering restart")
+            publish { $0.isOfferingRestart = true }
         }
     }
 

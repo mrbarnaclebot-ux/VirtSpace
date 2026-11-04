@@ -90,6 +90,8 @@ final class CaptureHUDState {
     /// Low-light preflight: AE is pinned near its ceiling before shot 0. The
     /// HUD offers "continue anyway"; the engine holds the dwell until then.
     var isTooDark = false
+    /// ARKit couldn't relocalize after an interruption: offer a restart.
+    var isOfferingRestart = false
 
     // MARK: - HUD geometry (Stage B2)
 
@@ -151,6 +153,7 @@ final class CaptureHUDState {
         pivotOffset = .zero
         exposureLocked = false
         isTooDark = false
+        isOfferingRestart = false
         warning = nil
         cameraTransform = matrix_identity_float4x4
         cameraIntrinsics = matrix_identity_float3x3
