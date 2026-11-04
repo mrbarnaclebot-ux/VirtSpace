@@ -2,9 +2,9 @@ import { and, desc, eq, inArray, isNull } from 'drizzle-orm';
 import { z } from 'zod';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { getDb } from '../db/client.js';
-import { captures, worlds, type World } from '../db/schema.js';
+import { captures, worlds, type JobKind, type World } from '../db/schema.js';
 import { enqueue } from '../queue.js';
-import { chargeScanQuota, releaseScanQuota } from '../quota.js';
+import { chargeScanQuota, releaseScanQuota, type QuotaChargeResult } from '../quota.js';
 import { MAX_DEPTH_BYTES, MAX_FRAME_BYTES, type StorageDriver } from '../storage/index.js';
 import { depthKeyName } from '../depth.js';
 import type { RouteDeps } from './deps.js';
@@ -36,6 +36,52 @@ const ENHANCE_PATH = '/v1/worlds/:id(^[^:]+)::enhance';
 /** Legacy slash form. Kept as an alias on the same handler so anything already
  * pointed at it (the pre-fix backend README, curl snippets) keeps working. */
 const ENHANCE_LEGACY_PATH = '/v1/worlds/:id/enhance';
+
+/** `POST /v1/worlds/{id}:retry` — same regex-terminated param as ENHANCE_PATH. */
+const RETRY_PATH = '/v1/worlds/:id(^[^:]+)::retry';
+
+/**
+ * What `:retry` re-runs for each failed status: the in-progress status it flips
+ * back to, the job that drives it, and what must already exist for that job to
+ * have a chance (the same thing the original action needed).
+ */
+const RETRY_PLANS: Record<
+  string,
+  { to: string; kind: JobKind; ready: (w: World) => boolean }
+> = {
+  // Same transition frames:done already allows from failed_stitch.
+  failed_stitch: { to: 'stitching', kind: 'stitch', ready: () => true },
+  // handleGenerate refuses a world without a pano.
+  failed_generating_draft: {
+    to: 'generating_draft',
+    kind: 'generate_draft',
+    ready: (w) => w.panoUrl !== null,
+  },
+  // Enhance requires draft_ready, i.e. a finished draft world (and its pano).
+  failed_generating_hq: {
+    to: 'generating_hq',
+    kind: 'generate_hq',
+    ready: (w) => w.panoUrl !== null && w.draftWorldId !== null,
+  },
+};
+
+/** Statuses a retry would produce: a retry that finds one is a replay. */
+const RETRY_TARGETS = new Set(Object.values(RETRY_PLANS).map((p) => p.to));
+
+/** Rolls back a retry transaction whose scan-quota charge was refused. */
+class ScanQuotaRefused extends Error {
+  constructor(readonly charge: QuotaChargeResult) {
+    super('scan quota refused');
+  }
+}
+
+/** The 429 for a refused scan-quota charge (create and draft retry). */
+function sendScanQuotaExceeded(reply: FastifyReply, charge: QuotaChargeResult) {
+  return reply.code(429).send({
+    error: 'daily_scan_quota_exceeded',
+    retry_at: charge.resetAt,
+  });
+}
 
 // Asset columns that hold a storage key → the JSON field name we sign into.
 const ASSET_FIELDS = [
@@ -267,12 +313,7 @@ export function worldsRoutes(app: FastifyInstance, deps: RouteDeps): void {
     // (spec §10 R9).
     const charge = await chargeScanQuota(db, userId, config.DAILY_SCAN_QUOTA);
     if (!charge.userFound) return reply.code(401).send({ error: 'unknown_user' });
-    if (!charge.allowed) {
-      return reply.code(429).send({
-        error: 'daily_scan_quota_exceeded',
-        retry_at: charge.resetAt,
-      });
-    }
+    if (!charge.allowed) return sendScanQuotaExceeded(reply, charge);
 
     // Create the world shell in the uploading state.
     let world: World;
@@ -585,6 +626,96 @@ export function worldsRoutes(app: FastifyInstance, deps: RouteDeps): void {
   };
   app.post<{ Params: { id: string } }>(ENHANCE_PATH, enhanceOpts, enhanceHandler);
   app.post<{ Params: { id: string } }>(ENHANCE_LEGACY_PATH, enhanceOpts, enhanceHandler);
+
+  // POST /v1/worlds/{id}:retry — re-run the phase a world failed in.
+  //
+  //   failed_stitch           → stitching        + stitch
+  //   failed_generating_draft → generating_draft + generate_draft (needs a pano)
+  //   failed_generating_hq    → generating_hq    + generate_hq    (needs a draft)
+  //
+  // Same admission shape as enhance / frames:done: ONE transaction whose
+  // conditional UPDATE … WHERE status = <failed status> is the gate, with the
+  // enqueue inside it, so a double tap flips and enqueues once. A world already
+  // in the in-progress status a retry produces (the double tap, or a replay
+  // after a lost response) answers 200 with the current world and job_id null,
+  // like a frames:done replay; any other status is 409 not_retryable.
+  //
+  // CREDIT SAFETY (spec §14, §10 R1): a generation retry is a NEW job, so it
+  // gets a new display_name (`VirtSpace <jobId>`) and never reconciles against
+  // the failed job's provider operation. The failed job may or may not have been
+  // billed — a generate call that failed after submission is non-retryable by
+  // design and may well have been charged by World Labs — so a retry can pay for
+  // the phase a second time. That is the explicit user action this route exists
+  // for; it is bounded the same way the original action was: a draft retry
+  // charges one scan against the daily scan quota (like the create that paid for
+  // the first draft), and every generation reserves credits against
+  // DAILY_CREDIT_BUDGET in the worker exactly as the original job did. A stitch
+  // retry charges nothing, like frames:done from failed_stitch.
+  //
+  // Own rate-limit key, same bucket size as create / enhance (cost bucket).
+  app.post<{ Params: { id: string } }>(
+    RETRY_PATH,
+    {
+      config: {
+        rateLimit: {
+          max: config.RATE_LIMIT_CREATE_MAX,
+          timeWindow: config.RATE_LIMIT_WINDOW_MS,
+          keyGenerator: (req: FastifyRequest) => `retry:${req.userId ?? req.ip}`,
+        },
+      },
+    },
+    async (req, reply) => {
+      const userId = requireUserId(req, reply);
+      if (!userId) return;
+      const db = getDb();
+      const world = await findOwnedWorld(db, req.params.id, userId);
+      if (!world) return reply.code(404).send({ error: 'world_not_found' });
+
+      if (RETRY_TARGETS.has(world.status)) {
+        return reply.send({ world: serializeWorld(world), job_id: null });
+      }
+      const plan = RETRY_PLANS[world.status];
+      if (!plan || !plan.ready(world)) {
+        return reply.code(409).send({ error: 'not_retryable', status: world.status });
+      }
+
+      let flipped: { world: World; jobId: string } | null;
+      try {
+        flipped = await db.transaction(async (tx) => {
+          const [row] = await tx
+            .update(worlds)
+            .set({ status: plan.to, progress: null, updatedAt: new Date() })
+            .where(
+              and(
+                eq(worlds.id, world.id),
+                eq(worlds.status, world.status),
+                isNull(worlds.deletedAt),
+              ),
+            )
+            .returning();
+          if (!row) return null;
+          if (plan.kind === 'generate_draft') {
+            // Inside the tx: a refusal rolls the flip back, and a double tap
+            // that lost the flip above is never charged.
+            const charge = await chargeScanQuota(tx, userId, config.DAILY_SCAN_QUOTA);
+            if (!charge.allowed) throw new ScanQuotaRefused(charge);
+          }
+          return { world: row, jobId: await enqueue(tx, plan.kind, world.id) };
+        });
+      } catch (err) {
+        if (!(err instanceof ScanQuotaRefused)) throw err;
+        if (!err.charge.userFound) return reply.code(401).send({ error: 'unknown_user' });
+        return sendScanQuotaExceeded(reply, err.charge);
+      }
+
+      if (!flipped) {
+        // Lost the race to a concurrent retry (or a delete): nothing enqueued.
+        const current = await findOwnedWorld(db, world.id, userId);
+        return reply.send({ world: serializeWorld(current ?? world), job_id: null });
+      }
+      return reply.send({ world: serializeWorld(flipped.world), job_id: flipped.jobId });
+    },
+  );
 
   // DELETE /v1/worlds/:id — soft delete + enqueue purge.
   app.delete<{ Params: { id: string } }>('/v1/worlds/:id', async (req, reply) => {

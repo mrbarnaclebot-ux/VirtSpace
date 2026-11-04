@@ -100,7 +100,7 @@ export interface QuotaChargeResult {
  * missing, charged, or refused (with the window's reset for `retry_at`).
  */
 export async function chargeScanQuota(
-  db: Db,
+  db: Pick<Db, 'execute'>, // a transaction handle works too (worlds:retry)
   userId: string,
   max: number,
 ): Promise<QuotaChargeResult> {
