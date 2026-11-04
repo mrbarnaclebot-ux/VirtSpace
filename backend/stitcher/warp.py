@@ -126,11 +126,12 @@ def shrink(img, cam, pano_width, oversample):
     return img, cam._replace(fx=cam.fx * sx, fy=cam.fy * sy, w=size[0], h=size[1])
 
 
-def render_layers(frames, center, invd, w, oversample=1.0):
+def render_layers(frames, center, invd, w, oversample=1.0, min_dy=-1.0):
     """Whole-canvas reprojection of every (img, cam) at a SMALL pano width w:
     [(uint8 BGR, bool mask, float32 centre weight)]. The analysis view that
     gains and seams are computed on; frames are shrunk to w's density first so
-    the analysis image is not aliased either."""
+    the analysis image is not aliased either. Rays with dy <= min_dy (the
+    nadir cap, see reproject.NADIR_CAP_DEG) count as uncovered."""
     h = w // 2
     rows, cols = np.arange(h), np.arange(w)
     dx, dy, dz = pano_rays(rows, cols, w, h)
@@ -139,5 +140,6 @@ def render_layers(frames, center, invd, w, oversample=1.0):
     for img, cam in frames:
         img, cam = shrink(img, cam, w, oversample)
         px, py, inb = project(cam, center, dx, dy, dz, invd)
+        inb &= dy > min_dy
         out.append((sample(img, px, py), inb, center_weight(cam, px, py).astype(np.float32)))
     return out

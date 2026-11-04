@@ -225,3 +225,33 @@ print(json.dumps({'full': np.exp(full).tolist(), 'part': part}))
     expect(r.part).toBeNull();
   });
 });
+
+describe.skipIf(!available)('stitcher v2: nadir mask', () => {
+  it('drops the nadir cap from every frame and refills it from the rim', () => {
+    const r = run(`
+# A floor that is red toward lon<0 and blue toward lon>0 around the cap.
+h, w = 256, 512
+pano = np.zeros((h, w, 3), np.uint8)
+pano[:, : w // 2] = (0, 0, 200)
+pano[:, w // 2:] = (200, 0, 0)
+cap_row = int((1 - 20 / 180) * h)
+mask = np.zeros((h, w), np.uint8)
+mask[cap_row:] = 255
+pano[cap_row:] = 0          # what build() leaves in the cap
+out = R.fill_nadir(pano.copy(), mask, 20.0)
+cap = out[cap_row:].astype(int)
+print(json.dumps({
+  'mask_cleared': int(mask[cap_row:].max()),
+  'black_px': int((cap.max(axis=2) < 20).sum()),
+  'left_red': bool(cap[:, 10, 2].mean() > cap[:, 10, 0].mean()),
+  'right_blue': bool(cap[:, w - 10, 0].mean() > cap[:, w - 10, 2].mean()),
+  'above_untouched': bool(np.array_equal(out[:cap_row], pano[:cap_row])),
+}))
+`);
+    expect(r.mask_cleared).toBe(0); // fill_holes must not redo it
+    expect(r.black_px).toBe(0);
+    expect(r.left_red).toBe(true);
+    expect(r.right_blue).toBe(true);
+    expect(r.above_untouched).toBe(true);
+  });
+});

@@ -199,7 +199,9 @@ print(json.dumps({k: centroid(v) for k, v in m.items()} | {'width': int(pano.sha
 write_frame(fd, 0, solid((0, 0, 255)))    # RED  straight up
 write_frame(fd, 1, solid((255, 0, 0)))    # BLUE straight down
 poses = [pose(0, 0.0, 90.0), pose(1, 0.0, -90.0)]
-pano, cov, _ = R.build(512, fd, poses, 1, -1, 52.0, band_height=37)
+# nadir_cap_deg=0: the default cap (the user's body) is masked out for
+# inpainting by design; this test is about where the nadir frame LANDS.
+pano, cov, _ = R.build(512, fd, poses, 1, -1, 52.0, band_height=37, nadir_cap_deg=0)
 m = masks(pano)
 print(json.dumps({k: centroid(v) for k, v in m.items()} | {'height': int(pano.shape[0])}))
 `);

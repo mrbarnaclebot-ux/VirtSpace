@@ -103,6 +103,12 @@ DEFAULT_PITCH_SIGN = -1
 # at which it starts to alias.
 PREFILTER_OVERSAMPLE = 1.3
 
+# Radius (deg) of the cap around the nadir dropped from EVERY frame and left to
+# fill_holes: the down ring and nadir shots see the user's feet and legs there
+# (R39). Phone at ~1.3 m, feet within ~0.3 m of the pivot -> ~13 deg; 20 leaves
+# margin for a forward lean. Floor texture under the user is lost either way.
+NADIR_CAP_DEG = 20.0
+
 # Pano width the gain and seam analysis runs at: overlap statistics and seam
 # placement need structure, not pixels, and the cost grows with width^2.
 ANALYSIS_WIDTH = 1024
@@ -380,14 +386,14 @@ def frame_gains(frames, pose_by_index, center, invd, wa, lay=None):
 
 
 def build(width, frames_dir, poses, yaw_dir, pitch_sign, hfov_deg,
-          band_height=None, depth_dir=None, proxy_m=None):
+          band_height=None, depth_dir=None, proxy_m=None, nadir_cap_deg=NADIR_CAP_DEG):
     """Reproject, compensate, seam and blend all frames into an equirect pano.
     Returns (pano uint8, coverage %, hole mask uint8 255 = hole).
 
     Stages (spec §5.2 item 5): prefilter (load_frames) -> translation-aware
     reprojection about the camera centroid (warp/depth) -> gains and graph-cut
     seams on a small analysis pano (gains/seams) -> banded multi-band blend at
-    full width (blend).
+    full width (blend), with the nadir cap masked out for fill_holes.
 
     MEMORY (spec §10 R8). Full-res work happens in row BANDS of ~band_height
     rows (plus a pyramid margin), and each frame is only warped over the
@@ -421,8 +427,10 @@ def build(width, frames_dir, poses, yaw_dir, pitch_sign, hfov_deg,
     invd = scene_depth(frames, pose_by_index, depth_dir, center, proxy_m)
     log(f"center {np.round(center, 3).tolist()} proxy {proxy_m} m")
 
+    # dy is sin(latitude): rays below -(90 - cap) deg belong to the user's body.
+    min_dy = -math.cos(math.radians(nadir_cap_deg)) if nadir_cap_deg > 0 else -1.0
     wa = min(w, ANALYSIS_WIDTH)
-    lay = render_layers([f[:2] for f in frames.values()], center, invd, wa)
+    lay = render_layers([f[:2] for f in frames.values()], center, invd, wa, min_dy=min_dy)
     gains = frame_gains(frames, pose_by_index, center, invd, wa, lay)
     seams = find_seams([x[0] for x in lay], gains, [x[1] for x in lay], [x[2] for x in lay])
     seams = [s.astype(np.float32) for s in seams]  # bilinear-upsampled per band
@@ -457,6 +465,7 @@ def build(width, frames_dir, poses, yaw_dir, pitch_sign, hfov_deg,
             cols = np.arange(c0, c1)
             dx, dy, dz = pano_rays(rows, cols, w, h)
             px, py, inb = project(cam, center, dx, dy, dz, sample_field(invd, rows, cols, w, h))
+            inb &= dy > min_dy
             del dx, dy, dz
             wt = sample_field(seams[k], rows, cols, w, h) * inb
             if not wt.any():
@@ -497,6 +506,70 @@ def build(width, frames_dir, poses, yaw_dir, pitch_sign, hfov_deg,
     np.subtract(1, mask, out=mask)
     mask *= 255
     return pano, covpct, mask
+
+
+RELAX_ITERS = 150  # ~0.3 s at 512x512; the rim step is gone by ~100
+
+
+def push_pull_fill(img, hole, source):
+    """Fill `hole` pixels of img with a smooth membrane from the `source`
+    pixels: average them down a pyramid, then pull coarse values back up only
+    where finer levels have no data."""
+    wt = (source & ~hole).astype(np.float32)
+    acc = [img.astype(np.float32) * wt[:, :, None]]
+    wts = [wt]
+    while min(wts[-1].shape) > 4:
+        acc.append(cv2.pyrDown(acc[-1]))
+        wts.append(cv2.pyrDown(wts[-1]))
+    fill = acc[-1] / np.maximum(wts[-1], 1e-6)[:, :, None]
+    for a, w in zip(acc[-2::-1], wts[-2::-1]):
+        up = cv2.pyrUp(fill, dstsize=(w.shape[1], w.shape[0]))
+        # acc is premultiplied by w (in [0, 1]): top up the missing share.
+        fill = a + (1.0 - np.minimum(w, 1.0))[:, :, None] * up
+    # Push-pull alone leaves a step at the rim (the coarse average is not the
+    # rim value); a few Jacobi sweeps pin the membrane to its boundary.
+    out = img.astype(np.float32)
+    out[hole] = fill[hole]
+    for _ in range(RELAX_ITERS):
+        out[hole] = cv2.blur(out, (3, 3))[hole]  # neighbours outside are fixed
+    return np.clip(out, 0, 255).astype(img.dtype)
+
+
+def fill_nadir(pano, mask, cap_deg, size=512, ring_deg=10.0):
+    """Inpaint the nadir cap in a top-down polar view, then map it back.
+
+    Equirect Telea fills each column straight down to the pole, which reads as
+    a radial starburst on the floor. In an azimuthal view centred on the nadir
+    the cap is a plain disc surrounded by real floor, and a push-pull fill
+    interpolates it smoothly from the whole rim (Telea still streaks inward).
+    Clears the cap from `mask` so fill_holes leaves it alone.
+    """
+    if cap_deg <= 0:
+        return pano
+    h, w = pano.shape[:2]
+    rad = cap_deg + ring_deg  # polar view radius (deg from nadir)
+    yy, xx = np.mgrid[0:size, 0:size].astype(np.float32)
+    u, v = (xx - size / 2) / (size / 2), (yy - size / 2) / (size / 2)
+    r = np.sqrt(u * u + v * v) * rad
+    lon = np.arctan2(u, -v)
+    mx = ((lon / math.pi + 1) / 2 * w - 0.5).astype(np.float32)
+    my = ((0.5 - (r - 90.0) / 180.0) * h - 0.5).astype(np.float32)
+    polar = cv2.remap(pano, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_WRAP)
+    hole = (r < cap_deg + 0.5) | (cv2.remap(mask, mx, my, cv2.INTER_NEAREST) > 0)
+    hole &= r < rad
+    # Source = a thin rim only: a wide ring drags in whatever bright object
+    # sits nearby (the desk) and lifts the whole disc.
+    polar = push_pull_fill(polar, hole, r < cap_deg + 2.0)
+
+    r0 = int(math.floor((1.0 - cap_deg / 180.0) * h))  # first cap row
+    lat = 90.0 - (np.arange(r0, h) + 0.5) / h * 180.0
+    lon = ((np.arange(w) + 0.5) / w * 2 - 1) * math.pi
+    rr = ((90.0 + lat) / rad * (size / 2))[:, None]
+    px = (size / 2 + np.sin(lon)[None, :] * rr - 0.5).astype(np.float32)
+    py = (size / 2 - np.cos(lon)[None, :] * rr - 0.5).astype(np.float32)
+    pano[r0:] = cv2.remap(polar, px, py, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    mask[r0:] = 0
+    return pano
 
 
 def fill_holes(pano, mask):
@@ -617,6 +690,10 @@ def main(argv=None):
         "--proxy-depth", type=float, default=DEFAULT_PROXY_DEPTH_M,
         help="fallback surface distance in metres (inf = rotation-only)",
     )
+    ap.add_argument(
+        "--nadir-cap-deg", type=float, default=NADIR_CAP_DEG,
+        help="radius of the nadir cap masked out (user's body) and inpainted; 0 = keep",
+    )
     # Nominal-fallback tuning (defaults are the Phase 0.5 winning parameters).
     ap.add_argument("--hfov", type=float, default=DEFAULT_HFOV)
     ap.add_argument("--yaw-dir", type=int, default=DEFAULT_YAW_DIR)
@@ -629,6 +706,8 @@ def main(argv=None):
         # A caller asking for more than the product's pano width is a
         # misconfiguration; honouring it would OOM the worker (spec §10 R8).
         die_input(f"--width {args.width} exceeds the maximum {MAX_WIDTH}")
+    if not 0 <= args.nadir_cap_deg < 90:
+        die_input("--nadir-cap-deg must be in [0, 90)")
     if not args.proxy_depth > 0:
         die_input("--proxy-depth must be > 0 (inf for rotation-only)")
     if not os.path.isdir(args.frames_dir):
@@ -658,9 +737,11 @@ def main(argv=None):
         args.width, args.frames_dir, poses,
         args.yaw_dir, args.pitch_sign, args.hfov,
         band_height=bh, depth_dir=args.depth_dir, proxy_m=args.proxy_depth,
+        nadir_cap_deg=args.nadir_cap_deg,
     )
     log(f"coverage {cov:.1f}% before inpaint")
     progress(75)  # blend done; inpainting residual holes next.
+    pano = fill_nadir(pano, mask, args.nadir_cap_deg)
     pano = fill_holes(pano, mask)
     progress(85)  # inpaint done; encoding + writing outputs next.
 
