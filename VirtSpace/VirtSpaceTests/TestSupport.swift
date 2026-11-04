@@ -86,6 +86,18 @@ enum Fixtures {
         }
     }
 
+    static func depthSlots(count: Int) -> [FrameUpload] {
+        (0..<count).map {
+            FrameUpload(
+                index: $0,
+                key: "captures/c/depth_\($0).png",
+                url: "https://example.invalid/depth/\($0)",
+                method: "PUT",
+                headers: ["Content-Type": "image/png"]
+            )
+        }
+    }
+
     /// An APIError.network wrapping a genuine "device is offline" URLError.
     static var offline: APIError {
         .network(URLError(.notConnectedToInternet))
@@ -106,6 +118,13 @@ final class FakeUploadAPI: CaptureUploadAPI, @unchecked Sendable {
     private(set) var refreshedWorldIds: [String] = []
     private(set) var framesDoneWorldIds: [String] = []
     private(set) var deletedWorldIds: [String] = []
+    /// The `depthFrames` declaration each create / refresh call sent.
+    private(set) var createDepthFrames: [[DepthFrameDeclaration]?] = []
+    private(set) var refreshDepthFrames: [[DepthFrameDeclaration]?] = []
+    /// Poses sent with the last frames:done.
+    private(set) var lastPoses: [FramePose]?
+    /// Depth slots handed back whenever a call asked for depth.
+    var depthSlotCount = 0
 
     /// Per-call behaviour. Defaults are "everything works".
     var onCreateWorld: ((UUID?) throws -> (World, [FrameUpload]))?
@@ -117,23 +136,35 @@ final class FakeUploadAPI: CaptureUploadAPI, @unchecked Sendable {
     func createWorld(
         title: String,
         frameCount: Int,
+        depthFrames: [DepthFrameDeclaration]?,
         idempotencyKey: UUID?,
         lat: Double?,
         lng: Double?
-    ) async throws -> (World, [FrameUpload]) {
+    ) async throws -> (World, [FrameUpload], [FrameUpload]) {
         createKeys.append(idempotencyKey)
-        if let onCreateWorld { return try onCreateWorld(idempotencyKey) }
-        return (Fixtures.world(), Fixtures.slots(count: frameCount))
+        createDepthFrames.append(depthFrames)
+        let depth = depthFrames == nil ? [] : Fixtures.depthSlots(count: depthSlotCount)
+        if let onCreateWorld {
+            let (world, slots) = try onCreateWorld(idempotencyKey)
+            return (world, slots, depth)
+        }
+        return (Fixtures.world(), Fixtures.slots(count: frameCount), depth)
     }
 
-    func refreshUploads(worldId: String) async throws -> (World, [FrameUpload]) {
+    func refreshUploads(worldId: String, depthFrames: [DepthFrameDeclaration]?) async throws -> (World, [FrameUpload], [FrameUpload]) {
         refreshedWorldIds.append(worldId)
-        if let onRefreshUploads { return try onRefreshUploads(worldId) }
-        return (Fixtures.world(id: worldId), Fixtures.slots(count: 2))
+        refreshDepthFrames.append(depthFrames)
+        let depth = depthFrames == nil ? [] : Fixtures.depthSlots(count: depthSlotCount)
+        if let onRefreshUploads {
+            let (world, slots) = try onRefreshUploads(worldId)
+            return (world, slots, depth)
+        }
+        return (Fixtures.world(id: worldId), Fixtures.slots(count: 2), depth)
     }
 
     func framesDone(worldId: String, poses: [FramePose]?) async throws {
         framesDoneWorldIds.append(worldId)
+        lastPoses = poses
         try onFramesDone?(worldId)
     }
 
@@ -144,10 +175,20 @@ final class FakeUploadAPI: CaptureUploadAPI, @unchecked Sendable {
 
 /// Frame uploads that never leave the process.
 final class FakeFrameUploader: FrameUploading, @unchecked Sendable {
+    /// Frame (JPEG) slot indices uploaded, in order.
     private(set) var uploadedIndices: [Int] = []
+    /// Depth slot indices uploaded, in order.
+    private(set) var uploadedDepthIndices: [Int] = []
     var error: Error?
+    /// Depth slot indices whose PUT fails.
+    var failingDepthIndices: Set<Int> = []
 
     func upload(fileURL: URL, to slot: FrameUpload) async throws {
+        if slot.key.contains("depth_") {
+            if failingDepthIndices.contains(slot.index) { throw APIError.server(500, "depth put failed") }
+            uploadedDepthIndices.append(slot.index)
+            return
+        }
         if let error { throw error }
         uploadedIndices.append(slot.index)
     }

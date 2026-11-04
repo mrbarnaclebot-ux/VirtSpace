@@ -109,21 +109,32 @@ final class APIClient {
     /// backend answers 409 when the world previously created for that key has
     /// since been deleted — see `APIError.isIdempotencyConflict`; the caller
     /// then persists a fresh key and retries.
+    ///
+    /// `depthFrames` non-nil opts into LiDAR depth (spec §5.2): the response
+    /// then carries `depth_uploads` (returned third). An idempotent replay
+    /// only returns them if it sends the same depth fields, so callers must
+    /// build the identical body on every retry.
     func createWorld(
         title: String,
         frameCount: Int,
+        depthFrames: [DepthFrameDeclaration]? = nil,
         idempotencyKey: UUID? = nil,
         lat: Double? = nil,
         lng: Double? = nil
-    ) async throws -> (World, [FrameUpload]) {
-        let body = try encoder.encode(CreateWorldRequest(title: title, frameCount: frameCount, lat: lat, lng: lng))
+    ) async throws -> (World, [FrameUpload], [FrameUpload]) {
+        var payload = CreateWorldRequest(title: title, frameCount: frameCount, lat: lat, lng: lng)
+        if let depthFrames {
+            payload.depth = true
+            payload.depthFrames = depthFrames
+        }
+        let body = try encoder.encode(payload)
         var req = request("POST", "v1/worlds", body: body)
         if let idempotencyKey {
             req?.setValue(idempotencyKey.uuidString, forHTTPHeaderField: "Idempotency-Key")
         }
         let data = try await send(req)
         let resp: CreateWorldResponse = try decode(data)
-        return (resp.world, resp.uploads)
+        return (resp.world, resp.uploads, resp.depthUploads ?? [])
     }
 
     /// Re-issue presigned frame PUT URLs for an in-progress capture (resume
@@ -131,16 +142,22 @@ final class APIClient {
     /// recreated. Called by `CaptureUploader` when resuming a session that
     /// already has a `createdWorldId`, so a dropped/expired URL never orphans a
     /// world by forcing a fresh `createWorld`.
-    func refreshUploads(worldId: String) async throws -> (World, [FrameUpload]) {
-        let data = try await send(request("POST", "v1/worlds/\(worldId)/uploads:refresh"))
+    /// `depthFrames` non-nil also re-presigns the depth slots (same shape).
+    func refreshUploads(
+        worldId: String,
+        depthFrames: [DepthFrameDeclaration]? = nil
+    ) async throws -> (World, [FrameUpload], [FrameUpload]) {
+        let body = try depthFrames.map { try encoder.encode(RefreshUploadsRequest(depth: true, depthFrames: $0)) }
+        let data = try await send(request("POST", "v1/worlds/\(worldId)/uploads:refresh", body: body))
         let resp: RefreshUploadsResponse = try decode(data)
+        let depthUploads = resp.depthUploads ?? []
         if let world = resp.world {
-            return (world, resp.uploads)
+            return (world, resp.uploads, depthUploads)
         }
         // Backend always echoes `world`; if a lenient/older shape omits it, fall
         // back to a detail fetch so callers still get a valid World.
         let world = try await getWorld(id: worldId).world
-        return (world, resp.uploads)
+        return (world, resp.uploads, depthUploads)
     }
 
     /// Signal all frames uploaded. `poses` (when present) is included in the

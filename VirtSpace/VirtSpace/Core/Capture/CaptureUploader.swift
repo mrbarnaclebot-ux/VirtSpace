@@ -5,7 +5,9 @@
 //  Glue between a finished on-disk capture session and the backend:
 //  createWorld → sequential presigned frame uploads (FrameUploader) →
 //  frames:done → purge the local session. Frames upload as image/jpeg using
-//  exactly the headers the API returned per slot. Resumable: a failed upload
+//  exactly the headers the API returned per slot; LiDAR depth maps (spec §5.2)
+//  ride alongside as depth_<i>.png to their `depth_uploads` slots, best
+//  effort: a missing or failed depth file never blocks or parks a session. Resumable: a failed upload
 //  keeps the session directory; `resumePending()` retries complete sessions
 //  found on disk (crash/offline recovery, spec §6.1).
 //
@@ -260,7 +262,8 @@ final class CaptureUploader {
         let manifest = session.manifest
         AppLog.upload.log("Stranded session \(session.id.uuidString, privacy: .public): \(manifest.uploadedFrameIndices.count)/\(manifest.frames.count) frames already uploaded, world \(worldId, privacy: .public) — going straight to frames:done")
         do {
-            let poses = manifest.frames.map(\.wire)
+            let depthUploaded = Set(manifest.uploadedDepthIndices)
+            let poses = manifest.frames.map { $0.wire(depthUploaded: depthUploaded.contains($0.index)) }
             AppLog.upload.log("uploads complete, calling frames:done for \(worldId, privacy: .public)")
             try await api.framesDone(worldId: worldId, poses: poses)
             AppLog.upload.log("frames:done ok for \(worldId, privacy: .public) with \(poses.count) poses (stranded recovery)")
@@ -354,8 +357,9 @@ final class CaptureUploader {
     private func createFreshWorld(
         session: CaptureStore.PendingSession,
         frameCount: Int,
+        depthFrames: [DepthFrameDeclaration]?,
         renewKey: Bool
-    ) async throws -> (World, [FrameUpload]) {
+    ) async throws -> (World, [FrameUpload], [FrameUpload]) {
         // Defensive: a parked session must never mint a billable world behind
         // the user's back. Every automatic path already skips parked sessions.
         if let current = await sessions.pending(session.id), current.manifest.isParked {
@@ -365,13 +369,13 @@ final class CaptureUploader {
         let title = "Scan \(now().formatted(date: .abbreviated, time: .shortened))"
         AppLog.upload.log("Upload start: session \(session.id.uuidString, privacy: .public), \(frameCount) frames")
         do {
-            return try await mintWorld(session: session, title: title, frameCount: frameCount, renewKey: renewKey)
+            return try await mintWorld(session: session, title: title, frameCount: frameCount, depthFrames: depthFrames, renewKey: renewKey)
         } catch let error as APIError where error.isIdempotencyConflict {
             // 409: the world this key created has since been deleted, so the
             // key is spent and can never produce a world again. Persist a
             // brand-new key (before the request, as always) and retry once.
             AppLog.upload.fault("createWorld 409 for session \(session.id.uuidString, privacy: .public) — idempotency key is spent, minting under a fresh key")
-            return try await mintWorld(session: session, title: title, frameCount: frameCount, renewKey: true)
+            return try await mintWorld(session: session, title: title, frameCount: frameCount, depthFrames: depthFrames, renewKey: true)
         } catch APIError.quota {
             AppLog.upload.log("createWorld refused for quota (429) — keeping session \(session.id.uuidString, privacy: .public) pending, will retry when allowance frees up (no replacement world minted)")
             throw APIError.quota
@@ -382,14 +386,16 @@ final class CaptureUploader {
         session: CaptureStore.PendingSession,
         title: String,
         frameCount: Int,
+        depthFrames: [DepthFrameDeclaration]?,
         renewKey: Bool
-    ) async throws -> (World, [FrameUpload]) {
+    ) async throws -> (World, [FrameUpload], [FrameUpload]) {
         // Persisted FIRST — the whole point of the key. A key that can't be
         // persisted throws here, so the billable request is never sent.
         let key = try await sessions.worldRequestId(forSession: session.id, in: session.directory, renew: renewKey)
-        let (world, slots) = try await api.createWorld(
+        let (world, slots, depthSlots) = try await api.createWorld(
             title: title,
             frameCount: frameCount,
+            depthFrames: depthFrames,
             idempotencyKey: key,
             lat: nil,
             lng: nil
@@ -397,8 +403,8 @@ final class CaptureUploader {
         // Persist the world id BEFORE uploading any frame so a crash/kill
         // mid-upload resumes onto this same world instead of orphaning it.
         try await sessions.setCreatedWorldId(world.id, forSession: session.id, in: session.directory)
-        AppLog.upload.log("World created: \(world.id, privacy: .public), \(slots.count) upload slots (idempotency key \(key.uuidString, privacy: .public))")
-        return (world, slots)
+        AppLog.upload.log("World created: \(world.id, privacy: .public), \(slots.count) upload slots, \(depthSlots.count) depth slots (idempotency key \(key.uuidString, privacy: .public))")
+        return (world, slots, depthSlots)
     }
 
     private func upload(
@@ -410,16 +416,22 @@ final class CaptureUploader {
         // so the rest of this run re-uploads EVERY frame to the fresh world.
         var manifest = session.manifest
         let frameCount = manifest.frames.count
+        // Depth files actually on disk, with their exact sizes. Derived from
+        // disk, so every retry under one idempotency key sends the same body
+        // (the backend replays depth_uploads only for a request that asks
+        // for depth again). nil = no depth: the request omits it entirely.
+        let depthFrames = await sessions.depthDeclarations(for: session)
 
         // World reuse (spec §6.1): if this session already minted a world, RESUME
         // it — re-presign fresh URLs (the originals may have expired) rather than
         // creating a second, orphaned world for the same capture.
         let world: World
         let slots: [FrameUpload]
+        let depthSlots: [FrameUpload]
         if let existingWorldId = manifest.createdWorldId {
             do {
                 AppLog.upload.log("Resuming upload for world \(existingWorldId, privacy: .public), \(manifest.uploadedFrameIndices.count)/\(frameCount) already uploaded")
-                (world, slots) = try await api.refreshUploads(worldId: existingWorldId)
+                (world, slots, depthSlots) = try await api.refreshUploads(worldId: existingWorldId, depthFrames: depthFrames)
                 AppLog.upload.log("Refreshed \(slots.count) upload slots")
             } catch let error as APIError where error.isWorldGone {
                 // The created world was deleted server-side (404 world_not_found):
@@ -431,11 +443,15 @@ final class CaptureUploader {
                 try await sessions.resetWorldState(forSession: session.id, in: session.directory)
                 manifest.createdWorldId = nil
                 manifest.uploadedFrameIndices = []
-                (world, slots) = try await createFreshWorld(session: session, frameCount: frameCount, renewKey: true)
+                manifest.uploadedDepthIndices = []
+                (world, slots, depthSlots) = try await createFreshWorld(session: session, frameCount: frameCount, depthFrames: depthFrames, renewKey: true)
             }
         } else {
-            (world, slots) = try await createFreshWorld(session: session, frameCount: frameCount, renewKey: renewWorldKey)
+            (world, slots, depthSlots) = try await createFreshWorld(session: session, frameCount: frameCount, depthFrames: depthFrames, renewKey: renewWorldKey)
         }
+        let depthSlotsByIndex = Dictionary(depthSlots.map { ($0.index, $0) }, uniquingKeysWith: { first, _ in first })
+        var depthUploaded = Set(manifest.uploadedDepthIndices)
+        let framesWithDepth = Set((depthFrames ?? []).map(\.index))
 
         // Count frames already confirmed uploaded (resume) toward progress.
         var done = manifest.uploadedFrameIndices.count
@@ -443,25 +459,33 @@ final class CaptureUploader {
         progress(done)
         for slot in slots.sorted(by: { $0.index < $1.index }) {
             // Skip frames a previous (possibly killed) run already confirmed.
-            if manifest.isUploaded(slot.index) { continue }
-            // Upload straight from the on-disk session file via the background
-            // session; the transfer itself runs in URLSession, off the main thread.
-            let fileURL = sessions.frameURL(index: slot.index, in: session.directory)
-            do {
-                try await frameUploader.upload(fileURL: fileURL, to: slot)
-            } catch {
-                AppLog.upload.error("Frame \(slot.index) upload failed: \(error.localizedDescription, privacy: .public)")
-                throw error
+            if !manifest.isUploaded(slot.index) {
+                // Upload straight from the on-disk session file via the background
+                // session; the transfer itself runs in URLSession, off the main thread.
+                let fileURL = sessions.frameURL(index: slot.index, in: session.directory)
+                do {
+                    try await frameUploader.upload(fileURL: fileURL, to: slot)
+                } catch {
+                    AppLog.upload.error("Frame \(slot.index) upload failed: \(error.localizedDescription, privacy: .public)")
+                    throw error
+                }
+                // Mark uploaded immediately (crash-safe) so a later resume skips it.
+                try await sessions.markFrameUploaded(index: slot.index, forSession: session.id, in: session.directory)
+                done += 1
+                progress(done)
             }
-            // Mark uploaded immediately (crash-safe) so a later resume skips it.
-            try await sessions.markFrameUploaded(index: slot.index, forSession: session.id, in: session.directory)
-            done += 1
-            progress(done)
+            // Depth after its frame, also for frames a killed run already
+            // uploaded, so an interrupted depth PUT gets another chance.
+            if framesWithDepth.contains(slot.index), !depthUploaded.contains(slot.index),
+               let depthSlot = depthSlotsByIndex[slot.index],
+               await uploadDepth(index: slot.index, to: depthSlot, session: session) {
+                depthUploaded.insert(slot.index)
+            }
         }
 
         // Include the captured poses so the backend gets pose-assisted stitching
         // data (spec §5). The field is optional on the contract.
-        let poses = session.manifest.frames.map(\.wire)
+        let poses = session.manifest.frames.map { $0.wire(depthUploaded: depthUploaded.contains($0.index)) }
         AppLog.upload.log("uploads complete, calling frames:done for \(world.id, privacy: .public)")
         do {
             try await api.framesDone(worldId: world.id, poses: poses)
@@ -476,6 +500,22 @@ final class CaptureUploader {
         AppLog.upload.log("frames:done ok for \(world.id, privacy: .public) with \(poses.count) poses")
         await sessions.purge(id: session.id)
         return world
+    }
+
+    /// Best effort, by contract: a depth file that is missing, fails to upload
+    /// or can't be recorded is logged and skipped — never thrown, never
+    /// counted toward parking. That frame's pose then simply carries no
+    /// `depth`. Returns whether the upload is confirmed and recorded.
+    private func uploadDepth(index: Int, to slot: FrameUpload, session: CaptureStore.PendingSession) async -> Bool {
+        let fileURL = sessions.depthURL(index: index, in: session.directory)
+        do {
+            try await frameUploader.upload(fileURL: fileURL, to: slot)
+            try await sessions.markDepthUploaded(index: index, forSession: session.id, in: session.directory)
+            return true
+        } catch {
+            AppLog.upload.error("Depth \(index) upload skipped: \(error.localizedDescription, privacy: .public)")
+            return false
+        }
     }
 
     /// User-facing text for a failed attempt.

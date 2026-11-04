@@ -73,8 +73,9 @@ nonisolated final class CaptureStore: @unchecked Sendable {
         }
 
         /// The frames:done wire shape. Nil fields are omitted, never sent as
-        /// JSON null (the backend 400s a null).
-        var wire: VirtSpace.FramePose {
+        /// JSON null (the backend 400s a null). `depth` rides along only when
+        /// the depth file actually reached R2.
+        func wire(depthUploaded: Bool) -> VirtSpace.FramePose {
             VirtSpace.FramePose(
                 index: index,
                 timestamp: timestamp,
@@ -83,7 +84,8 @@ nonisolated final class CaptureStore: @unchecked Sendable {
                 exposureLocked: exposureLocked,
                 iso: iso,
                 exposureDuration: exposureDuration,
-                featureDepthMedian: featureDepthMedian
+                featureDepthMedian: featureDepthMedian,
+                depth: depthUploaded ? depth : nil
             )
         }
     }
@@ -101,6 +103,9 @@ nonisolated final class CaptureStore: @unchecked Sendable {
         /// Frame indices confirmed uploaded to R2. A resume skips these and only
         /// re-PUTs the rest. Written after each confirmed upload → crash-safe.
         var uploadedFrameIndices: [Int]
+        /// Frame indices whose depth_<i>.png is confirmed uploaded. Only these
+        /// poses carry `depth` on frames:done (spec §5.2).
+        var uploadedDepthIndices: [Int]
         /// Idempotency-Key for this session's `POST /v1/worlds`, persisted
         /// BEFORE the request goes out. A kill between request and response
         /// therefore can't double-create: the retry replays the same key and
@@ -157,6 +162,7 @@ nonisolated final class CaptureStore: @unchecked Sendable {
             frames: [FramePose],
             createdWorldId: String? = nil,
             uploadedFrameIndices: [Int] = [],
+            uploadedDepthIndices: [Int] = [],
             worldRequestId: UUID? = nil,
             attemptCount: Int = 0,
             lastAttemptAt: Date? = nil
@@ -167,6 +173,7 @@ nonisolated final class CaptureStore: @unchecked Sendable {
             self.frames = frames
             self.createdWorldId = createdWorldId
             self.uploadedFrameIndices = uploadedFrameIndices
+            self.uploadedDepthIndices = uploadedDepthIndices
             self.worldRequestId = worldRequestId
             self.attemptCount = attemptCount
             self.lastAttemptAt = lastAttemptAt
@@ -179,6 +186,7 @@ nonisolated final class CaptureStore: @unchecked Sendable {
             case frames
             case createdWorldId = "created_world_id"
             case uploadedFrameIndices = "uploaded_frame_indices"
+            case uploadedDepthIndices = "uploaded_depth_indices"
             case worldRequestId = "world_request_id"
             case attemptCount = "attempt_count"
             case lastAttemptAt = "last_attempt_at"
@@ -195,6 +203,7 @@ nonisolated final class CaptureStore: @unchecked Sendable {
             frames = try c.decode([FramePose].self, forKey: .frames)
             createdWorldId = try c.decodeIfPresent(String.self, forKey: .createdWorldId)
             uploadedFrameIndices = try c.decodeIfPresent([Int].self, forKey: .uploadedFrameIndices) ?? []
+            uploadedDepthIndices = try c.decodeIfPresent([Int].self, forKey: .uploadedDepthIndices) ?? []
             worldRequestId = try c.decodeIfPresent(UUID.self, forKey: .worldRequestId)
             attemptCount = try c.decodeIfPresent(Int.self, forKey: .attemptCount) ?? 0
             lastAttemptAt = try c.decodeIfPresent(Date.self, forKey: .lastAttemptAt)
@@ -313,6 +322,7 @@ nonisolated final class CaptureStore: @unchecked Sendable {
         try mutateManifest(id: id, in: directory) { m in
             m.createdWorldId = nil
             m.uploadedFrameIndices = []
+            m.uploadedDepthIndices = []
         }
     }
 
@@ -378,6 +388,31 @@ nonisolated final class CaptureStore: @unchecked Sendable {
             m.uploadedFrameIndices.append(index)
             m.uploadedFrameIndices.sort()
         }
+    }
+
+    /// Mark one frame's depth file confirmed-uploaded (crash-safe).
+    func markDepthUploaded(index: Int, forSession id: UUID, in directory: URL) throws {
+        try mutateManifest(id: id, in: directory) { m in
+            guard !m.uploadedDepthIndices.contains(index) else { return }
+            m.uploadedDepthIndices.append(index)
+            m.uploadedDepthIndices.sort()
+        }
+    }
+
+    /// Exact on-disk sizes of the session's depth files, for the create /
+    /// refresh `depth_frames` declaration; nil when no frame has depth (the
+    /// request then omits depth entirely). Derived from disk, so every retry
+    /// under one idempotency key sends the same body. Missing or oversized
+    /// files are left out: that frame just isn't uploaded with depth.
+    func depthDeclarations(for frames: [FramePose], in directory: URL) -> [DepthFrameDeclaration]? {
+        let declared = frames.compactMap { frame -> DepthFrameDeclaration? in
+            guard frame.depth != nil,
+                  let size = (try? fileManager.attributesOfItem(atPath: depthURL(index: frame.index, in: directory).path))?[.size] as? Int,
+                  size > 0, size <= FrameDepth.maxPNGBytes
+            else { return nil }
+            return DepthFrameDeclaration(index: frame.index, bytes: size)
+        }
+        return declared.isEmpty ? nil : declared
     }
 
     /// Read-modify-write poses.json atomically. Reads the on-disk manifest first

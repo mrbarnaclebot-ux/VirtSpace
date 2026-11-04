@@ -257,16 +257,47 @@ struct CreateWorldRequest: Encodable {
     let frameCount: Int
     let lat: Double?
     let lng: Double?
+    /// Depth opt-in (spec §5.2 item 3). nil (absent) keeps the request — and
+    /// the response — byte-identical to the pre-depth contract.
+    var depth: Bool?
+    var depthFrames: [DepthFrameDeclaration]?
 
     enum CodingKeys: String, CodingKey {
-        case title, lat, lng
+        case title, lat, lng, depth
         case frameCount = "frame_count"
+        case depthFrames = "depth_frames"
+    }
+}
+
+/// One depth file's exact size, so its presigned PUT carries a signed
+/// Content-Length (the R7 pattern). The backend 400s anything over 1 MiB.
+nonisolated struct DepthFrameDeclaration: Codable, Hashable, Sendable {
+    let index: Int
+    let bytes: Int
+}
+
+/// `POST /v1/worlds/:id/uploads:refresh` body when depth is wanted.
+struct RefreshUploadsRequest: Encodable {
+    let depth: Bool
+    let depthFrames: [DepthFrameDeclaration]
+
+    enum CodingKeys: String, CodingKey {
+        case depth
+        case depthFrames = "depth_frames"
     }
 }
 
 struct CreateWorldResponse: Decodable {
     let world: World
     let uploads: [FrameUpload]
+    /// Same shape as `uploads` (keys `depth_<i>.png`); present only when the
+    /// request asked for depth.
+    let depthUploads: [FrameUpload]?
+
+    enum CodingKeys: String, CodingKey {
+        case world, uploads
+        case depthUploads = "depth_uploads"
+    }
 }
 
 /// `POST /v1/worlds/:id/uploads:refresh` → the same `uploads` array shape as
@@ -275,6 +306,12 @@ struct CreateWorldResponse: Decodable {
 struct RefreshUploadsResponse: Decodable {
     let world: World?
     let uploads: [FrameUpload]
+    let depthUploads: [FrameUpload]?
+
+    enum CodingKeys: String, CodingKey {
+        case world, uploads
+        case depthUploads = "depth_uploads"
+    }
 }
 
 // MARK: - Frame poses (capture → backend)
@@ -300,6 +337,9 @@ struct FramePose: Codable, Hashable {
     var exposureDuration: Double?
     /// Metres; median depth of ARKit raw feature points in view.
     var featureDepthMedian: Float?
+    /// Present iff this frame's depth_<index>.png was uploaded — the worker
+    /// reads depth only for poses carrying it.
+    var depth: FrameDepthSize?
 }
 
 /// Pixel size of a frame's depth map (spec §5.2 `depth`). Nonisolated: built

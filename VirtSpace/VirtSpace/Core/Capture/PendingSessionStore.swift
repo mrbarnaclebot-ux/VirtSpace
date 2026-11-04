@@ -68,6 +68,15 @@ actor PendingSessionStore {
         try store.markFrameUploaded(index: index, forSession: id, in: directory)
     }
 
+    func markDepthUploaded(index: Int, forSession id: UUID, in directory: URL) throws {
+        try store.markDepthUploaded(index: index, forSession: id, in: directory)
+    }
+
+    /// File-size reads, so off the main actor like the manifest I/O.
+    func depthDeclarations(for session: PendingSession) -> [DepthFrameDeclaration]? {
+        store.depthDeclarations(for: session.manifest.frames, in: session.directory)
+    }
+
     func purge(id: UUID) {
         store.purge(id: id)
     }
@@ -75,5 +84,9 @@ actor PendingSessionStore {
     /// Pure path arithmetic, no I/O — callable without a hop.
     nonisolated func frameURL(index: Int, in directory: URL) -> URL {
         store.frameURL(index: index, in: directory)
+    }
+
+    nonisolated func depthURL(index: Int, in directory: URL) -> URL {
+        store.depthURL(index: index, in: directory)
     }
 }

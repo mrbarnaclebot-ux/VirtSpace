@@ -97,7 +97,7 @@ struct CaptureDebugToolsView: View {
             let frame = Self.makeGradientJPEG()
             // Keyed like a real capture, so a replayed request can't mint a
             // second billable world.
-            let (world, uploads) = try await api.createWorld(title: "Test Scan", frameCount: 1, idempotencyKey: UUID())
+            let (world, uploads, _) = try await api.createWorld(title: "Test Scan", frameCount: 1, idempotencyKey: UUID())
             guard let slot = uploads.first else {
                 throw APIError.server(0, "Backend returned no upload slots")
             }

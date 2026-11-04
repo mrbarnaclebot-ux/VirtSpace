@@ -12,6 +12,7 @@
 
 import Foundation
 import Testing
+import simd
 @testable import VirtSpace
 
 @Suite("CaptureUploader resume state machine")
@@ -407,5 +408,69 @@ struct CaptureUploaderTests {
         #expect(api.deletedWorldIds == ["world-1"])
         #expect(fixture.pending(session.id) == nil)
         #expect(await uploader.pendingSummary().pendingCount == 0)
+    }
+}
+
+@Suite("CaptureUploader depth uploads")
+struct CaptureUploaderDepthTests {
+    /// Two frames with depth on disk plus one whose depth file is missing.
+    private func makeDepthSession(_ fixture: StoreFixture) throws -> CaptureStore.PendingSession {
+        let session = try fixture.store.createSession(expectedFrameCount: 3)
+        let png = try #require(FrameDepth.png(millimetres: [1000, 2000], width: 2, height: 1))
+        for index in 0..<3 {
+            let pose = CaptureStore.FramePose(
+                index: index, timestamp: Double(index), transform: matrix_identity_float4x4,
+                intrinsics: matrix_identity_float3x3, exposureLocked: true,
+                iso: 200, exposureDuration: 1.0 / 60,
+                depth: FrameDepthSize(width: 2, height: 1)
+            )
+            try fixture.store.saveFrame(Data([0xFF, 0xD8]), depthPNG: png, pose: pose, in: session)
+        }
+        // Lost after capture: frame 2 must still upload, just without depth.
+        try FileManager.default.removeItem(at: fixture.store.depthURL(index: 2, in: session.directory))
+        return try #require(fixture.pending(session.id))
+    }
+
+    @Test("Declares exact depth sizes, uploads them, and sends depth only for uploaded files")
+    func depthUploadsAlongsideFrames() async throws {
+        let fixture = StoreFixture()
+        let session = try makeDepthSession(fixture)
+        let api = FakeUploadAPI()
+        api.depthSlotCount = 3
+        let frames = FakeFrameUploader()
+        frames.failingDepthIndices = [1]
+        let uploader = CaptureUploader(api: api, store: fixture.store, frameUploader: frames, now: TestClock().now)
+
+        _ = try await uploader.upload(
+            result: CaptureResult(sessionID: session.id, directory: session.directory, frameCount: 3)
+        )
+
+        let size = try #require(
+            try FileManager.default.attributesOfItem(atPath: fixture.store.depthURL(index: 0, in: session.directory).path)[.size] as? Int
+        )
+        #expect(api.createDepthFrames == [[DepthFrameDeclaration(index: 0, bytes: size), DepthFrameDeclaration(index: 1, bytes: size)]])
+        // A failed depth PUT and a missing depth file never block the frames.
+        #expect(frames.uploadedIndices == [0, 1, 2])
+        #expect(frames.uploadedDepthIndices == [0])
+        let poses = try #require(api.lastPoses)
+        #expect(poses.map { $0.depth != nil } == [true, false, false])
+        #expect(poses.allSatisfy { $0.iso == 200 })
+        #expect(fixture.pending(session.id) == nil)
+    }
+
+    @Test("A session without depth sends no depth fields at all")
+    func noDepthNoField() async throws {
+        let fixture = StoreFixture()
+        let session = try fixture.makeCompleteSession(frameCount: 2)
+        let api = FakeUploadAPI()
+        let uploader = CaptureUploader(api: api, store: fixture.store, frameUploader: FakeFrameUploader(), now: TestClock().now)
+
+        _ = try await uploader.upload(
+            result: CaptureResult(sessionID: session.id, directory: session.directory, frameCount: 2)
+        )
+
+        #expect(api.createDepthFrames.count == 1)
+        #expect(api.createDepthFrames.first! == nil)
+        #expect(api.lastPoses?.allSatisfy { $0.depth == nil } == true)
     }
 }
