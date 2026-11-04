@@ -13,6 +13,10 @@ const numberFromEnv = (def: number) =>
 
 const baseSchema = z.object({
   DATABASE_URL: z.string().min(1, 'DATABASE_URL is required'),
+  // Direct (non-pooler) Neon host for src/migrate.ts only: its session-scoped
+  // advisory lock is unreliable through the pgbouncer pooler. Unset falls back
+  // to DATABASE_URL with a warning.
+  MIGRATE_DATABASE_URL: z.string().min(1).optional(),
   PORT: numberFromEnv(8080),
   // Deployment environment. Only 'production' is load-bearing (it gates dev
   // auth, see refine()); anything else is treated as a non-production run.

@@ -6,12 +6,14 @@ import { defineRailway, project, service } from "railway/iac";
 export default defineRailway(() => {
   const build = { buildEnvironment: "V3", builder: "DOCKERFILE", dockerfilePath: "Dockerfile" } as const;
 
-  // ponytail: no preDeploy migrate yet. migrate.ts reads DATABASE_URL (the
-  // pgbouncer pooler) and its session advisory lock is unreliable there
-  // (HANDOFF pooler incident). Upgrade path: MIGRATE_DATABASE_URL on the
-  // direct Neon host, then preDeploy: "node dist/migrate.js" on api only.
+  // preDeploy migrate runs on api ONLY (one migrator per release; worker would
+  // race the same DDL). PRECONDITION: set MIGRATE_DATABASE_URL on the api
+  // service to the DIRECT (non -pooler) Neon host before applying this. Without
+  // it migrate.ts falls back to DATABASE_URL, the pgbouncer pooler, where its
+  // session advisory lock is unreliable (HANDOFF pooler incident).
   const api = service("api", {
     build,
+    preDeploy: "node dist/migrate.js",
     healthcheck: "/healthz",
     replicas: { "us-west2": 1 },
   });
