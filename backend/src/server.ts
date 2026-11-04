@@ -18,8 +18,9 @@ export async function buildServer(config = getConfig()): Promise<FastifyInstance
   // a direct client. That is safe here only because the container is reachable
   // solely through Railway's edge. proxy-addr calls this with i = 0 for the
   // socket peer, then 1.. walking X-Forwarded-For right to left.
-  // ponytail: hop count assumed 1 (Railway edge); confirm once against
-  // production req.ips. Upgrade path: trust the edge's CIDR (a string) instead.
+  // ponytail: hop count is measured, not derived (production = 2 on
+  // 2026-11-04); re-measure if Railway changes its edge. Upgrade path: trust
+  // the edge's CIDR (a string) instead.
   const hops = config.TRUST_PROXY_HOPS;
   const app = Fastify({ logger: true, trustProxy: (_addr: string, i: number) => i < hops });
   installErrorHandler(app);
