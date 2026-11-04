@@ -84,6 +84,13 @@ actor PanoCache {
         return dest
     }
 
+    /// Drop one cached pano, e.g. a file that would not decode, so the next
+    /// `ensure` downloads it fresh.
+    func remove(worldId: String, version: Int) {
+        guard let url = try? fileURL(worldId: worldId, version: version) else { return }
+        try? fm.removeItem(at: url)
+    }
+
     // MARK: - Maintenance (Settings)
 
     /// Total bytes currently held in the panos cache directory.

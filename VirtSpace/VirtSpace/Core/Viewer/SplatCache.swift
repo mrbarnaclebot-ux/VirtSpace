@@ -58,6 +58,24 @@ actor SplatCache {
         remoteURL: URL,
         progress: @Sendable @escaping (Double) -> Void
     ) async throws -> URL {
+        let url = try await ensure(worldId: worldId, version: version, tier: tier, remoteURL: remoteURL, bytes: { written, expected in
+            guard expected > 0 else { return }
+            progress(min(1, Double(written) / Double(expected)))
+        })
+        progress(1)
+        return url
+    }
+
+    /// Same, reporting (bytes written, bytes expected) for a "12 of 40 MB"
+    /// line. `expected` is <= 0 when the size is unknown. A cache hit returns
+    /// without any report.
+    func ensure(
+        worldId: String,
+        version: Int,
+        tier: String,
+        remoteURL: URL,
+        bytes: @Sendable @escaping (Int64, Int64) -> Void
+    ) async throws -> URL {
         let dest = try fileURL(worldId: worldId, version: version, tier: tier)
         if fm.fileExists(atPath: dest.path) {
             touch(dest)
@@ -70,7 +88,7 @@ actor SplatCache {
         // sequence over a multi-megabyte SPZ (spec §10 R12).
         let tmp = try directory.appendingPathComponent("\(UUID().uuidString).partial")
         do {
-            try await FileDownload.download(from: remoteURL, to: tmp, progress: progress)
+            try await FileDownload.download(from: remoteURL, to: tmp, bytes: bytes)
         } catch let error as FileDownloadError {
             try? fm.removeItem(at: tmp)
             switch error {
@@ -94,7 +112,6 @@ actor SplatCache {
             throw error
         }
 
-        progress(1)
         evictIfNeeded(keeping: dest)
         return dest
     }

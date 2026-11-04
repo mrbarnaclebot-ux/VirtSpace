@@ -41,7 +41,20 @@ enum FileDownload {
         to destination: URL,
         progress: @escaping @Sendable (Double) -> Void
     ) async throws {
-        let delegate = DownloadDelegate(destination: destination, progress: progress)
+        try await download(from: remoteURL, to: destination, bytes: { written, expected in
+            guard expected > 0 else { return }
+            progress(min(1, Double(written) / Double(expected)))
+        })
+    }
+
+    /// Same, reporting (bytes written, bytes expected). `expected` is <= 0
+    /// when the server sent no content length.
+    static func download(
+        from remoteURL: URL,
+        to destination: URL,
+        bytes: @escaping @Sendable (Int64, Int64) -> Void
+    ) async throws {
+        let delegate = DownloadDelegate(destination: destination, bytes: bytes)
         try await delegate.run(remoteURL: remoteURL)
     }
 }
@@ -52,14 +65,14 @@ enum FileDownload {
 /// and `session` are guarded by `lock`, and the rest is immutable.
 private nonisolated final class DownloadDelegate: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
     private let destination: URL
-    private let progress: @Sendable (Double) -> Void
+    private let bytes: @Sendable (Int64, Int64) -> Void
     private let lock = NSLock()
     private var continuation: CheckedContinuation<Void, Error>?
     private var session: URLSession?
 
-    init(destination: URL, progress: @escaping @Sendable (Double) -> Void) {
+    init(destination: URL, bytes: @escaping @Sendable (Int64, Int64) -> Void) {
         self.destination = destination
-        self.progress = progress
+        self.bytes = bytes
         super.init()
     }
 
@@ -108,8 +121,7 @@ private nonisolated final class DownloadDelegate: NSObject, URLSessionDownloadDe
         totalBytesWritten: Int64,
         totalBytesExpectedToWrite: Int64
     ) {
-        guard totalBytesExpectedToWrite > 0 else { return }
-        progress(min(1, Double(totalBytesWritten) / Double(totalBytesExpectedToWrite)))
+        bytes(totalBytesWritten, totalBytesExpectedToWrite)
     }
 
     func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
