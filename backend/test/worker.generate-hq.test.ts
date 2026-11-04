@@ -176,3 +176,37 @@ describe('generate_hq finalize', () => {
     expect(sink.pushes).toEqual([]);
   });
 });
+
+describe('full_res splat (best-effort tier)', () => {
+  function withFullRes(deps: WorkerDeps, download: (url: string) => Promise<Buffer>): WorkerDeps {
+    deps.provider.getWorld = vi.fn(async () => ({ spzUrls: { k500: 'u500', full: 'ufull' } }));
+    deps.provider.downloadAsset = vi.fn(download);
+    return deps;
+  }
+
+  it('stores full_res on our storage when the provider returns it', async () => {
+    const sink: Sink = { updates: [], pushes: [] };
+    const deps = withFullRes(makeDeps(makeDb(fakeWorld(), sink), sink), async () => Buffer.from('b'));
+    await processJob(deps, hqJob);
+
+    const patch = sink.updates.find((u) => u.patch['status'] === 'complete')!.patch;
+    expect(patch['spzFullUrl']).toBe('worlds/w-1/splat_full.spz');
+    expect(deps.storage.putObject).toHaveBeenCalledWith('worlds/w-1/splat_full.spz', expect.anything());
+  });
+
+  it('a failed full_res download still completes the job, with spz_full_url null', async () => {
+    const sink: Sink = { updates: [], pushes: [] };
+    // The draft's full_res key must not survive into the bumped HQ version.
+    const world = fakeWorld({ spzFullUrl: 'worlds/w-1/splat_full.spz' });
+    const deps = withFullRes(makeDeps(makeDb(world, sink), sink), async (url) => {
+      if (url === 'ufull') throw new Error('asset too large');
+      return Buffer.from('b');
+    });
+    await processJob(deps, hqJob);
+
+    const patch = sink.updates.find((u) => u.patch['status'] === 'complete')!.patch;
+    expect(patch['spzFullUrl']).toBeNull();
+    expect(patch['spz500kUrl']).toBe('worlds/w-1/splat_500k.spz');
+    expect(sink.pushes).toEqual(['Your world is complete']);
+  });
+});

@@ -437,6 +437,8 @@ export interface GenerationResult {
   assetKeys: {
     spz100kUrl?: string;
     spz500kUrl?: string;
+    /** null (not omitted) when absent or failed, so an HQ pass clears the draft's. */
+    spzFullUrl?: string | null;
     thumbnailUrl?: string;
     colliderGlbUrl?: string;
   };
@@ -646,6 +648,21 @@ async function collectAssets(
       'splat_500k.spz',
       await provider.downloadAsset(assets.spzUrls.k500),
     );
+  }
+  // full_res is best-effort: 500k is the required tier, so a failed full_res
+  // download degrades capable devices to 500k instead of failing a paid job.
+  // Always written (null on failure) — an HQ pass must not leave the draft's
+  // full_res key behind under the bumped asset_version.
+  assetKeys.spzFullUrl = null;
+  if (assets.spzUrls.full) {
+    try {
+      assetKeys.spzFullUrl = await io.storeAsset(
+        'splat_full.spz',
+        await provider.downloadAsset(assets.spzUrls.full),
+      );
+    } catch (err) {
+      console.warn(`[worker] world ${worldId}: full_res splat not stored: ${String(err)}`);
+    }
   }
   if (assets.spzUrls.k100) {
     assetKeys.spz100kUrl = await io.storeAsset(
