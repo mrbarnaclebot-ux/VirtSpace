@@ -105,7 +105,7 @@ def layers(fd, poses, depth_dir, proxy, W=1024):
     dx, dy, dz = pano_rays(rows, cols, W, W // 2)
     invd = sample_field(invd, rows, cols, W, W // 2)
     out = []
-    for img, cam, _, _ in frames.values():
+    for img, cam, _ in frames.values():
         px, py, inb = project(cam, center, dx, dy, dz, invd)
         out.append((sample(img, px, py)[:, :, 0].astype(np.float32), inb))
     return out

@@ -79,10 +79,11 @@ from depth import (  # noqa: E402
     proxy_field,
     read_depth_png,
 )
+from blend import MARGIN_STEPS, Band, levels_for, roi_from_mask  # noqa: E402
 from gains import apply_gain, estimate_gains, exposure_prior  # noqa: E402
+from seams import find_seams  # noqa: E402
 from warp import (  # noqa: E402
     Cam,
-    center_weight,
     pano_rays,
     project,
     render_layers,
@@ -112,8 +113,6 @@ ANALYSIS_WIDTH = 1024
 # 13% worse rotation-only; 2.0 is the far end of that plateau so bigger rooms
 # are not over-corrected. Wrong-by-x error scales with |1/d_true - 1/d_proxy|.
 DEFAULT_PROXY_DEPTH_M = 2.0
-POLE_LAT_DEG = 60.0  # frames looking steeper than this get the pole weight boost.
-POLE_BOOST = 8.0
 
 # Hard ceiling on --width. 8192 was the original product width (spec §5); anything
 # larger is a misconfiguration that would blow the worker's memory budget, so we
@@ -125,12 +124,11 @@ MAX_WIDTH = 8192
 # user-facing preview/save. --width can still ask for up to MAX_WIDTH.
 DEFAULT_WIDTH = 4096
 
-# Peak-RSS control. The equirect is filled in horizontal row BANDS: the ray grid
-# and the accumulators are sized per band instead of per sphere, so memory is
-# O(band) not O(width^2). 1 Mpx per band (128 rows at 8192 wide) keeps the
-# transient per-band arrays near 170 MB on top of the ~135 MB output pano +
-# coverage mask; measured whole-process peak at 8192x4096 is ~430 MB, against
-# ~4.5 GB for the pre-banding full-frame version.
+# Peak-RSS control (spec §10 R8). The full-res blend runs in horizontal row
+# BANDS of ~1 Mpx (256 rows at 4096) plus a pyramid margin, so ray grids,
+# warped patches and pyramid accumulators are O(band) not O(width^2). Measured
+# on the 28-frame 2026-09-17 capture (macOS peak RSS, which also counts freed
+# pages): ~0.98 GB at 4096, ~1.43 GB at 8192.
 BAND_TARGET_PIXELS = 1024 * 1024
 
 # --- Exit codes (see the module docstring; mirrored in src/worker.ts) ---------
@@ -295,7 +293,7 @@ def upright(img):
 
 
 def frame_camera(i, img_shape, pose_by_index, angles, hfov_deg):
-    """(Cam, is_pole, label) for frame `i` sampled from an UPRIGHT image of
+    """(Cam, label) for frame `i` sampled from an UPRIGHT image of
     `img_shape`. Focals are FOV-derived, so the same call serves the full-res
     frame, its prefiltered copy and its depth map."""
     hf, wf = img_shape[:2]
@@ -315,7 +313,7 @@ def frame_camera(i, img_shape, pose_by_index, angles, hfov_deg):
         # us whether this is a pole (zenith/nadir) frame.
         fwd_lat = math.degrees(math.asin(max(-1.0, min(1.0, float(r_proj[2, 1])))))
         cam = Cam(r_proj, origin, focal_x, focal_y, wf, hf)
-        return cam, abs(fwd_lat) > POLE_LAT_DEG, f"pose(lat={fwd_lat:.0f})"
+        return cam, f"pose(lat={fwd_lat:.0f})"
 
     yaw, pitch, roll = angles[i]
     # world -> projection camera. FLIP_RIGHT turns rmat's proper rotation into
@@ -325,11 +323,11 @@ def frame_camera(i, img_shape, pose_by_index, angles, hfov_deg):
     r_proj = FLIP_RIGHT @ rmat(yaw, pitch, roll).T
     focal = (wf / 2.0) / math.tan(math.radians(hfov_deg) / 2.0)
     cam = Cam(r_proj, np.zeros(3), focal, focal, wf, hf)
-    return cam, abs(pitch) > POLE_LAT_DEG, f"pose(y={yaw:.0f},p={pitch:.0f})"
+    return cam, f"pose(y={yaw:.0f},p={pitch:.0f})"
 
 
 def load_frames(frames_dir, indices, pose_by_index, angles, hfov_deg, width):
-    """{i: (prefiltered upright image, Cam, is_pole, label)} for every frame
+    """{i: (prefiltered upright image, Cam, label)} for every frame
     present. Decoded ONCE: at the pano's density a 12 MP frame shrinks ~10x in
     area, so holding all of them is cheaper than re-decoding per band."""
     frames = {}
@@ -340,16 +338,16 @@ def load_frames(frames_dir, indices, pose_by_index, angles, hfov_deg, width):
             continue
         img = upright(raw)
         del raw
-        cam, is_pole, label = frame_camera(i, img.shape, pose_by_index, angles, hfov_deg)
+        cam, label = frame_camera(i, img.shape, pose_by_index, angles, hfov_deg)
         img, cam = shrink(img, cam, width, PREFILTER_OVERSAMPLE)
-        frames[i] = (img, cam, is_pole, label)
+        frames[i] = (img, cam, label)
     return frames
 
 
 def scene_depth(frames, pose_by_index, depth_dir, center, proxy_m):
     """Pano-space inverse depth (scalar or field), see depth.py for priority."""
     points, cams, depths = [], [], []
-    for i, (_, cam, _, _) in frames.items():
+    for i, (_, cam, _) in frames.items():
         p = pose_by_index.get(i, {}) if pose_by_index else {}
         fdm = p.get("featureDepthMedian")
         ok_fdm = isinstance(fdm, (int, float)) and math.isfinite(fdm) and fdm > 0
@@ -370,9 +368,10 @@ def scene_depth(frames, pose_by_index, depth_dir, center, proxy_m):
     return inverse_depth_field(points, proxy, center)
 
 
-def frame_gains(frames, pose_by_index, center, invd, wa):
+def frame_gains(frames, pose_by_index, center, invd, wa, lay=None):
     """(n_frames, 3) exposure gains, solved over overlaps at analysis scale."""
-    lay = render_layers([f[:2] for f in frames.values()], center, invd, wa)
+    if lay is None:
+        lay = render_layers([f[:2] for f in frames.values()], center, invd, wa)
     prior = exposure_prior([pose_by_index[i] for i in frames]) if pose_by_index else None
     gains = estimate_gains([x[0] for x in lay], [x[1] for x in lay], prior)
     log("gains " + " ".join(f"{i}:{g.mean():.2f}" for i, g in zip(frames, gains))
@@ -380,24 +379,24 @@ def frame_gains(frames, pose_by_index, center, invd, wa):
     return gains
 
 
-def build(width, frames_dir, poses, yaw_dir, pitch_sign, hfov_deg, power=2.0,
+def build(width, frames_dir, poses, yaw_dir, pitch_sign, hfov_deg,
           band_height=None, depth_dir=None, proxy_m=None):
-    """Reproject all frames into an equirect pano. Returns (pano, coverage%, mask).
+    """Reproject, compensate, seam and blend all frames into an equirect pano.
+    Returns (pano uint8, coverage %, hole mask uint8 255 = hole).
 
-    MEMORY (spec §10 R8). The pano is filled in horizontal row BANDS of
-    `band_height` rows, so the ray grid and accumulators are O(band) not
-    O(sphere); only the uint8 pano, the coverage mask and the prefiltered
-    frames are held whole.
+    Stages (spec §5.2 item 5): prefilter (load_frames) -> translation-aware
+    reprojection about the camera centroid (warp/depth) -> gains and graph-cut
+    seams on a small analysis pano (gains/seams) -> banded multi-band blend at
+    full width (blend).
 
-    Output is BIT-IDENTICAL to a single-band run: each equirect pixel's value
-    depends only on its own ray and the frames, accumulated in the same frame
-    order, so splitting the pixel set changes nothing.
+    MEMORY (spec §10 R8). Full-res work happens in row BANDS of ~band_height
+    rows (plus a pyramid margin), and each frame is only warped over the
+    patch its seam mask can influence, so transient arrays are O(band);
+    the uint8 pano, the coverage mask, the prefiltered frames and the
+    analysis-scale masks are the only whole-sphere allocations.
     """
     w = width
     h = width // 2
-    if band_height is None:
-        band_height = band_rows(w, h)
-    band_height = max(1, min(h, int(band_height)))
     proxy_m = DEFAULT_PROXY_DEPTH_M if proxy_m is None else proxy_m
 
     if poses is not None:
@@ -415,65 +414,81 @@ def build(width, frames_dir, poses, yaw_dir, pitch_sign, hfov_deg, power=2.0,
     frames = load_frames(frames_dir, indices, pose_by_index, angles, hfov_deg, w)
     if not frames:
         die_input(f"no usable frames found in {frames_dir}")
+    progress(5)
     # Pano centre = centroid of the camera positions: the user orbits the phone
     # on their arm, so the centroid is ~2x closer to every camera than shot 0.
     center = np.mean([f[1].o for f in frames.values()], axis=0)
     invd = scene_depth(frames, pose_by_index, depth_dir, center, proxy_m)
     log(f"center {np.round(center, 3).tolist()} proxy {proxy_m} m")
-    gains = frame_gains(frames, pose_by_index, center, invd, min(w, ANALYSIS_WIDTH))
+
+    wa = min(w, ANALYSIS_WIDTH)
+    lay = render_layers([f[:2] for f in frames.values()], center, invd, wa)
+    gains = frame_gains(frames, pose_by_index, center, invd, wa, lay)
+    seams = find_seams([x[0] for x in lay], gains, [x[1] for x in lay], [x[2] for x in lay])
+    seams = [s.astype(np.float32) for s in seams]  # bilinear-upsampled per band
+    del lay
+    progress(15)
+
+    levels = levels_for(w)
+    step = 1 << levels
+    rois = [roi_from_mask(s, w, h, step, 2 * step) for s in seams]
+    if band_height is None:
+        band_height = band_rows(w, h)
+    core = -(-max(1, int(band_height)) // step) * step
+    margin = MARGIN_STEPS * step
+    h_pad = -(-h // step) * step
 
     pano = np.zeros((h, w, 3), np.uint8)
     cover = np.zeros((h, w), np.uint8)
-    cols = np.arange(w)
-    n_bands = (h + band_height - 1) // band_height
-    steps = max(1, len(frames) * n_bands)
-    step = 0
-    covered_px = {i: 0 for i in frames}
-
-    for r0 in range(0, h, band_height):
-        r1 = min(h, r0 + band_height)
-        rows = np.arange(r0, r1)
-        dx, dy, dz = pano_rays(rows, cols, w, h)
-        band_invd = sample_field(invd, rows, cols, w, h)
-        accum = np.zeros((r1 - r0, w, 3), np.float32)
-        wsum = np.zeros((r1 - r0, w), np.float32)
-
-        for k, (i, (img, cam, is_pole, _)) in enumerate(frames.items()):
-            # Per-frame reprojection spans PROGRESS 5..70 across ALL bands
-            # (blend/inpaint/write take the rest — see main()).
-            progress(5 + 65 * step / steps)
-            step += 1
-            px, py, inb = project(cam, center, dx, dy, dz, band_invd)
-            hits = int(inb.sum())
-            covered_px[i] += hits
-            if hits == 0:
+    covered_px = dict.fromkeys(frames, 0)
+    starts = range(0, h, core)
+    for b, r0 in enumerate(starts):
+        progress(15 + 55 * b / len(starts))
+        R0, R1 = max(0, r0 - margin), min(h_pad, r0 + core + margin)
+        band = Band(R0, R1 - R0, w, levels)
+        for k, (i, (img, cam, _)) in enumerate(frames.items()):
+            if rois[k] is None:
                 continue
-            weight = (center_weight(cam, px, py) ** power) * inb
-            if is_pole:  # pole frames dominate their caps to avoid smeared bleed.
-                weight *= POLE_BOOST
-            accum += apply_gain(sample(img, px, py), gains[k]) * weight[:, :, None]
-            wsum += weight
-            del px, py, inb, weight
-
-        nz = wsum > 0
-        accum[nz] /= wsum[nz, None]
-        pano[r0:r1] = accum.astype(np.uint8)
-        cover[r0:r1] = nz
-        del dx, dy, dz, accum, wsum, nz
+            y0, y1, c0, c1, crop = rois[k]
+            y0, y1 = max(R0, y0), min(R1, y1)
+            if y0 >= y1:
+                continue
+            rows = np.minimum(np.arange(y0, y1), h - 1)  # h_pad rows replicate the last
+            cols = np.arange(c0, c1)
+            dx, dy, dz = pano_rays(rows, cols, w, h)
+            px, py, inb = project(cam, center, dx, dy, dz, sample_field(invd, rows, cols, w, h))
+            del dx, dy, dz
+            wt = sample_field(seams[k], rows, cols, w, h) * inb
+            if not wt.any():
+                continue
+            core_rows = (np.arange(y0, y1) >= r0) & (np.arange(y0, y1) < r0 + core)
+            covered_px[i] += int((wt[core_rows] > 0).sum())
+            band.add(apply_gain(sample(img, px, py), gains[k]), wt, y0, c0, crop)
+            del px, py, inb, wt
+        out, cov = band.collapse()
+        a = r0 - R0
+        n = min(core, h - r0)
+        # Coarse pyramid levels bleed low frequencies into uncovered pixels;
+        # holes must stay black and flagged so fill_holes owns them.
+        out = np.clip(out[a:a + n], 0, 255).astype(np.uint8)
+        out[~cov[a:a + n]] = 0
+        pano[r0:r0 + n] = out
+        cover[r0:r0 + n] = cov[a:a + n]
+        del band, out, cov
 
     # Per-frame coverage totals, reported once (not once per band).
     processed = 0
-    for i, (_, _, _, label) in frames.items():
+    for i, (_, _, label) in frames.items():
         if covered_px[i] == 0:
             log(f"frame {i}: 0 px")
             continue
         processed += 1
-        log(f"frame {i}: {label} covered {covered_px[i]} px")
+        log(f"frame {i}: {label} owns {covered_px[i]} px")
 
     if processed == 0:
         die_input(f"no usable frames found in {frames_dir}")
 
-    progress(70)  # reprojection done.
+    progress(70)  # reprojection + blend done.
     covpct = 100.0 * cover.mean()
     # Reuse the coverage buffer as the hole mask (covered 1 -> 0, hole 0 -> 255)
     # instead of allocating a bool temp + a uint8 temp + the scaled result: three

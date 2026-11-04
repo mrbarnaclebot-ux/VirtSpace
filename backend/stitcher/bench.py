@@ -31,6 +31,8 @@ from gains import apply_gain
 from warp import pano_rays, project, sample, sample_field
 
 NCC_WIN = 15  # local window (px at --width) for the gradient NCC
+NOISE_SIGMA = 1.5  # blur before gradients: dim-room sensor noise otherwise dominates
+EDGE_PCT = 80  # score only the strongest 20% of pano edges, where doubling shows
 NADIR_EXCLUDE_LAT = -70.0
 
 
@@ -48,7 +50,7 @@ def layers(args):
     gains = (R.frame_gains(frames, by_i, center, invd_field, min(w, R.ANALYSIS_WIDTH))
              if args.gains else np.ones((len(frames), 3), np.float32))
     out = []
-    for (img, cam, _, _), g in zip(frames.values(), gains):
+    for (img, cam, _), g in zip(frames.values(), gains):
         px, py, inb = project(cam, center, dx, dy, dz, invd)
         im = apply_gain(sample(img, px, py), g).astype(np.uint8)
         out.append((cv2.cvtColor(im, cv2.COLOR_BGR2GRAY).astype(np.float32), inb))
@@ -68,6 +70,7 @@ def overlap_err(lay):
 
 
 def grad(g):
+    g = cv2.GaussianBlur(g, (0, 0), NOISE_SIGMA)
     return cv2.magnitude(cv2.Sobel(g, cv2.CV_32F, 1, 0), cv2.Sobel(g, cv2.CV_32F, 0, 1))
 
 
@@ -91,7 +94,7 @@ def doubling(pano_path, lay, w):
         best = np.where(m, np.maximum(best, ncc), best)
         count += m
     lat = (0.5 - (np.arange(w // 2) + 0.5) / (w // 2)) * 180.0
-    textured = var_p > np.percentile(var_p, 50)  # flat walls carry no edge signal
+    textured = var_p > np.percentile(var_p, EDGE_PCT)  # flat walls carry no edge signal
     sel = (count >= 2) & textured & (lat > NADIR_EXCLUDE_LAT)[:, None]
     return 1.0 - float(best[sel].mean())
 

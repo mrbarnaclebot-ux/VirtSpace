@@ -13,6 +13,8 @@ Ray-grid convention (R17, see reproject.py): longitude grows with image-x and
 leans toward -X, i.e. dx = -cos(lat) sin(lon). Do not flip it.
 """
 
+from __future__ import annotations  # Cam's annotations: tests stub numpy out
+
 import math
 from typing import NamedTuple
 
