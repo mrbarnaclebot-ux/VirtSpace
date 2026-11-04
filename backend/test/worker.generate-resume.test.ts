@@ -14,6 +14,7 @@ import {
   type WorldGenProvider,
 } from '../src/provider/index.js';
 import { BudgetExceededError } from '../src/budget.js';
+import { MAX_DISPLAY_NAME } from '../src/provider/worldlabs.js';
 import { createMockProvider } from '../src/provider/mock.js';
 
 // spec §10 R1 / §14 — the worlds:generate double-bill window.
@@ -28,7 +29,7 @@ const instantClock: GenerationClock = { now: () => 0, sleep: async () => undefin
 
 const JOB_ID = 'job-abc';
 const WORLD_ID = 'world-row-1';
-const DISPLAY_NAME = generationDisplayName(JOB_ID, WORLD_ID);
+const DISPLAY_NAME = generationDisplayName(JOB_ID);
 
 function fakeProvider(overrides: Partial<WorldGenProvider> = {}): WorldGenProvider {
   return {
@@ -98,11 +99,19 @@ describe('generationDisplayName', () => {
   });
 
   it('is deterministic — the same job always produces the same name', () => {
-    expect(generationDisplayName(JOB_ID, WORLD_ID)).toBe(DISPLAY_NAME);
+    expect(generationDisplayName(JOB_ID)).toBe(DISPLAY_NAME);
   });
 
-  it('is unique per job, even for the same world', () => {
-    expect(generationDisplayName('job-2', WORLD_ID)).not.toBe(DISPLAY_NAME);
+  it('is unique per job', () => {
+    expect(generationDisplayName('job-2')).not.toBe(DISPLAY_NAME);
+  });
+
+  it('fits the provider 64-char display_name cap for real UUID job ids', () => {
+    const a = generationDisplayName('8c433317-8f78-4527-aeab-d8c558aeaccd');
+    const b = generationDisplayName('b936c74a-8b1c-4e7f-b0c4-c9eccc0ab83f');
+    expect(a.length).toBeLessThanOrEqual(MAX_DISPLAY_NAME);
+    expect(b.length).toBeLessThanOrEqual(MAX_DISPLAY_NAME);
+    expect(a).not.toBe(b);
   });
 });
 

@@ -1,5 +1,9 @@
 import { describe, it, expect } from 'vitest';
-import { createWorldLabsProvider, type FetchLike } from '../src/provider/worldlabs.js';
+import {
+  createWorldLabsProvider,
+  MAX_DISPLAY_NAME,
+  type FetchLike,
+} from '../src/provider/worldlabs.js';
 
 // Verifies worldlabs.ts shapes requests EXACTLY like the live-verified spike
 // (tools/spike/spike.py): endpoints, headers (WLT-Api-Key), and JSON bodies.
@@ -87,6 +91,16 @@ describe('worldlabs provider request shaping', () => {
     ]);
     const provider = createWorldLabsProvider({ apiKey: KEY, fetchImpl: fetch });
     expect(await provider.uploadPano(Buffer.from('X'), 'p.jpg')).toBe('ma_fallback');
+  });
+
+  it('generateWorld: refuses a display_name over the 64-char cap without calling fetch', async () => {
+    const { fetch, calls } = mockFetch([]);
+    const provider = createWorldLabsProvider({ apiKey: KEY, fetchImpl: fetch });
+
+    await expect(
+      provider.generateWorld('ma_123', 'marble-1.0-draft', 'x'.repeat(MAX_DISPLAY_NAME + 1)),
+    ).rejects.toThrow(/at most 64/);
+    expect(calls).toHaveLength(0);
   });
 
   it('generateWorld: exact worlds:generate body with is_pano + media_asset source', async () => {

@@ -20,6 +20,9 @@ import {
 const DEFAULT_BASE_URL = 'https://api.worldlabs.ai';
 const DEFAULT_TIMEOUT_MS = 120_000; // matches spike.py urlopen timeout=120.
 
+/** World Labs rejects a longer worlds:generate display_name with a 422. */
+export const MAX_DISPLAY_NAME = 64;
+
 // --- Asset download hardening (spec §10 R10) ---------------------------------
 //
 // getWorld() returns asset URLs chosen by the PROVIDER. downloadAsset used to
@@ -309,6 +312,11 @@ export function createWorldLabsProvider(opts: WorldLabsOptions): WorldGenProvide
     async generateWorld(mediaAssetId, model: WorldModel, displayName): Promise<string> {
       // worlds:generate (SPENDS CREDITS). NEVER retried internally — a resumed
       // worker resumes via the persisted operation_id instead (spec §14).
+      if (displayName.length > MAX_DISPLAY_NAME) {
+        throw new Error(
+          `display_name is ${displayName.length} chars; World Labs allows at most ${MAX_DISPLAY_NAME}`,
+        );
+      }
       const body = await requestJson<Record<string, unknown>>(
         'POST',
         '/marble/v1/worlds:generate',

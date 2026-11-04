@@ -388,13 +388,14 @@ export function isPendingOperationMarker(value: string | null | undefined): bool
  * Provider-side `display_name` for a generation: deterministic per job and
  * unique across jobs, because it is the ONLY key reconciliation has to decide
  * whether a job's generate call already spent credits. Derived from the job id
- * (uniqueness + traceability) and the world id (operator legibility) alone —
- * deliberately NOT from the user's title, which can change between attempts and
+ * alone (a UUID: unique + traceable) and kept short because World Labs caps
+ * display_name at 64 chars (`MAX_DISPLAY_NAME`; a longer name is a 422).
+ * Deliberately NOT from the user's title, which can change between attempts and
  * would make the same job unrecoverable (and would ship user text to the
  * provider for no benefit).
  */
-export function generationDisplayName(jobId: string, worldId: string): string {
-  return `VirtSpace world ${worldId} [job:${jobId}]`;
+export function generationDisplayName(jobId: string): string {
+  return `VirtSpace ${jobId}`;
 }
 
 export interface GenerationInput {
@@ -987,7 +988,7 @@ async function handleGenerate(
       model,
       // Deterministic + unique per job — it is the reconciliation key (§10 R1),
       // not a user-facing label, so the world's title is deliberately not used.
-      displayName: generationDisplayName(job.id, world.id),
+      displayName: generationDisplayName(job.id),
       cost,
       existingOperationId: job.providerOperationId,
     },
