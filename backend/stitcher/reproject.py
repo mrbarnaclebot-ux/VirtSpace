@@ -50,10 +50,8 @@ message text:
 """
 
 import argparse
-import json
 import math
 import os
-import re
 import sys
 
 import cv2
@@ -79,8 +77,16 @@ from depth import (  # noqa: E402
     proxy_field,
     read_depth_png,
 )
-from blend import MARGIN_STEPS, Band, levels_for, roi_from_mask  # noqa: E402
+from blend import MARGIN_STEPS, Band, band_rows, levels_for, roi_from_mask  # noqa: E402
+from fill import fill_holes, fill_nadir  # noqa: E402
 from gains import apply_gain, estimate_gains, exposure_prior  # noqa: E402
+from poses import (  # noqa: E402  (re-exported: tests use R.<name>)
+    count_frames,
+    load_poses,
+    nominal_angles,
+    nominal_pose,
+    pose_validation_error,
+)
 from seams import find_seams  # noqa: E402
 from warp import (  # noqa: E402
     Cam,
@@ -130,13 +136,6 @@ MAX_WIDTH = 8192
 # user-facing preview/save. --width can still ask for up to MAX_WIDTH.
 DEFAULT_WIDTH = 4096
 
-# Peak-RSS control (spec §10 R8). The full-res blend runs in horizontal row
-# BANDS of ~1 Mpx (256 rows at 4096) plus a pyramid margin, so ray grids,
-# warped patches and pyramid accumulators are O(band) not O(width^2). Measured
-# on the 28-frame 2026-09-17 capture (macOS peak RSS, which also counts freed
-# pages): ~0.98 GB at 4096, ~1.43 GB at 8192.
-BAND_TARGET_PIXELS = 1024 * 1024
-
 # --- Exit codes (see the module docstring; mirrored in src/worker.ts) ---------
 EXIT_INTERNAL_ERROR = 1
 EXIT_INPUT_ERROR = 2
@@ -174,12 +173,6 @@ def die_input(msg):
     die(msg, EXIT_INPUT_ERROR)
 
 
-def band_rows(width, height, target_pixels=BAND_TARGET_PIXELS):
-    """Rows per reprojection band for an equirect of `width` x `height`."""
-    rows = max(1, int(target_pixels) // max(1, int(width)))
-    return max(1, min(int(height), rows))
-
-
 def detect_image_format(path):
     """Container sniff from the leading magic bytes.
 
@@ -202,63 +195,6 @@ def detect_image_format(path):
     if len(head) >= 12 and head[4:8] == b"ftyp":
         return "heif" if head[8:12] in HEIF_BRANDS else "iso-bmff"
     return "unknown"
-
-
-# --- nominal capture geometry (fallback, no poses) --------------------------
-# Degrees. yaw = a RIGHTWARD turn about world up (see rmat), pitch about world
-# +X (positive looks down), roll about the forward axis.
-# horizon ring 0-7 at 45 deg apart, +45 pitch ring 8-11 at 90, -45 pitch 12-13
-# at 0/180, 14 zenith (up), 15 nadir (down).
-def nominal_pose(i, yaw_dir, pitch_sign):
-    if i < 8:
-        return (yaw_dir * i * 45.0, 0.0, 0.0)
-    if 8 <= i <= 11:
-        return (yaw_dir * (i - 8) * 90.0, pitch_sign * 45.0, 0.0)
-    if i == 12:
-        return (0.0, -pitch_sign * 45.0, 0.0)
-    if i == 13:
-        return (180.0, -pitch_sign * 45.0, 0.0)
-    if i == 14:
-        return (0.0, pitch_sign * 90.0, 0.0)  # zenith (up)
-    if i == 15:
-        return (0.0, -pitch_sign * 90.0, 0.0)  # nadir (down)
-    # Beyond the nominal 16 targets we have no angle; treat as horizon spillover.
-    return (yaw_dir * (i % 8) * 45.0, 0.0, 0.0)
-
-
-def nominal_angles(frame_count, yaw_dir, pitch_sign):
-    """Per-frame (yaw, pitch, roll) table for the pose-less fallback, selected
-    by capture pattern:
-
-      16 -> legacy layout (8 horizon @45 / 4 up @90 / 2 down / zenith / nadir)
-      28 -> densified layout, same order as the iOS TargetLayout:
-            12 horizon @30 / 8 up(+45) @45 / 6 down(-45) @60 / zenith / nadir
-      other -> WARN and evenly distribute a horizon-only ring.
-
-    pitch_sign follows the legacy convention (winning params use -1, i.e.
-    "up" rings get pitch_sign * 45).
-    """
-    if frame_count == 16:
-        return [nominal_pose(i, yaw_dir, pitch_sign) for i in range(16)]
-    if frame_count == 28:
-        angles = []
-        for i in range(12):  # horizon ring, every 30 deg
-            angles.append((yaw_dir * i * 30.0, 0.0, 0.0))
-        for i in range(8):  # upper ring (+45), every 45 deg
-            angles.append((yaw_dir * i * 45.0, pitch_sign * 45.0, 0.0))
-        for i in range(6):  # lower ring (-45), every 60 deg
-            angles.append((yaw_dir * i * 60.0, -pitch_sign * 45.0, 0.0))
-        angles.append((0.0, pitch_sign * 90.0, 0.0))  # zenith
-        angles.append((0.0, -pitch_sign * 90.0, 0.0))  # nadir
-        return angles
-    log(
-        f"WARN unknown capture pattern ({frame_count} frames) — "
-        "using an even horizon-only ring"
-    )
-    n = max(1, int(frame_count))
-    return [(yaw_dir * i * (360.0 / n), 0.0, 0.0) for i in range(n)]
-
-
 
 
 def load_frame(frames_dir, i):
@@ -506,166 +442,6 @@ def build(width, frames_dir, poses, yaw_dir, pitch_sign, hfov_deg,
     np.subtract(1, mask, out=mask)
     mask *= 255
     return pano, covpct, mask
-
-
-RELAX_ITERS = 150  # ~0.3 s at 512x512; the rim step is gone by ~100
-
-
-def push_pull_fill(img, hole, source):
-    """Fill `hole` pixels of img with a smooth membrane from the `source`
-    pixels: average them down a pyramid, then pull coarse values back up only
-    where finer levels have no data."""
-    wt = (source & ~hole).astype(np.float32)
-    acc = [img.astype(np.float32) * wt[:, :, None]]
-    wts = [wt]
-    while min(wts[-1].shape) > 4:
-        acc.append(cv2.pyrDown(acc[-1]))
-        wts.append(cv2.pyrDown(wts[-1]))
-    fill = acc[-1] / np.maximum(wts[-1], 1e-6)[:, :, None]
-    for a, w in zip(acc[-2::-1], wts[-2::-1]):
-        up = cv2.pyrUp(fill, dstsize=(w.shape[1], w.shape[0]))
-        # acc is premultiplied by w (in [0, 1]): top up the missing share.
-        fill = a + (1.0 - np.minimum(w, 1.0))[:, :, None] * up
-    # Push-pull alone leaves a step at the rim (the coarse average is not the
-    # rim value); a few Jacobi sweeps pin the membrane to its boundary.
-    out = img.astype(np.float32)
-    out[hole] = fill[hole]
-    for _ in range(RELAX_ITERS):
-        out[hole] = cv2.blur(out, (3, 3))[hole]  # neighbours outside are fixed
-    return np.clip(out, 0, 255).astype(img.dtype)
-
-
-def fill_nadir(pano, mask, cap_deg, size=512, ring_deg=10.0):
-    """Inpaint the nadir cap in a top-down polar view, then map it back.
-
-    Equirect Telea fills each column straight down to the pole, which reads as
-    a radial starburst on the floor. In an azimuthal view centred on the nadir
-    the cap is a plain disc surrounded by real floor, and a push-pull fill
-    interpolates it smoothly from the whole rim (Telea still streaks inward).
-    Clears the cap from `mask` so fill_holes leaves it alone.
-    """
-    if cap_deg <= 0:
-        return pano
-    h, w = pano.shape[:2]
-    rad = cap_deg + ring_deg  # polar view radius (deg from nadir)
-    yy, xx = np.mgrid[0:size, 0:size].astype(np.float32)
-    u, v = (xx - size / 2) / (size / 2), (yy - size / 2) / (size / 2)
-    r = np.sqrt(u * u + v * v) * rad
-    lon = np.arctan2(u, -v)
-    mx = ((lon / math.pi + 1) / 2 * w - 0.5).astype(np.float32)
-    my = ((0.5 - (r - 90.0) / 180.0) * h - 0.5).astype(np.float32)
-    polar = cv2.remap(pano, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_WRAP)
-    hole = (r < cap_deg + 0.5) | (cv2.remap(mask, mx, my, cv2.INTER_NEAREST) > 0)
-    hole &= r < rad
-    # Source = a thin rim only: a wide ring drags in whatever bright object
-    # sits nearby (the desk) and lifts the whole disc.
-    polar = push_pull_fill(polar, hole, r < cap_deg + 2.0)
-
-    r0 = int(math.floor((1.0 - cap_deg / 180.0) * h))  # first cap row
-    lat = 90.0 - (np.arange(r0, h) + 0.5) / h * 180.0
-    lon = ((np.arange(w) + 0.5) / w * 2 - 1) * math.pi
-    rr = ((90.0 + lat) / rad * (size / 2))[:, None]
-    px = (size / 2 + np.sin(lon)[None, :] * rr - 0.5).astype(np.float32)
-    py = (size / 2 - np.cos(lon)[None, :] * rr - 0.5).astype(np.float32)
-    pano[r0:] = cv2.remap(polar, px, py, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-    mask[r0:] = 0
-    return pano
-
-
-def fill_holes(pano, mask):
-    """Inpaint residual holes at reduced res (holes are large plain surfaces),
-    then composite the filled pixels back into the full-res pano.
-
-    Composites with `np.copyto(..., where=)` rather than `np.where(...)`: the
-    latter allocates a THIRD full-res image (100 MB at 8192x4096) while both
-    inputs are still live. The `where=` mask is materialised one row band at a
-    time for the same reason. `pano` is updated in place and also returned."""
-    h, w = pano.shape[:2]
-    if not mask.any():
-        # Full coverage — every pixel would composite back to itself. Skips a
-        # 2048-wide Telea inpaint and a full-res upscale for nothing.
-        return pano
-    sw = 2048
-    sh = sw * h // w
-    ps = cv2.resize(pano, (sw, sh))
-    ms = cv2.resize(mask, (sw, sh), interpolation=cv2.INTER_NEAREST)
-    ms = cv2.dilate(ms, np.ones((5, 5), np.uint8), iterations=1)
-    filled = cv2.inpaint(ps, ms, 7, cv2.INPAINT_TELEA)
-    del ps, ms
-    fu = cv2.resize(filled, (w, h))
-    for r0 in range(0, h, band_rows(w, h)):
-        r1 = min(h, r0 + band_rows(w, h))
-        np.copyto(pano[r0:r1], fu[r0:r1], where=(mask[r0:r1] > 0)[:, :, None])
-    return pano
-
-
-FRAME_NAME_RE = re.compile(r"^frame_\d+\.(jpg|jpeg|png)$", re.IGNORECASE)
-
-
-def count_frames(frames_dir):
-    """Number of frame_<i>.jpg/png files present, or None if unreadable."""
-    try:
-        return sum(1 for name in os.listdir(frames_dir) if FRAME_NAME_RE.match(name))
-    except OSError:
-        return None
-
-
-def load_poses(path):
-    """Load poses.json (the captures.poses_json array).
-
-    Returns (poses, None) on success or (None, reason) when the file is
-    missing/unreadable/malformed. Pose problems are NEVER fatal — the caller
-    WARNs and falls back to the nominal-angle path (a legacy client once
-    shipped zeroed intrinsics and hard-failing here burned every retry)."""
-    if not path:
-        return None, None
-    if not os.path.exists(path):
-        return None, f"poses file not found: {path}"
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, json.JSONDecodeError) as exc:
-        return None, f"failed to read poses: {exc}"
-    if not isinstance(data, list) or len(data) == 0:
-        return None, "poses.json must be a non-empty array"
-    return data, None
-
-
-def pose_validation_error(poses, frame_count=None):
-    """Return a human-readable reason when the pose array is unusable, else
-    None. Checks entry shape, transform (16 numbers), intrinsics (9 numbers
-    with positive fx/fy/cx/cy) and — when known — pose count vs frame count.
-    Mirrors everything build() would otherwise die on mid-run."""
-    if frame_count is not None and frame_count > 0 and len(poses) != frame_count:
-        return f"pose count {len(poses)} != frame count {frame_count}"
-    for p in poses:
-        if not isinstance(p, dict) or "transform" not in p or "index" not in p:
-            return "each pose needs at least 'index' and 'transform'"
-        try:
-            i = int(p["index"])
-        except (TypeError, ValueError):
-            return f"non-integer pose index {p.get('index')!r}"
-        t = p["transform"]
-        if not isinstance(t, (list, tuple)) or len(t) != 16:
-            return f"frame {i}: transform must have 16 elements"
-        try:
-            [float(x) for x in t]
-        except (TypeError, ValueError):
-            return f"frame {i}: non-numeric transform"
-        k = p.get("intrinsics")
-        if k is not None:
-            if not isinstance(k, (list, tuple)) or len(k) != 9:
-                return f"frame {i}: intrinsics must have 9 elements"
-            try:
-                # Convention-tolerant (row- or column-major) extraction; only
-                # when BOTH principal-point candidates are non-positive is the
-                # pose genuinely invalid.
-                fx, fy, cx, cy = intrinsics_fx_fy_cx_cy(k)
-            except (TypeError, ValueError):
-                return f"frame {i}: non-numeric intrinsics"
-            if fx <= 0 or fy <= 0 or cx <= 0 or cy <= 0:
-                return f"frame {i}: non-positive intrinsics"
-    return None
 
 
 def main(argv=None):

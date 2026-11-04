@@ -17,9 +17,23 @@ the pyramids is a multiple of 2**levels so all layers' levels line up.
 import cv2
 import numpy as np
 
+# Peak-RSS control (spec §10 R8). The full-res blend runs in horizontal row
+# BANDS of ~1 Mpx (256 rows at 4096) plus a pyramid margin, so ray grids,
+# warped patches and pyramid accumulators are O(band) not O(width^2). Measured
+# on the 28-frame 2026-09-17 capture (macOS peak RSS, which also counts freed
+# pages): ~0.98 GB at 4096, ~1.43 GB at 8192.
+BAND_TARGET_PIXELS = 1024 * 1024
+
+
 MAX_LEVELS = 5  # 32x at 4096: blend zone ~100 px (~8 deg), enough for exposure
 MIN_COARSE_COLS = 128  # fewer levels on narrow panos: same blend zone in DEGREES
 MARGIN_STEPS = 4  # band margin in coarsest-level cells; truncation error ~0
+
+
+def band_rows(width, height, target_pixels=BAND_TARGET_PIXELS):
+    """Rows per reprojection band for an equirect of `width` x `height`."""
+    rows = max(1, int(target_pixels) // max(1, int(width)))
+    return max(1, min(int(height), rows))
 
 
 def levels_for(width):
