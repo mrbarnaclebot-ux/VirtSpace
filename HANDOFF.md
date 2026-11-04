@@ -34,9 +34,13 @@ After a clean capture: rebase `refactor/r19-r15-capture-split` then `feat/captur
 **Verified test state (2026-11-04):** backend `tsc` clean, vitest **348 passed / 12 skipped** (skips = Postgres integration suites) with `STITCHER_TEST_PYTHON` set. iOS `feat/capture-v2`: **80/80** on a freshly erased iPhone 18 Pro simulator (iOS 27):
 `xcodebuild test -project VirtSpace/VirtSpace.xcodeproj -scheme VirtSpace -destination 'platform=iOS Simulator,name=iPhone 18 Pro'`
 
+## 2026-11-05: first capture-v2 device run (world `b936c74a`)
+
+Upload worked: 28 frames + 28 LiDAR depth maps (~22 KB each) in R2, stitch v2 ran with real depth. Draft generation then failed with a World Labs **422: `display_name` max 64 chars** (ours was 90; the limit is new since 09-17, so every capture was failing). Fixed in `2cf8506` (`VirtSpace <jobId>`, 46 chars, plus a pre-flight length guard in `generateWorld`), worker deployed, and the owner-approved manual re-queue (guarded single transaction on the direct host: world `failed_generating_draft` → `generating_draft` + one `generate_draft` job) reached `draft_ready`. The dead job's 150-credit reservation still counts against that UTC day's budget. There is still no in-app retry for `failed_generating_draft`.
+
 ## Open items
 
-- **Device capture with `feat/capture-v2`** (above), then merge both iOS branches. R16/R17/R18 also still unseen on the phone.
+- **Owner's verdict on the `b936c74a` capture** (phone flow + world quality), then merge both iOS branches. Add an in-app/ops retry for `failed_generating_draft`. R16/R17/R18 also still unseen on the phone.
 - **Stitcher residuals:** faint doubling on objects ≲0.5 m without LiDAR (overlap-based depth estimate deferred); a hard seam where content changed between shots (e.g. a playing monitor).
 - **Follow-ups:** split `CaptureEngine.swift` (620 lines: exposure/relocalization out); `MIGRATE_DATABASE_URL` on the direct Neon host, then `preDeploy: "node dist/migrate.js"` on api in `railway.ts`.
 - **Backlog (not started):** R24 real auth before sharing the app (P1); R25 background uploads (P1); rest of R26 (CI, deploy from a clean commit); R27 status-flip + enqueue atomicity; R28 pg pool error/timeouts, structured logs; R29 redirect SSRF; R30 `npm audit` (zod high); rest of R31 (WebGL process termination, caches in Application Support); R32 terms + consent screen, `fixture.spz` in Release, privacy manifest; R33 `STORAGE_DRIVER` default, PID 1, image size, pg `sslmode` warning; R35 modernisation (Spark 2.4, three r187, `worker.ts` 1328 lines, …).
