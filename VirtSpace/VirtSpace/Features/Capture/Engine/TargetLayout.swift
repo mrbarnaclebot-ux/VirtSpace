@@ -13,18 +13,23 @@
 //  the earlier 16-target ring (45° yaw spacing) proved too sparse. In portrait
 //  the iPhone main camera covers only ~50° horizontally, so a 45° step leaves
 //  barely ~5° of shared view between horizon neighbors — well under the ≥30%
-//  overlap the server stitcher needs, and the 2-frame down ring left a muddy,
-//  under-sampled band near the floor. The densified pattern fixes both:
-//    • Horizon ring — 12 shots every 30°. At ~50° HFOV a 30° step keeps ~20°
-//      (≈40% of the FOV) shared between neighbors, clearing the ≥30% gate.
-//    • Upper ring (+45°) — 8 shots every 45°. Latitude shrinks the great-circle
-//      spacing between neighbors, and each shot also overlaps 2–3 horizon shots
-//      vertically (vertical FOV ~64° portrait, ring separation 45°).
-//    • Lower ring (−45°) — 6 shots every 60°. Denser than the old 2-shot pair
-//      so the floor band is properly sampled instead of muddy.
+//  overlap the server stitcher needs.
+//    • Horizon ring — 12 shots every 30° (~40% of the FOV shared).
+//    • Upper ring (+45°) — 6 shots every 60°. Latitude shrinks the spacing
+//      and each shot also overlaps 2–3 horizon shots vertically.
+//    • Lower ring (−45°) — 8 shots every 45°. Rebalanced from 6 (R39): the
+//      floor matters more than the ceiling for a walkable world, and 60°
+//      steps left the down ring at only ~20% overlap.
 //    • Explicit zenith + nadir close the poles for true full-sphere coverage.
-//  Total: 12 + 8 + 6 + 2 = 28 targets. The backend accepts any frame_count
-//  (poses schema caps at 64), so no server change is needed.
+//  Total: 12 + 6 + 8 + 2 = 28 targets.
+//
+//  Capture order is COLUMN order (R39): one sweep around, taking whichever
+//  ring targets share a yaw step together (up / horizon / down), then the
+//  poles. Ring-by-ring meant three full body rotations — three chances to
+//  drift off the pivot. Column order over "any aligned target fires" because
+//  it keeps the HUD at one current target, one chevron and one label; any-
+//  order would need the HUD to choose and explain which of several targets
+//  to aim for.
 //
 
 import Foundation
@@ -32,8 +37,7 @@ import simd
 
 /// One aim-point in the guided capture sphere.
 struct CaptureTarget: Identifiable, Hashable {
-    /// Capture order: 0…11 horizon ring, 12…19 up ring, 20…25 down ring,
-    /// 26 zenith, 27 nadir.
+    /// Capture order (column sweep, then Sky, then Ground) — see TargetLayout.
     let index: Int
     /// Unit direction in the heading frame (-Z forward, +Y up, +X right).
     let direction: simd_float3
@@ -52,79 +56,76 @@ struct CaptureTarget: Identifiable, Hashable {
 nonisolated enum TargetLayout {
     // MARK: - Shape of the pattern (single source of truth)
 
-    /// Target counts per group, in capture order: horizon ring, upper ring,
-    /// lower ring, poles. EVERYTHING else in the layout — the targets, the
-    /// total, the ring boundaries the HUD/haptics celebrate — derives from
-    /// this. The 16→28 densification left the ring-completion haptics firing
-    /// at the dead literals 7/11/13 (mid-ring in the new pattern) precisely
-    /// because those indices were hardcoded elsewhere; deriving them here
-    /// means the next pattern change can't silently desync (spec §10 R12).
-    static let groupSizes: [Int] = [12, 8, 6, 2]
+    /// The three rings: pitch, target count (yaw step = 360 / count), label.
+    /// EVERYTHING else — the targets, the total, the celebration haptics, the
+    /// progress sphere's facets — derives from this (spec §10 R12: hardcoded
+    /// indices elsewhere silently desynced on the last pattern change).
+    static let rings: [(pitchDegrees: Double, count: Int, label: String)] = [
+        (0, 12, "Horizon"),
+        (45, 6, "Up"),
+        (-45, 8, "Down")
+    ]
 
-    static var horizonCount: Int { groupSizes[0] }
-    static var upperCount: Int { groupSizes[1] }
-    static var lowerCount: Int { groupSizes[2] }
-    static var poleCount: Int { groupSizes[3] }
+    static func ringCount(atPitch pitch: Double) -> Int? {
+        rings.first { $0.pitchDegrees == pitch }?.count
+    }
+
+    /// Sky + Ground.
+    static let poleCount = 2
 
     /// Total targets in the pattern (28 today).
-    static var targetCount: Int { groupSizes.reduce(0, +) }
+    static var targetCount: Int { rings.reduce(0) { $0 + $1.count } + poleCount }
 
-    /// Index of the LAST target of each group — the running sums of
-    /// `groupSizes`, minus one: [11, 19, 25, 27] for the 28-target pattern.
-    static var ringBoundaryIndices: [Int] {
-        var running = 0
-        return groupSizes.map { size in
-            running += size
-            return running - 1
-        }
-    }
+    /// Index of the last ring target: the sweep around is complete.
+    static var sweepEndIndex: Int { targetCount - poleCount - 1 }
 
-    /// Ring boundaries that earn a "ring complete" celebration haptic: every
-    /// boundary except the final target, whose completion is announced by the
-    /// end-of-capture success haptic the engine fires with `.finished`.
-    static var ringCompletionIndices: Set<Int> {
-        Set(ringBoundaryIndices.dropLast())
-    }
+    /// Shots that earn a celebration haptic: the end of the sweep. In column
+    /// order all three rings finish within the sweep's last few shots, so
+    /// per-ring celebrations would fire back to back. The final target's
+    /// completion is the engine's end-of-capture success haptic.
+    static var celebrationIndices: Set<Int> { [sweepEndIndex] }
 
     // MARK: - Targets
 
-    /// The 28-frame capture pattern, in capture order: 12 horizon shots
-    /// (every 30°), 8 at pitch +45° (every 45°), 6 at pitch −45° (every 60°),
-    /// zenith, nadir. Ring yaw steps are 360° / ring size, so the ring sizes
-    /// above fully determine the pattern.
+    /// The 28-frame pattern in capture order: ring targets sorted by yaw;
+    /// within one yaw step, nearest pitch to the previous shot first (ties go
+    /// up), so each column is one tilt; then Sky, then Ground.
     static func targets() -> [CaptureTarget] {
-        var result: [CaptureTarget] = []
-        var index = 0
-
-        func add(pitch: Double, yaw: Double, label: String) {
-            result.append(CaptureTarget(
-                index: index,
-                direction: direction(pitchDegrees: pitch, yawDegrees: yaw),
-                pitchDegrees: pitch,
-                yawDegrees: yaw,
-                label: label
-            ))
-            index += 1
-        }
-
-        func addRing(pitch: Double, count: Int, labelPrefix: String) {
-            let step = 360 / Double(count)
-            for i in 0..<count {
-                add(pitch: pitch, yaw: Double(i) * step, label: "\(labelPrefix) \(i + 1)")
+        typealias Spot = (pitch: Double, yaw: Double, label: String)
+        var spots: [Spot] = []
+        for ring in rings {
+            let step = 360 / Double(ring.count)
+            for i in 0..<ring.count {
+                spots.append((ring.pitchDegrees, Double(i) * step, "\(ring.label) \(i + 1)"))
             }
         }
 
-        // Horizon ring — 12 shots, every 30° of yaw.
-        addRing(pitch: 0, count: horizonCount, labelPrefix: "Horizon")
-        // Upper ring — 8 shots at +45°, every 45° of yaw.
-        addRing(pitch: 45, count: upperCount, labelPrefix: "Up")
-        // Lower ring — 6 shots at −45°, every 60° of yaw.
-        addRing(pitch: -45, count: lowerCount, labelPrefix: "Down")
-        // Poles.
-        add(pitch: 90, yaw: 0, label: "Sky")
-        add(pitch: -90, yaw: 0, label: "Ground")
+        var ordered: [Spot] = []
+        var lastPitch = 0.0 // target 0 is the horizon straight ahead
+        let columns = Dictionary(grouping: spots) { $0.yaw }.sorted { $0.key < $1.key }
+        for (_, column) in columns {
+            var remaining = column
+            while !remaining.isEmpty {
+                let pick = remaining.indices.min { a, b in
+                    let da = abs(remaining[a].pitch - lastPitch), db = abs(remaining[b].pitch - lastPitch)
+                    return da != db ? da < db : remaining[a].pitch > remaining[b].pitch
+                }!
+                lastPitch = remaining[pick].pitch
+                ordered.append(remaining.remove(at: pick))
+            }
+        }
+        ordered.append((90, 0, "Sky"))
+        ordered.append((-90, 0, "Ground"))
 
-        return result
+        return ordered.enumerated().map { index, spot in
+            CaptureTarget(
+                index: index,
+                direction: direction(pitchDegrees: spot.pitch, yawDegrees: spot.yaw),
+                pitchDegrees: spot.pitch,
+                yawDegrees: spot.yaw,
+                label: spot.label
+            )
+        }
     }
 
     /// Unit vector for a pitch/yaw pair in the heading frame.

@@ -15,19 +15,21 @@ import simd
 
 @Suite("TargetLayout")
 struct TargetLayoutTests {
-    @Test("Densified pattern is 12 horizon + 8 up + 6 down + 2 poles")
+    @Test("Rebalanced pattern is 12 horizon + 6 up + 8 down + 2 poles")
     func patternShape() {
         let targets = TargetLayout.targets()
         #expect(targets.count == 28)
         #expect(TargetLayout.targetCount == 28)
         #expect(targets.filter { $0.pitchDegrees == 0 }.count == 12)
-        #expect(targets.filter { $0.pitchDegrees == 45 }.count == 8)
-        #expect(targets.filter { $0.pitchDegrees == -45 }.count == 6)
+        #expect(targets.filter { $0.pitchDegrees == 45 }.count == 6)
+        #expect(targets.filter { $0.pitchDegrees == -45 }.count == 8)
         #expect(targets.filter { $0.pitchDegrees == 90 }.count == 1)
         #expect(targets.filter { $0.pitchDegrees == -90 }.count == 1)
+        // Every ring position appears exactly once.
+        #expect(Set(targets.map(\.label)).count == 28)
     }
 
-    @Test("Targets are unit vectors in capture order")
+    @Test("Targets are unit vectors; target 0 is the horizon straight ahead; poles last")
     func directions() {
         let targets = TargetLayout.targets()
         #expect(targets.allSatisfy { abs(simd_length($0.direction) - 1) < 1e-4 })
@@ -37,34 +39,37 @@ struct TargetLayoutTests {
         #expect(simd_length(targets[27].direction - simd_float3(0, -1, 0)) < 1e-4)
     }
 
-    @Test("Horizon neighbours sit 30° apart")
-    func horizonSpacing() {
-        let targets = TargetLayout.targets()
-        let spacing = AlignmentMath.angularDistanceDegrees(targets[0].direction, targets[1].direction)
-        #expect(abs(spacing - 30) < 0.01)
+    @Test("Column order: one sweep, yaw never goes backwards before the poles")
+    func columnOrder() {
+        let sweep = TargetLayout.targets().prefix(TargetLayout.sweepEndIndex + 1)
+        let yaws = sweep.map(\.yawDegrees)
+        #expect(yaws == yaws.sorted())
+        // The first column is horizon, then up, then down (nearest pitch first,
+        // ties go up); a two-target column follows from the previous pitch.
+        #expect(sweep.prefix(3).map(\.pitchDegrees) == [0, 45, -45])
+        let at60 = sweep.filter { $0.yawDegrees == 60 }.map(\.pitchDegrees)
+        #expect(at60 == [0, 45]) // coming from the down ring at 45°: horizon first
     }
 
-    @Test("Ring boundaries are derived from the ring sizes, not literals")
-    func ringBoundaries() {
-        // Running sums of [12, 8, 6, 2], minus one.
-        #expect(TargetLayout.ringBoundaryIndices == [11, 19, 25, 27])
-        // The final target is excluded: its completion is the end-of-capture
-        // success haptic, not a ring celebration.
-        #expect(TargetLayout.ringCompletionIndices == [11, 19, 25])
-        // The dead 16-target layout's indices must NOT fire any more — this is
-        // the exact R12 bug: 7/11/13 survived the 16→28 densification.
-        #expect(!TargetLayout.ringCompletionIndices.contains(7))
-        #expect(!TargetLayout.ringCompletionIndices.contains(13))
-    }
-
-    @Test("Each ring boundary really is the last target of its ring")
-    func boundariesMatchRings() {
+    @Test("Ring neighbours are 360 / ring size apart")
+    func ringSpacing() {
         let targets = TargetLayout.targets()
-        for boundary in TargetLayout.ringBoundaryIndices {
-            let next = boundary + 1
-            guard next < targets.count else { continue }
-            // The target after a boundary starts a different ring (pitch changes).
-            #expect(targets[boundary].pitchDegrees != targets[next].pitchDegrees)
+        func spacing(_ prefix: String) -> Double {
+            let a = targets.first { $0.label == "\(prefix) 1" }!
+            let b = targets.first { $0.label == "\(prefix) 2" }!
+            return b.yawDegrees - a.yawDegrees
         }
+        #expect(spacing("Horizon") == 30)
+        #expect(spacing("Up") == 60)
+        #expect(spacing("Down") == 45)
+    }
+
+    @Test("Celebrations are derived: the sweep's last shot, never the final one")
+    func celebrations() {
+        let targets = TargetLayout.targets()
+        #expect(TargetLayout.sweepEndIndex == 25)
+        #expect(TargetLayout.celebrationIndices == [25])
+        #expect(targets[TargetLayout.sweepEndIndex + 1].label == "Sky")
+        #expect(!TargetLayout.celebrationIndices.contains(TargetLayout.targetCount - 1))
     }
 }

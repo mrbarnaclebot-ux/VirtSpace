@@ -137,12 +137,10 @@ nonisolated final class ShotPipeline: @unchecked Sendable {
         paint(still, index: index)
 
         Self.shotHaptic()
-        // Ring-completion celebrations, derived from TargetLayout's ring sizes
-        // (11 / 19 / 25 in today's 28-target pattern). These used to be the
-        // literals 7/11/13 from the dead 16-target layout, so two of the three
-        // fired mid-ring and the horizon ring never celebrated at all. The
-        // final shot's success haptic is the engine's, with `.finished`.
-        if TargetLayout.ringCompletionIndices.contains(index) {
+        // Sweep-complete celebration, derived from TargetLayout (R12: these
+        // were once dead literals from an older pattern). The final shot's
+        // success haptic is the engine's, with `.finished`.
+        if TargetLayout.celebrationIndices.contains(index) {
             Self.celebrationHaptic()
         }
 

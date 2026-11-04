@@ -4,11 +4,12 @@
 //
 //  The "filling sphere" progress hero (spec §6.1: progress as a filling
 //  sphere, not just "1 of 28"). A stylized 2D azimuthal projection of the
-//  Phase 0.5 densified 28-target pattern drawn with Canvas: an outer band of
-//  12 facets (horizon ring, 30°), a middle band of 8 (upper ring, 45°), an
-//  inner band of 6 (down ring, 60°) and a center core split into Sky (top
-//  half) and Ground (bottom half). Facets light up as their target is
-//  captured; the current target's facet carries a brighter rim.
+//  capture pattern drawn with Canvas: an outer band for the horizon ring, a
+//  middle band for the upper ring, an inner band for the down ring and a
+//  center core split into Sky (top half) and Ground (bottom half). Facets are
+//  derived from TargetLayout (capture order is a column sweep, so a target's
+//  index says nothing about its ring); they light up as their target is
+//  captured, and the current target's facet carries a brighter rim.
 //
 
 import SwiftUI
@@ -42,36 +43,28 @@ struct ProgressSphereView: View {
         let endDegrees: Double
     }
 
-    /// The 28 facets, indexed like TargetLayout: 0…11 horizon, 12…19 up,
-    /// 20…25 down, 26 sky, 27 ground.
-    private static let facets: [Facet] = {
-        var facets: [Facet] = []
+    /// One facet per TargetLayout target, placed by its pitch band and yaw.
+    private static let facets: [Facet] = TargetLayout.targets().map { target in
         let gap = 4.0 // degrees between facets
-        // Horizon ring — 12 facets every 30°, outer band.
-        for i in 0..<12 {
-            let start = Double(i) * 30 - 15
-            facets.append(Facet(index: i, innerRadius: 0.76, outerRadius: 1.0,
-                                startDegrees: start + gap / 2, endDegrees: start + 30 - gap / 2))
+        switch target.pitchDegrees {
+        case 90:
+            return Facet(index: target.index, innerRadius: 0, outerRadius: 0.18,
+                         startDegrees: -90 + gap, endDegrees: 90 - gap)
+        case -90:
+            return Facet(index: target.index, innerRadius: 0, outerRadius: 0.18,
+                         startDegrees: 90 + gap, endDegrees: 270 - gap)
+        default:
+            let (inner, outer): (CGFloat, CGFloat) = switch target.pitchDegrees {
+            case 0: (0.76, 1.0)
+            case let p where p > 0: (0.5, 0.7)
+            default: (0.26, 0.44)
+            }
+            let width = 360 / Double(TargetLayout.ringCount(atPitch: target.pitchDegrees) ?? 1)
+            return Facet(index: target.index, innerRadius: inner, outerRadius: outer,
+                         startDegrees: target.yawDegrees - width / 2 + gap / 2,
+                         endDegrees: target.yawDegrees + width / 2 - gap / 2)
         }
-        // Upper ring — 8 facets every 45°, middle band.
-        for i in 0..<8 {
-            let start = Double(i) * 45 - 22.5
-            facets.append(Facet(index: 12 + i, innerRadius: 0.5, outerRadius: 0.7,
-                                startDegrees: start + gap / 2, endDegrees: start + 45 - gap / 2))
-        }
-        // Lower ring — 6 facets every 60°, inner band.
-        for i in 0..<6 {
-            let start = Double(i) * 60 - 30
-            facets.append(Facet(index: 20 + i, innerRadius: 0.26, outerRadius: 0.44,
-                                startDegrees: start + gap / 2, endDegrees: start + 60 - gap / 2))
-        }
-        // Sky = top half of the core, Ground = bottom half.
-        facets.append(Facet(index: 26, innerRadius: 0, outerRadius: 0.18,
-                            startDegrees: -90 + gap, endDegrees: 90 - gap))
-        facets.append(Facet(index: 27, innerRadius: 0, outerRadius: 0.18,
-                            startDegrees: 90 + gap, endDegrees: 270 - gap))
-        return facets
-    }()
+    }
 
     private func draw(in context: inout GraphicsContext, size: CGSize) {
         let center = CGPoint(x: size.width / 2, y: size.height / 2)
