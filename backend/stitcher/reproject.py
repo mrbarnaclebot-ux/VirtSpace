@@ -5,7 +5,7 @@ Ports the gate-winning rotation-only reprojection spike into a production CLI.
 Given a directory of ARKit-native landscape frames (and, optionally, the
 per-frame ARKit poses), it rotates each frame upright, reprojects it onto an
 equirectangular sphere using the camera orientation, feather-blends the
-overlaps, inpaints the residual holes and writes an 8192x4096 (2:1) pano.
+overlaps, inpaints the residual holes and writes a 4096x2048 (2:1) pano by default.
 
 Two orientation modes:
 
@@ -34,7 +34,7 @@ Coordinate conventions (derived in full in ARKIT_TO_PROJ and build()):
 
 Usage:
   reproject.py --frames-dir DIR --out pano.jpg [--poses poses.json]
-               [--width 8192] [--preview-out pano_preview.jpg]
+               [--width 4096] [--preview-out pano_preview.jpg]
 
 On success: prints progress lines to stdout and exits 0.
 On failure: prints a message to stderr and exits one of the EXIT_* codes below.
@@ -87,10 +87,15 @@ REMAP_CHUNK = 8192  # cv2.remap 2D grid width cap (stay under SHRT_MAX).
 POLE_LAT_DEG = 60.0  # frames looking steeper than this get the pole weight boost.
 POLE_BOOST = 8.0
 
-# Hard ceiling on --width. 8192 is the product's pano width (spec §5); anything
+# Hard ceiling on --width. 8192 was the original product width (spec §5); anything
 # larger is a misconfiguration that would blow the worker's memory budget, so we
 # refuse it up front instead of discovering it via an OOM-kill.
 MAX_WIDTH = 8192
+
+# Default output width (spec §10 R40): Marble recommends 2560 and returns
+# 2560x1280, so 8192 only cost stitch time and memory; 4096 keeps a decent
+# user-facing preview/save. --width can still ask for up to MAX_WIDTH.
+DEFAULT_WIDTH = 4096
 
 # Peak-RSS control. The equirect is filled in horizontal row BANDS: the ray grid
 # and the accumulators are sized per band instead of per sphere, so memory is
@@ -617,7 +622,7 @@ def main(argv=None):
     ap.add_argument("--out", required=True, help="output pano.jpg path")
     ap.add_argument("--poses", default=None, help="optional poses.json (captures.poses_json array)")
     ap.add_argument(
-        "--width", type=int, default=MAX_WIDTH,
+        "--width", type=int, default=DEFAULT_WIDTH,
         help=f"pano width (height = width/2), even, max {MAX_WIDTH}",
     )
     ap.add_argument("--preview-out", default=None, help="optional 2000x1000 preview jpg path")
