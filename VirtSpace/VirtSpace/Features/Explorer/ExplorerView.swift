@@ -2,80 +2,71 @@
 //  ExplorerView.swift
 //  VirtSpace
 //
-//  Stage C: the full-screen immersive 3D world explorer (spec §6.4). A
-//  WKWebView runs the bundled Spark viewer; native SwiftUI provides only the
-//  chrome — a "Preparing your world…" loading ring (SplatCache download → the
-//  in-page render progress bridge), an error state with Retry, a top-left close
-//  X matching the capture chrome, and a first-run coach-mark overlay. Status
-//  bar hidden and the idle timer disabled while presented.
-//
-//  Nav controls (joystick + drag-to-look) live inside the web page — a native→JS
-//  bridge at 60 fps is too laggy (spec §3.1, §9).
+//  Explore in 3D (ui-spec 4.7): a full-screen WKWebView running the bundled
+//  Spark viewer (ExplorerWebView), with native chrome on top. The cover owns
+//  the whole loading arc: one screen, two labelled steps (download, then
+//  open; ExplorerLoadPhase). Also an error state with one recovery button, a
+//  glass close button plus the space title, and a one-time coach anchored
+//  above the in-page joystick. Always dark; status bar hidden and the idle
+//  timer off while presented.
 //
 
 import OSLog
 import SwiftUI
-import WebKit
 
 struct ExplorerView: View {
-    /// Where the world's SPZ comes from. `.file` is already local (bundled
-    /// fixture or a pre-downloaded world); `.remote` is fetched via SplatCache
-    /// with the loading ring.
+    /// Where the space's file comes from. `.file` is already local (bundled
+    /// fixture or pre-downloaded); `.remote` downloads through SplatCache as
+    /// step 1 of the loading screen.
     enum SplatSource: Equatable {
         case file(URL)
         case remote(worldId: String, version: Int, tier: String, url: URL)
     }
 
     let source: SplatSource
-    var title: String = "3D World"
+    let title: String
 
     @Environment(\.dismiss) private var dismiss
 
-    private enum Phase: Equatable {
-        case preparing(Double)   // SplatCache download (remote) — fraction or 0 if unknown
-        case rendering(Double)   // WebView up, splats streaming — in-page bridge
-        case ready
-        case failed(String)
-    }
-
-    @State private var phase: Phase = .preparing(0)
+    @State private var phase = ExplorerLoadPhase.start
     @State private var splatFileURL: URL?
     @State private var reloadToken = 0
-    @State private var showCoach = false
+    @State private var showCoach: Bool
+    @State private var stickFrame: CGRect?
 
-    private static let coachKey = "explorer.coachSeen.v1"
+    static let coachKey = "explorer.coachSeen.v1"
+
+    init(source: SplatSource, title: String = "") {
+        self.source = source
+        self.title = title
+        _showCoach = State(initialValue: !UserDefaults.standard.bool(forKey: Self.coachKey))
+    }
 
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
-
             if let splatFileURL {
-                ExplorerWebView(
-                    splatURL: splatFileURL,
-                    onProgress: { p in
-                        if case .rendering = phase { phase = .rendering(p) }
-                        else if !isReady { phase = .rendering(p) }
-                    },
-                    onLoaded: { phase = .ready },
-                    onError: { message in phase = .failed(message) },
-                    onInteraction: { dismissCoach() }
-                )
-                .id(reloadToken)
-                .ignoresSafeArea()
+                ExplorerWebView(splatURL: splatFileURL, onMessage: handle)
+                    .id(reloadToken)
+                    .ignoresSafeArea()
             }
-
-            if !isReady && !isFailed {
-                loadingOverlay
+            if phase.isLoading {
+                ExplorerLoadingView(phase: phase)
+                    .transition(.opacity)
             }
-            if case .failed(let message) = phase {
-                errorOverlay(message)
+            if case .failed(let failure) = phase {
+                ViewerErrorView(title: failure.title, message: failure.message,
+                                buttonTitle: failure.buttonTitle, action: reload)
+                    .transition(.opacity)
             }
-            if showCoach && isReady {
-                coachOverlay
+            if showCoach && phase == .ready {
+                ExplorerCoach(stickFrame: stickFrame)
+                    .transition(.opacity)
             }
-
-            closeButton
+            topBar
         }
+        .animation(Theme.Motion.standard, value: phase)
+        .preferredColorScheme(.dark)
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
         .task(id: reloadToken) { await prepare() }
@@ -83,8 +74,24 @@ struct ExplorerView: View {
         .onDisappear { UIApplication.shared.isIdleTimerDisabled = false }
     }
 
-    private var isReady: Bool { phase == .ready }
-    private var isFailed: Bool { if case .failed = phase { return true }; return false }
+    private var topBar: some View {
+        HStack(spacing: Theme.Space.s) {
+            ViewerIconButton(systemName: "xmark", label: "Close") { dismiss() }
+            if !title.isEmpty {
+                Text(title)
+                    .font(.headline)
+                    .lineLimit(1)
+                    .padding(.horizontal, Theme.Space.m)
+                    .frame(minHeight: Theme.minTarget)
+                    .glassEffect(.regular, in: .capsule)
+                    .accessibilityAddTraits(.isHeader)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, Theme.Space.m)
+        .padding(.top, Theme.Space.s)
+        .frame(maxHeight: .infinity, alignment: .top)
+    }
 
     // MARK: - Load
 
@@ -92,311 +99,163 @@ struct ExplorerView: View {
         switch source {
         case .file(let url):
             splatFileURL = url
-            if case .preparing = phase { phase = .rendering(0) }
+            phase = phase.applying(.downloaded)
         case .remote(let worldId, let version, let tier, let url):
             do {
-                let local = try await SplatCache.shared.ensure(
-                    worldId: worldId, version: version, tier: tier, remoteURL: url
-                ) { p in
-                    Task { @MainActor in
-                        if case .preparing = phase { phase = .preparing(p) }
+                splatFileURL = try await SplatCache.shared.ensure(
+                    worldId: worldId, version: version, tier: tier, remoteURL: url,
+                    bytes: { received, expected in
+                        Task { @MainActor in report(.downloadProgress(received, expected)) }
                     }
-                }
-                splatFileURL = local
-                phase = .rendering(0)
+                )
+                report(.downloaded)
             } catch {
-                phase = .failed((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+                guard !Task.isCancelled else { return }
+                AppLog.viewer.error("Explorer download failed: \(error.localizedDescription, privacy: .public)")
+                report(.failed(ViewerErrorCopy.message(for: error)))
             }
         }
     }
 
-    private func retry() {
-        phase = .preparing(0)
+    private func report(_ event: ExplorerEvent) {
+        phase = phase.applying(event)
+    }
+
+    private func handle(_ message: ExplorerWebView.Message) {
+        switch message {
+        case .phase(let event): report(event)
+        case .interaction: dismissCoach()
+        case .stickFrame(let frame): stickFrame = frame
+        }
+    }
+
+    /// Error-state button: a fresh web view and, if needed, a fresh download.
+    private func reload() {
+        phase = .start
         splatFileURL = nil
         reloadToken += 1
     }
 
-    // MARK: - Coach marks
-
     private func dismissCoach() {
         guard showCoach else { return }
-        showCoach = false
+        withAnimation(Theme.Motion.exit) { showCoach = false }
         UserDefaults.standard.set(true, forKey: Self.coachKey)
     }
+}
 
-    // MARK: - Overlays
+// MARK: - Loading
 
-    private var loadingOverlay: some View {
-        ZStack {
-            Color.black.opacity(0.001) // keep it above the (transparent) webview
-            VStack(spacing: 20) {
-                ProgressRing(progress: loadingFraction)
-                    .frame(width: 66, height: 66)
-                Text("Preparing your world…")
-                    .font(.headline)
-                    .foregroundStyle(.white)
-                Text(loadingDetail)
-                    .font(.footnote)
-                    .foregroundStyle(.white.opacity(0.6))
+/// "Opening your space" with the two steps. The current step shows its own
+/// bar (determinate when measured) and the other step a done or waiting mark.
+private struct ExplorerLoadingView: View {
+    let phase: ExplorerLoadPhase
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Theme.Space.m) {
+            Text(ExplorerLoadPhase.title)
+                .font(.title2.bold())
+            stepRow(1, label: phase.downloadLabel)
+            stepRow(2, label: ExplorerLoadPhase.openingLabel)
+        }
+        .padding(Theme.Space.l)
+        .frame(maxWidth: 360)
+        .padding(Theme.Space.m)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color.black.opacity(0.001)) // stays above the transparent web view
+    }
+
+    private func stepRow(_ step: Int, label: String) -> some View {
+        let current = phase.step ?? 0
+        let state: StepState = step < current ? .done : (step == current ? .active : .waiting)
+        return VStack(alignment: .leading, spacing: Theme.Space.xs) {
+            HStack(spacing: Theme.Space.s) {
+                marker(state)
+                    .frame(width: 24)
+                Text(label)
+                    .font(.body)
+                    .monospacedDigit()
+                    .contentTransition(reduceMotion ? .identity : .numericText())
+                    .foregroundStyle(state == .waiting ? Theme.textSecondary : Theme.textPrimary)
+            }
+            if state == .active, let fraction = phase.fraction {
+                ProgressView(value: fraction)
+                    .tint(Theme.accent)
+                    .animation(Theme.Motion.standard, value: fraction)
+                    .padding(.leading, 24 + Theme.Space.s)
             }
         }
-        .transition(.opacity)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(label)
+        .accessibilityValue(state.spoken)
     }
 
-    private var loadingFraction: Double {
-        switch phase {
-        case .preparing(let p): return p
-        case .rendering(let p): return p
-        default: return 0
+    @ViewBuilder
+    private func marker(_ state: StepState) -> some View {
+        switch state {
+        case .done:
+            Image(systemName: "checkmark.circle.fill").foregroundStyle(Theme.success)
+        case .active:
+            ViewerSpinner()
+        case .waiting:
+            Image(systemName: "circle").foregroundStyle(Theme.textTertiary)
         }
     }
 
-    private var loadingDetail: String {
-        switch phase {
-        case .preparing: return "Downloading"
-        case .rendering: return "Rendering splats"
-        default: return ""
-        }
-    }
+    private enum StepState {
+        case done, active, waiting
 
-    private func errorOverlay(_ message: String) -> some View {
-        VStack(spacing: 18) {
-            Image(systemName: "exclamationmark.triangle")
-                .font(.system(size: 44, weight: .light))
-                .foregroundStyle(.orange)
-            Text("Couldn't open this world")
-                .font(.title3.weight(.bold))
-                .foregroundStyle(.white)
-            Text(message)
-                .font(.subheadline)
-                .foregroundStyle(.white.opacity(0.65))
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, 40)
-            Button {
-                retry()
-            } label: {
-                Label("Retry", systemImage: "arrow.clockwise")
-                    .font(.headline)
-                    .padding(.horizontal, 26)
-                    .padding(.vertical, 12)
-                    .background(Color.cyan, in: Capsule())
-                    .foregroundStyle(.black)
+        var spoken: String {
+            switch self {
+            case .done: "Done"
+            case .active: "In progress"
+            case .waiting: "Not started"
             }
         }
-        .padding(30)
-        .transition(.opacity)
     }
+}
 
-    private var coachOverlay: some View {
-        // Non-blocking: touches pass through to the webview, which reports the
-        // first interaction back over the bridge to dismiss this.
-        VStack {
-            Spacer()
-            HStack(spacing: 24) {
-                coachItem(icon: "hand.draw", text: "Drag to look around")
-                coachItem(icon: "dpad", text: "Use the stick to walk")
+// MARK: - Coach
+
+/// One-time "how to move" capsule, 24 pt above the joystick (its frame comes
+/// from the page). Touches pass through; the first drag in the page hides it.
+private struct ExplorerCoach: View {
+    let stickFrame: CGRect?
+
+    var body: some View {
+        GeometryReader { geo in
+            VStack(spacing: 0) {
+                Spacer(minLength: 0)
+                capsule
+                Color.clear.frame(height: max(0, geo.size.height - stickTop(in: geo.size) + Theme.Space.l))
             }
-            .padding(.vertical, 14)
-            .padding(.horizontal, 22)
-            .background(.ultraThinMaterial, in: Capsule())
-            .padding(.bottom, 170)
+            .frame(maxWidth: .infinity)
         }
+        .ignoresSafeArea()
         .allowsHitTesting(false)
-        .transition(.opacity)
     }
 
-    private func coachItem(icon: String, text: String) -> some View {
-        HStack(spacing: 8) {
-            Image(systemName: icon)
-                .font(.system(size: 18, weight: .semibold))
-                .foregroundStyle(.cyan)
-            Text(text)
-                .font(.subheadline.weight(.medium))
-                .foregroundStyle(.white)
-        }
+    /// Fallback before the page reports: the stick's CSS position (120 pt,
+    /// 28 pt above the bottom safe area), roughly.
+    private func stickTop(in size: CGSize) -> CGFloat {
+        stickFrame?.minY ?? size.height - 182
     }
 
-    private var closeButton: some View {
-        VStack {
-            HStack {
-                Button {
-                    dismiss()
-                } label: {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 16, weight: .bold))
-                        .foregroundStyle(.white)
-                        .frame(width: 40, height: 40)
-                        .background(.black.opacity(0.45), in: Circle())
-                        .overlay(Circle().stroke(.white.opacity(0.15), lineWidth: 1))
-                }
-                .padding(.leading, 16)
-                .padding(.top, 12)
-                Spacer()
-            }
-            Spacer()
+    private var capsule: some View {
+        ViewThatFits {
+            HStack(spacing: Theme.Space.l) { items }
+            VStack(alignment: .leading, spacing: Theme.Space.xs) { items }
         }
+        .padding(.vertical, Theme.Space.s)
+        .padding(.horizontal, Theme.Space.l)
+        .glassEffect(.regular, in: .capsule)
+        .padding(.horizontal, Theme.Space.m)
+        .dynamicTypeSize(...DynamicTypeSize.accessibility2)
     }
 
-    init(source: SplatSource, title: String = "3D World") {
-        self.source = source
-        self.title = title
-        _showCoach = State(initialValue: !UserDefaults.standard.bool(forKey: Self.coachKey))
-    }
-}
-
-// MARK: - ProgressRing
-
-private struct ProgressRing: View {
-    let progress: Double // 0…1; <=0 shows an indeterminate spinner
-
-    var body: some View {
-        ZStack {
-            Circle()
-                .stroke(Color.white.opacity(0.15), lineWidth: 5)
-            if progress > 0 {
-                Circle()
-                    .trim(from: 0, to: max(0.02, min(1, progress)))
-                    .stroke(Color.cyan, style: StrokeStyle(lineWidth: 5, lineCap: .round))
-                    .rotationEffect(.degrees(-90))
-                    .animation(.easeOut(duration: 0.2), value: progress)
-            } else {
-                IndeterminateArc()
-            }
-        }
-    }
-}
-
-private struct IndeterminateArc: View {
-    @State private var spinning = false
-    var body: some View {
-        Circle()
-            .trim(from: 0, to: 0.25)
-            .stroke(Color.cyan, style: StrokeStyle(lineWidth: 5, lineCap: .round))
-            .rotationEffect(.degrees(spinning ? 360 : 0))
-            .animation(.linear(duration: 0.9).repeatForever(autoreverses: false), value: spinning)
-            .onAppear { spinning = true }
-    }
-}
-
-// MARK: - ExplorerWebView (WKWebView bridge)
-
-private struct ExplorerWebView: UIViewRepresentable {
-    let splatURL: URL
-    let onProgress: (Double) -> Void
-    let onLoaded: () -> Void
-    let onError: (String) -> Void
-    let onInteraction: () -> Void
-
-    func makeCoordinator() -> Coordinator {
-        Coordinator(onProgress: onProgress, onLoaded: onLoaded, onError: onError, onInteraction: onInteraction)
-    }
-
-    func makeUIView(context: Context) -> WKWebView {
-        let config = WKWebViewConfiguration()
-        config.setURLSchemeHandler(ViewerSchemeHandler(splatURL: splatURL), forURLScheme: ViewerSchemeHandler.scheme)
-        config.userContentController.add(context.coordinator, name: "viewer")
-        config.allowsInlineMediaPlayback = true
-        config.mediaTypesRequiringUserActionForPlayback = []
-
-        let webView = WKWebView(frame: .zero, configuration: config)
-        webView.isOpaque = false
-        webView.backgroundColor = .black
-        webView.scrollView.backgroundColor = .black
-        webView.scrollView.isScrollEnabled = false
-        webView.scrollView.bounces = false
-        webView.navigationDelegate = context.coordinator
-        #if DEBUG
-        if #available(iOS 16.4, *) { webView.isInspectable = true }
-        #endif
-
-        var comps = URLComponents()
-        comps.scheme = ViewerSchemeHandler.scheme
-        comps.host = "app"
-        comps.path = "/viewer.html"
-        comps.queryItems = [URLQueryItem(name: "flip", value: "1")] // 180° X flip default (spec §3.1)
-        webView.load(URLRequest(url: comps.url!))
-        return webView
-    }
-
-    func updateUIView(_ webView: WKWebView, context: Context) {}
-
-    static func dismantleUIView(_ webView: WKWebView, coordinator: Coordinator) {
-        webView.configuration.userContentController.removeScriptMessageHandler(forName: "viewer")
-        webView.stopLoading()
-    }
-
-    final class Coordinator: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
-        let onProgress: (Double) -> Void
-        let onLoaded: () -> Void
-        let onError: (String) -> Void
-        let onInteraction: () -> Void
-
-        init(onProgress: @escaping (Double) -> Void, onLoaded: @escaping () -> Void,
-             onError: @escaping (String) -> Void, onInteraction: @escaping () -> Void) {
-            self.onProgress = onProgress
-            self.onLoaded = onLoaded
-            self.onError = onError
-            self.onInteraction = onInteraction
-        }
-
-        func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
-            guard let body = message.body as? [String: Any], let type = body["type"] as? String else { return }
-            switch type {
-            case "progress": onProgress((body["value"] as? Double) ?? 0)
-            case "loaded": onLoaded()
-            case "error": onError((body["message"] as? String) ?? "Unknown error")
-            case "interaction": onInteraction()
-            default: break
-            }
-        }
-
-        /// Navigation allowlist (spec §10 R12). The viewer is a fully local
-        /// page: the only navigations it can legitimately make are within the
-        /// `virtspace-viewer` scheme (its page, its pinned modules, the SPZ).
-        /// Anything else — an http(s) link, a data:/file: URL, a redirect out
-        /// of a world's caption text — is a navigation we never intend, so it
-        /// is cancelled rather than loaded into the explorer.
-        func webView(
-            _ webView: WKWebView,
-            decidePolicyFor navigationAction: WKNavigationAction,
-            decisionHandler: @escaping @MainActor @Sendable (WKNavigationActionPolicy) -> Void
-        ) {
-            let url = navigationAction.request.url
-            let scheme = url?.scheme?.lowercased()
-            // about:blank is WebKit's own initial/empty document, not a
-            // navigation away from the viewer.
-            if scheme == ViewerSchemeHandler.scheme || url?.absoluteString == "about:blank" {
-                decisionHandler(.allow)
-            } else {
-                AppLog.viewer.log("Blocked viewer navigation to \(AppLog.redact(url), privacy: .public)")
-                decisionHandler(.cancel)
-            }
-        }
-
-        /// Content-process deaths seen by this web view. Retry builds a new
-        /// web view (and coordinator), so the count starts over there.
-        private var processTerminations = 0
-
-        /// iOS kills the WebGL content process under memory pressure or in the
-        /// background, leaving a permanently black viewer (spec §10 R31).
-        /// Reload once; a second death in the same view goes to the error
-        /// state, whose Retry rebuilds everything.
-        func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
-            processTerminations += 1
-            AppLog.viewer.error("Viewer web content process terminated (\(self.processTerminations))")
-            if processTerminations == 1 {
-                webView.reload()
-            } else {
-                onError("The 3D viewer stopped unexpectedly.")
-            }
-        }
-
-        func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
-            onError(error.localizedDescription)
-        }
-
-        func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
-            onError(error.localizedDescription)
-        }
+    @ViewBuilder
+    private var items: some View {
+        Label("Drag to look around", systemImage: "hand.draw")
+        Label("Use the stick to walk", systemImage: "dpad")
     }
 }

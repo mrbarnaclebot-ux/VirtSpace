@@ -10,7 +10,8 @@
       "drag to look around".
     * The splat loads from `virtspace-viewer://assets/world.spz`.
     * A postMessage bridge (webkit.messageHandlers.viewer) reports lifecycle to
-      native: {loaded}, {progress:0..1}, {error:message}, {interaction}.
+      native: {loaded}, {progress:0..1}, {error:message}, {interaction},
+      {stick: x,y,width,height} (the joystick frame, for native coach marks).
     * The 180° X-axis flip (World Labs splats are Y-down vs three.js) is kept but
       gated behind a `?flip=1` (default on) query param so on-device verification
       can flip it off without a rebuild.
@@ -41,7 +42,7 @@
 <body>
 <canvas id="stage"></canvas>
 <div id="err"></div>
-<div id="stick"><div id="nub"></div></div>
+<div id="stick" role="application" aria-label="Use the stick to walk"><div id="nub"></div></div>
 <script type="importmap">
 { "imports": {
   "three": "virtspace-viewer://app/three.module.js",
@@ -75,6 +76,16 @@ function markInteraction() {
   bridge({ type: "interaction" });
 }
 
+// Joystick frame (CSS px = points) so native can anchor its coach marks
+// above the stick. Re-sent on resize and once the world has loaded, by which
+// time the safe-area insets are settled.
+function reportStick() {
+  const r = document.getElementById("stick").getBoundingClientRect();
+  bridge({ type: "stick", x: r.left, y: r.top, width: r.width, height: r.height });
+}
+reportStick();
+addEventListener("resize", reportStick);
+
 async function main() {
   const THREE = await import("three");
   const { SparkRenderer, SplatMesh } = await import("@sparkjsdev/spark");
@@ -105,7 +116,7 @@ async function main() {
   const splats = new SplatMesh({
     url: "virtspace-viewer://assets/world.spz",
     onProgress: (p) => bridge({ type: "progress", value: Math.max(0, Math.min(1, p || 0)) }),
-    onLoad: () => { bridge({ type: "progress", value: 1 }); bridge({ type: "loaded" }); },
+    onLoad: () => { bridge({ type: "progress", value: 1 }); bridge({ type: "loaded" }); reportStick(); },
   });
   // World Labs splats are Y-down relative to three.js — flip 180° about X so
   // they're upright. Gated behind ?flip so device verification can disable it.
