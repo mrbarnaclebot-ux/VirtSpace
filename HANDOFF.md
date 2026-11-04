@@ -38,7 +38,7 @@ Everything through **R18 is on `main` and deployed** to Railway (api `0b13dc16`,
 - **Base image must stay `node:24-trixie-slim`**: plain `node:24-slim` is bookworm/python 3.11 and the pinned numpy 2.5.x needs ≥3.12 (first-ever image build failed on this).
 - **Migrations: the pre-deploy step does NOT run.** Railway CLI 5.57.7 silently ignores `deploy.preDeployCommand` edits and the committed `railway.json` had no visible effect. `0003`+`0004` were applied by hand: `cd backend && DATABASE_URL=… AUTH_MODE=dev DEV_AUTH_TOKEN=x npx tsx src/migrate.ts`. **Before the next migration-bearing deploy**, set the api service's Pre-deploy Command (`node dist/migrate.js`) in the Railway dashboard, or apply by hand *before* `railway up`.
 - Post-deploy checks: `/healthz`; authed `GET /v1/worlds`; worker log shows `started; kinds=…` and no `claim error`.
-- Optional env vars (all defaulted): `RATE_LIMIT_WINDOW_MS`, `RATE_LIMIT_MAX`, `RATE_LIMIT_IP_MAX`, `RATE_LIMIT_CREATE_MAX`, `AUTH_FAIL_MAX`, `SHUTDOWN_GRACE_MS`, `WORLDLABS_ASSET_MAX_BYTES`, `WORLDLABS_ASSET_HOSTS` — see `backend/.env.example`.
+- Optional env vars (all defaulted): `RATE_LIMIT_WINDOW_MS`, `RATE_LIMIT_MAX`, `RATE_LIMIT_IP_MAX`, `RATE_LIMIT_CREATE_MAX`, `AUTH_FAIL_MAX`, `SHUTDOWN_GRACE_MS`, `WORLDLABS_ASSET_MAX_BYTES`, `WORLDLABS_ASSET_HOSTS`, `TRUST_PROXY_HOPS` (default 1; confirm against production `req.ips`) — see `backend/.env.example`.
 
 ### Incident 2026-09-17 23:35 → 09-18 00:12 IST (orchestrator error, no data lost)
 
@@ -56,7 +56,7 @@ Everything through **R18 is on `main` and deployed** to Railway (api `0b13dc16`,
 - **Postgres integration suites** are written but skipped (need `TEST_DATABASE_URL` — use a Neon branch, never the production DB): quota race, `heartbeatJob`.
 - **R5 simulator guard** has still never been seen firing.
 - `frames:done` / `uploads:refresh` routes hand their handlers a spurious extra param (behaviour correct, params untidy).
-- Deferred on purpose: vitest/zod/TypeScript majors; `worlds.spz_full_url` dead column (iOS also decodes-but-never-reads `spz_100k_url`, `spz_full_url`, `collider_glb_url`); root `package.json` engines `>=22` vs backend `>=24`; iOS frames are JPEG bytes under `.heic` keys.
+- Deferred on purpose: vitest/zod/TypeScript majors; `worlds.spz_full_url` dead column (iOS also decodes-but-never-reads `spz_100k_url`, `spz_full_url`, `collider_glb_url`); iOS frames are JPEG bytes under `.heic` keys.
 - Pre-existing spec §10 items (World Labs deletion API, training-data ToS, marble-1.1 latency, …) unchanged.
 
 ## Knowledge graph (graphify)
