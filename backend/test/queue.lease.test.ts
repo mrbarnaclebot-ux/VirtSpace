@@ -1,7 +1,14 @@
 import { describe, it, expect } from 'vitest';
 import { PgDialect } from 'drizzle-orm/pg-core';
 import type { SQL } from 'drizzle-orm';
-import { LEASE_SECONDS, claimNextJob, isJobClaimable, mapJobRow } from '../src/queue.js';
+import {
+  LEASE_SECONDS,
+  MAX_ATTEMPTS,
+  claimNextJob,
+  isJobClaimable,
+  mapJobRow,
+  parkExhaustedJobs,
+} from '../src/queue.js';
 import type { Db } from '../src/db/client.js';
 
 // Lease-expiry claim logic (QA defect fix). isJobClaimable is the pure mirror
@@ -13,11 +20,13 @@ function job(overrides: {
   phase: string;
   lockedAt: Date | null;
   runAfter?: Date;
+  attempts?: number;
 }) {
   return {
     phase: overrides.phase,
     lockedAt: overrides.lockedAt,
     runAfter: overrides.runAfter ?? new Date(now.getTime() - 1000),
+    attempts: overrides.attempts ?? 0,
   };
 }
 
@@ -50,6 +59,14 @@ describe('isJobClaimable', () => {
   it('treats the lease boundary as not-yet-expired (must be strictly older)', () => {
     const lockedAt = new Date(now.getTime() - LEASE_SECONDS * 1000);
     expect(isJobClaimable(job({ phase: 'running', lockedAt }), now)).toBe(false);
+  });
+
+  it('never re-claims a job that already used every attempt (§10 R27)', () => {
+    // A run that kills the process never reaches failJob; its lease expires
+    // with attempts at the cap. It used to be re-claimed forever.
+    const lockedAt = new Date(now.getTime() - (LEASE_SECONDS + 1) * 1000);
+    expect(isJobClaimable(job({ phase: 'running', lockedAt, attempts: MAX_ATTEMPTS }), now)).toBe(false);
+    expect(isJobClaimable(job({ phase: 'running', lockedAt, attempts: MAX_ATTEMPTS - 1 }), now)).toBe(true);
   });
 
   it('never claims done or dead jobs', () => {
@@ -88,7 +105,8 @@ describe('claimNextJob generated SQL', () => {
     ]);
     expect(text).not.toMatch(/ANY\s*\(\(/i); // the exact production failure.
     expect(text).toMatch(/kind IN \(\$\d+, \$\d+, \$\d+, \$\d+\)/);
-    // Values are bound parameters (workerId, kinds, LEASE_SECONDS) — never interpolated.
+    // Values are bound parameters (workerId, kinds, LEASE_SECONDS, MAX_ATTEMPTS)
+    // — never interpolated.
     expect(params).toEqual([
       'worker-1',
       'stitch',
@@ -96,12 +114,15 @@ describe('claimNextJob generated SQL', () => {
       'generate_hq',
       'purge',
       LEASE_SECONDS,
+      MAX_ATTEMPTS,
     ]);
     expect(text).not.toContain("'stitch'");
     // Lease expiry + backoff conditions present.
     expect(text).toContain('locked_at IS NULL OR locked_at <');
     expect(text).toContain('run_after <= now()');
     expect(text).toContain('FOR UPDATE SKIP LOCKED');
+    // §10 R27: a job that already used every attempt is never claimed again.
+    expect(text).toMatch(/attempts < \$\d+/);
   });
 
   it('single kind still renders a valid IN list', async () => {
@@ -193,5 +214,49 @@ describe('mapJobRow', () => {
     expect(mapped.lockedAt).toBeNull(); // exact null handling preserved.
     expect(mapped.runAfter).toBe(d); // same instance, no needless re-wrap.
     expect(mapped.createdAt).toBe(d);
+  });
+});
+
+describe('parkExhaustedJobs (§10 R27)', () => {
+  const dialect = new PgDialect();
+
+  it('parks over-cap, unleased-or-expired jobs dead in one statement and maps the rows', async () => {
+    let captured: SQL | undefined;
+    const fakeDb = {
+      execute: async (q: SQL) => {
+        captured = q;
+        return {
+          rows: [
+            {
+              id: 'j1', world_id: 'w1', kind: 'stitch', phase: 'dead', attempts: 5,
+              last_error: 'x', payload: null, provider_operation_id: null,
+              run_after: now, locked_at: null, locked_by: null, created_at: now, updated_at: now,
+            },
+          ],
+        };
+      },
+    } as unknown as Db;
+
+    const parked = await parkExhaustedJobs(fakeDb, ['stitch', 'purge']);
+
+    expect(parked.map((j) => [j.id, j.worldId, j.kind])).toEqual([['j1', 'w1', 'stitch']]);
+    const { sql: text, params } = dialect.sqlToQuery(captured!);
+    expect(text).toContain("SET phase = 'dead'");
+    expect(text).toMatch(/kind IN \(\$\d+, \$\d+\)/);
+    expect(text).toContain("phase IN ('queued', 'running')");
+    expect(text).toMatch(/attempts >= \$\d+/);
+    // Same lease test as claim: a live 5th attempt (fresh lease) is left alone.
+    expect(text).toContain('locked_at IS NULL OR locked_at <');
+    expect(text).toContain('RETURNING *');
+    expect(params).toEqual(expect.arrayContaining(['stitch', 'purge', MAX_ATTEMPTS, LEASE_SECONDS]));
+  });
+
+  it('no kinds → no SQL', async () => {
+    const fakeDb = {
+      execute: async () => {
+        throw new Error('should not execute');
+      },
+    } as unknown as Db;
+    expect(await parkExhaustedJobs(fakeDb, [])).toEqual([]);
   });
 });

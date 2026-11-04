@@ -14,6 +14,7 @@ import {
   enqueue,
   failJob,
   heartbeatJob,
+  parkExhaustedJobs,
   parkJobDead,
   setProviderOperationId,
 } from './queue.js';
@@ -786,31 +787,37 @@ function makeProgressWriter(
  * IDEMPOTENT (spec §10 R6): the transition is conditional on the world still
  * being pre-generation. Two stitch runs for one world (lease expiry + re-claim)
  * would otherwise enqueue two `generate_draft` jobs — i.e. two billable
- * generations — so the loser of the race enqueues nothing. */
+ * generations — so the loser of the race enqueues nothing.
+ *
+ * The flip and the enqueue share ONE transaction (spec §10 R27): a crash between
+ * them used to leave a world in generating_draft with no job, permanently — no
+ * other path ever enqueues a draft for a world already past stitching. */
 async function finalizeStitch(db: Db, worldId: string, panoKey: string): Promise<void> {
-  const advanced = await db
-    .update(worlds)
-    .set({
-      panoUrl: panoKey,
-      status: 'generating_draft',
-      phase: null,
-      progress: null,
-      updatedAt: sql`now()`,
-    })
-    .where(
-      and(
-        eq(worlds.id, worldId),
-        inArray(worlds.status, ['uploading', 'stitching', 'failed_stitch']),
-      ),
-    )
-    .returning({ id: worlds.id });
-  if (advanced.length === 0) {
-    console.log(
-      `[worker] world ${worldId} already past stitching; not enqueuing a second generate_draft`,
-    );
-    return;
-  }
-  await enqueue(db, 'generate_draft', worldId);
+  await db.transaction(async (tx) => {
+    const advanced = await tx
+      .update(worlds)
+      .set({
+        panoUrl: panoKey,
+        status: 'generating_draft',
+        phase: null,
+        progress: null,
+        updatedAt: sql`now()`,
+      })
+      .where(
+        and(
+          eq(worlds.id, worldId),
+          inArray(worlds.status, ['uploading', 'stitching', 'failed_stitch']),
+        ),
+      )
+      .returning({ id: worlds.id });
+    if (advanced.length === 0) {
+      console.log(
+        `[worker] world ${worldId} already past stitching; not enqueuing a second generate_draft`,
+      );
+      return;
+    }
+    await enqueue(tx, 'generate_draft', worldId);
+  });
 }
 
 /**
@@ -1186,6 +1193,12 @@ export async function handleJobError(db: Db, job: Job, err: unknown): Promise<vo
     if ((await failJob(db, job.id, message)) !== 'dead') return;
     console.error(`[worker] job ${job.id} (${job.kind}) exhausted its retries, now DEAD`);
   }
+  await failWorldForDeadJob(db, job);
+}
+
+/** A job just went dead → its world gets the failed_<phase> status (spec §10
+ * R22), so the app stops polling an in-progress status nothing will advance. */
+async function failWorldForDeadJob(db: Db, job: Pick<Job, 'kind' | 'worldId'>): Promise<void> {
   const failed = failedStatusFor(job.kind);
   if (failed) {
     await db
@@ -1194,6 +1207,24 @@ export async function handleJobError(db: Db, job: Job, err: unknown): Promise<vo
       .where(eq(worlds.id, job.worldId))
       .catch(() => undefined);
   }
+}
+
+/**
+ * Park jobs that used every attempt without ever reaching failJob — their run
+ * killed the process, so the lease simply expired (spec §10 R27). claimNextJob
+ * already skips them; this makes them dead and fails their worlds through the
+ * same path as any other dead job. Runs on the reaper cadence. Returns the
+ * parked job ids.
+ */
+export async function reapExhaustedJobs(db: Db): Promise<string[]> {
+  const parked = await parkExhaustedJobs(db, WORKER_KINDS);
+  for (const job of parked) {
+    console.error(
+      `[worker] job ${job.id} (${job.kind}) expired its lease on the last attempt, now DEAD`,
+    );
+    await failWorldForDeadJob(db, job);
+  }
+  return parked.map((j) => j.id);
 }
 
 // =============================================================================
@@ -1224,22 +1255,27 @@ export function isWorldReapable(
  * Returns the reaped world ids (logged individually).
  */
 export async function reapStaleUploads(db: Db): Promise<string[]> {
-  const rows = await db
-    .update(worlds)
-    .set({ status: 'failed_upload', progress: null, updatedAt: sql`now()` })
-    .where(
-      and(
-        eq(worlds.status, 'uploading'),
-        lt(worlds.createdAt, sql`now() - interval '24 hours'`),
-      ),
-    )
-    .returning({ id: worlds.id });
+  // One transaction (spec §10 R27): a crash between the flip and the enqueues
+  // would leave failed_upload worlds whose frames are never purged (§13) — the
+  // flip takes them out of this sweep for good.
+  return db.transaction(async (tx) => {
+    const rows = await tx
+      .update(worlds)
+      .set({ status: 'failed_upload', progress: null, updatedAt: sql`now()` })
+      .where(
+        and(
+          eq(worlds.status, 'uploading'),
+          lt(worlds.createdAt, sql`now() - interval '24 hours'`),
+        ),
+      )
+      .returning({ id: worlds.id });
 
-  for (const row of rows) {
-    console.log(`[worker] reaped stale uploading world ${row.id} → failed_upload`);
-    await enqueue(db, 'purge', row.id, { framesOnly: true });
-  }
-  return rows.map((r) => r.id);
+    for (const row of rows) {
+      console.log(`[worker] reaped stale uploading world ${row.id} → failed_upload`);
+      await enqueue(tx, 'purge', row.id, { framesOnly: true });
+    }
+    return rows.map((r) => r.id);
+  });
 }
 
 // =============================================================================
@@ -1280,6 +1316,7 @@ export function startWorker(rawDeps: WorkerDeps): WorkerHandle {
         lastReapAt = clock.now();
         try {
           await reapStaleUploads(deps.db);
+          await reapExhaustedJobs(deps.db);
         } catch (err) {
           console.error(`[worker] reaper error (staying alive): ${String(err)}`);
         }

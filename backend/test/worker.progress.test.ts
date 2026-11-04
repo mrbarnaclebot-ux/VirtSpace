@@ -121,7 +121,8 @@ interface ReapSink {
 
 /** Mocked drizzle db: update().set().where().returning() yields `reapedIds`. */
 function makeReaperDb(reapedIds: string[], sink: ReapSink) {
-  return {
+  const db = {
+    transaction: async <T>(cb: (tx: unknown) => Promise<T>): Promise<T> => cb(db),
     update: (table: unknown) => ({
       set: (patch: Record<string, unknown>) => ({
         where: () => ({
@@ -140,7 +141,8 @@ function makeReaperDb(reapedIds: string[], sink: ReapSink) {
         },
       }),
     }),
-  } as unknown as WorkerDeps['db'];
+  };
+  return db as unknown as WorkerDeps['db'];
 }
 
 describe('reapStaleUploads', () => {

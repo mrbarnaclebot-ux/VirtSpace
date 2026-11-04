@@ -389,6 +389,7 @@ describe('worker frame size guard', () => {
       }),
       insert: () => ({ values: () => ({ returning: async () => [{ id: 'j' }] }) }),
       execute: async () => ({ rows: [{ id: 'job-1' }] }),
+      transaction: async <T>(cb: (tx: unknown) => Promise<T>): Promise<T> => cb(db),
     };
     const storage = {
       kind: 'local',

@@ -20,9 +20,13 @@ export function accountRoutes(app: FastifyInstance): void {
       .from(worlds)
       .where(and(eq(worlds.ownerId, userId), isNull(worlds.deletedAt)));
 
+    // Each soft delete + its purge job in one transaction (spec §10 R27): a
+    // crash between them hid a world whose assets were then never purged (§13).
     for (const w of live) {
-      await db.update(worlds).set({ deletedAt: now }).where(eq(worlds.id, w.id));
-      await enqueue(db, 'purge', w.id);
+      await db.transaction(async (tx) => {
+        await tx.update(worlds).set({ deletedAt: now }).where(eq(worlds.id, w.id));
+        await enqueue(tx, 'purge', w.id);
+      });
     }
 
     await db.delete(devices).where(eq(devices.userId, userId));

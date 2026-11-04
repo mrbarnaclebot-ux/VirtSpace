@@ -6,6 +6,7 @@ import {
   handleStitch,
   processJob,
   handleJobError,
+  reapExhaustedJobs,
   LeaseLostError,
   type WorkerDeps,
   type StitcherSpawner,
@@ -142,7 +143,7 @@ function makeDb(opts: {
   finalizeRows?: () => unknown[];
 }) {
   const { world, capture, sink } = opts;
-  return {
+  const db = {
     select: () => ({
       from: (table: unknown) => {
         const rows = table === worlds ? [world] : table === captures && capture ? [capture] : [];
@@ -173,17 +174,17 @@ function makeDb(opts: {
         },
       }),
     }),
-    transaction: async (cb: (tx: unknown) => Promise<void>) => {
-      await cb({
-        execute: async () => ({ rows: [{ total: 0 }] }),
-        insert: () => ({ values: async () => undefined }),
-      });
-    },
+    // The tx is this db (finalizeStitch flips + enqueues in it, §10 R27) with
+    // the budget's SUM stubbed; the budget's credit_events insert never calls
+    // .returning(), so it does not land in sink.inserts.
+    transaction: async <T>(cb: (tx: unknown) => Promise<T>): Promise<T> =>
+      cb({ ...db, execute: async () => ({ rows: [{ total: 0 }] }) }),
     execute: async (q: SQL) => {
       sink.executes.push(new PgDialect().sqlToQuery(q).sql);
       return { rows: opts.heartbeatRows ? opts.heartbeatRows() : [{ id: 'job-1' }] };
     },
-  } as unknown as Db;
+  };
+  return db as unknown as Db;
 }
 
 function fakeStorage(puts: string[] = []): StorageDriver {
@@ -415,5 +416,35 @@ describe('handleJobError on a retryable failure', () => {
     // written or unwound (a reservation stays put — generate may have run, §14).
     expect(sink.inserts).toEqual([]);
     expect(sink.executes).toHaveLength(1);
+  });
+});
+
+// --- a job that killed the process on its last attempt (§10 R27) -------------
+
+describe('reapExhaustedJobs', () => {
+  it('fails the world of every parked job through the dead-job path', async () => {
+    const sink = newSink();
+    const db = makeDb({
+      world: fakeWorld(),
+      sink,
+      heartbeatRows: () => [
+        { id: 'j1', world_id: 'w-1', kind: 'generate_draft', phase: 'dead', attempts: 5 },
+        { id: 'j2', world_id: 'w-2', kind: 'purge', phase: 'dead', attempts: 5 },
+      ],
+    });
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    expect(await reapExhaustedJobs(db)).toEqual(['j1', 'j2']);
+
+    expect(sink.executes).toHaveLength(1);
+    expect(sink.executes[0]).toContain("SET phase = 'dead'");
+    // generate_draft → failed_generating_draft; purge has no failed status.
+    expect(sink.updates).toEqual([
+      {
+        table: worlds,
+        patch: { status: 'failed_generating_draft', progress: null, updatedAt: expect.anything() },
+      },
+    ]);
+    expect(sink.inserts).toEqual([]);
   });
 });

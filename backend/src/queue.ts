@@ -6,7 +6,7 @@ import { jobs, type Job, type JobKind, type JobPhase } from './db/schema.js';
 // Uses FOR UPDATE SKIP LOCKED so multiple workers can claim jobs concurrently
 // without contention.
 
-const MAX_ATTEMPTS = 5;
+export const MAX_ATTEMPTS = 5;
 const BASE_BACKOFF_SECONDS = 30;
 const MAX_BACKOFF_SECONDS = 60 * 60; // 1 hour cap.
 
@@ -21,16 +21,22 @@ export const LEASE_SECONDS = 600; // 10 minutes.
 
 /**
  * Pure mirror of the claimNextJob WHERE clause — a job is claimable when it is
- * queued/running, its backoff gate (run_after) has passed, and it is either
- * unlocked OR its lease has expired. The SQL in claimNextJob MUST stay in sync
- * with this predicate (it is the testable spec of the claim condition).
+ * queued/running, has attempts left, its backoff gate (run_after) has passed,
+ * and it is either unlocked OR its lease has expired. The SQL in claimNextJob
+ * MUST stay in sync with this predicate (it is the testable spec of the claim
+ * condition).
+ *
+ * The attempts cap (spec §10 R27): failJob parks a job dead at MAX_ATTEMPTS, but
+ * a job whose run KILLS the process never reaches failJob — its lease just
+ * expires and it used to be re-claimed forever. parkExhaustedJobs parks those.
  */
 export function isJobClaimable(
-  job: Pick<Job, 'phase' | 'lockedAt' | 'runAfter'>,
+  job: Pick<Job, 'phase' | 'lockedAt' | 'runAfter' | 'attempts'>,
   now: Date = new Date(),
   leaseSeconds: number = LEASE_SECONDS,
 ): boolean {
   if (job.phase !== 'queued' && job.phase !== 'running') return false;
+  if (job.attempts >= MAX_ATTEMPTS) return false;
   if (job.runAfter.getTime() > now.getTime()) return false;
   if (job.lockedAt === null) return true;
   return job.lockedAt.getTime() < now.getTime() - leaseSeconds * 1000;
@@ -135,6 +141,7 @@ export async function claimNextJob(
         -- Lease expiry (mirrors isJobClaimable): claimable when unlocked OR the
         -- lease is older than LEASE_SECONDS, so a crashed worker's job resumes.
         AND (locked_at IS NULL OR locked_at < now() - (${LEASE_SECONDS} * interval '1 second'))
+        AND attempts < ${MAX_ATTEMPTS}
         AND run_after <= now()
       ORDER BY run_after ASC
       FOR UPDATE SKIP LOCKED
@@ -144,6 +151,39 @@ export async function claimNextJob(
   `);
   const rows = (result as unknown as { rows: Record<string, unknown>[] }).rows;
   return rows[0] ? mapJobRow(rows[0]) : null;
+}
+
+/**
+ * Park every job that claimNextJob will never pick up again because it already
+ * used all MAX_ATTEMPTS (spec §10 R27): still queued/running, not leased (or the
+ * lease expired), attempts at the cap. In practice that is a job whose run killed
+ * the process (OOM, segfault) on its last attempt, so failJob never ran. Returns
+ * the parked jobs so the worker can fail their worlds through the same path as
+ * any other dead job — without that the world would sit in its in-progress
+ * status forever (R22).
+ */
+export async function parkExhaustedJobs(db: Db, kinds: JobKind[]): Promise<Job[]> {
+  if (kinds.length === 0) return [];
+  const kindsIn = sql.join(
+    kinds.map((k) => sql`${k}`),
+    sql`, `,
+  );
+  const result = await db.execute<Record<string, unknown>>(sql`
+    UPDATE jobs
+    SET phase = 'dead',
+        last_error = 'lease expired on the last attempt (' || attempts || ')'
+                     || COALESCE('; previous error: ' || last_error, ''),
+        locked_at = NULL,
+        locked_by = NULL,
+        updated_at = now()
+    WHERE kind IN (${kindsIn})
+      AND phase IN ('queued', 'running')
+      AND attempts >= ${MAX_ATTEMPTS}
+      AND (locked_at IS NULL OR locked_at < now() - (${LEASE_SECONDS} * interval '1 second'))
+    RETURNING *
+  `);
+  const rows = (result as unknown as { rows: Record<string, unknown>[] }).rows;
+  return rows.map(mapJobRow);
 }
 
 /** Mark a job done and release its lease. */

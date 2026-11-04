@@ -555,29 +555,33 @@ export function worldsRoutes(app: FastifyInstance, deps: RouteDeps): void {
     // any other non-enhanceable world. `deleted_at IS NULL` is re-asserted here
     // too: a delete landing between the read and the write must not start a
     // billable generation for a world that is on its way to the purge job.
-    const flipped = await db
-      .update(worlds)
-      .set({ status: 'generating_hq', progress: null, updatedAt: new Date() })
-      .where(
-        and(
-          eq(worlds.id, world.id),
-          eq(worlds.status, 'draft_ready'),
-          isNull(worlds.deletedAt),
-        ),
-      )
-      .returning();
-    const updated = flipped[0];
-    if (!updated) {
+    //
+    // Flip + enqueue are one transaction (spec §10 R27): a crash between them
+    // left a world in generating_hq with no job and no way back to draft_ready.
+    const flipped = await db.transaction(async (tx) => {
+      const [row] = await tx
+        .update(worlds)
+        .set({ status: 'generating_hq', progress: null, updatedAt: new Date() })
+        .where(
+          and(
+            eq(worlds.id, world.id),
+            eq(worlds.status, 'draft_ready'),
+            isNull(worlds.deletedAt),
+          ),
+        )
+        .returning();
+      if (!row) return null;
+      // Only reached by the request that actually won the flip → exactly one job.
+      return { world: row, jobId: await enqueue(tx, 'generate_hq', world.id) };
+    });
+    if (!flipped) {
       const current = await findOwnedWorld(db, world.id, userId);
       return reply.code(409).send({
         error: 'not_enhanceable',
         status: current?.status ?? world.status,
       });
     }
-
-    // Only reached by the request that actually won the flip → exactly one job.
-    const jobId = await enqueue(db, 'generate_hq', world.id);
-    return reply.send({ world: serializeWorld(updated), job_id: jobId });
+    return reply.send({ world: serializeWorld(flipped.world), job_id: flipped.jobId });
   };
   app.post<{ Params: { id: string } }>(ENHANCE_PATH, enhanceOpts, enhanceHandler);
   app.post<{ Params: { id: string } }>(ENHANCE_LEGACY_PATH, enhanceOpts, enhanceHandler);
@@ -590,11 +594,15 @@ export function worldsRoutes(app: FastifyInstance, deps: RouteDeps): void {
     const world = await findOwnedWorld(db, req.params.id, userId);
     if (!world) return reply.code(404).send({ error: 'world_not_found' });
 
-    await db
-      .update(worlds)
-      .set({ deletedAt: new Date(), updatedAt: new Date() })
-      .where(eq(worlds.id, world.id));
-    const jobId = await enqueue(db, 'purge', world.id);
+    // One transaction (spec §10 R27): a soft delete without its purge job hides
+    // the world forever while its assets stay in R2 (§13).
+    const jobId = await db.transaction(async (tx) => {
+      await tx
+        .update(worlds)
+        .set({ deletedAt: new Date(), updatedAt: new Date() })
+        .where(eq(worlds.id, world.id));
+      return enqueue(tx, 'purge', world.id);
+    });
     return reply.send({ ok: true, job_id: jobId });
   });
 }

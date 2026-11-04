@@ -304,10 +304,29 @@ interface Sink {
   updates: { table: unknown; patch: Record<string, unknown> }[];
   inserts: { table: unknown; vals: Record<string, unknown> }[];
   executes: number;
+  /** Writes made on the transaction handle (status flips / job kinds). */
+  txWrites?: string[];
 }
 
 function makeStitchDb(world: World, capture: Capture, sink: Sink) {
-  return {
+  const db = {
+    // Finalize flips + enqueues in one transaction (§10 R27). The tx handle is
+    // this db with its writes also recorded in sink.txWrites.
+    transaction: async <T>(cb: (tx: unknown) => Promise<T>): Promise<T> =>
+      cb({
+        update: (table: unknown) => ({
+          set: (patch: Record<string, unknown>) => {
+            (sink.txWrites ??= []).push(`update:${String(patch['status'])}`);
+            return db.update(table).set(patch);
+          },
+        }),
+        insert: (table: unknown) => ({
+          values: (vals: Record<string, unknown>) => {
+            (sink.txWrites ??= []).push(`insert:${String(vals['kind'])}`);
+            return db.insert(table).values(vals);
+          },
+        }),
+      }),
     select: () => ({
       from: (table: unknown) => {
         const rows = table === worlds ? [world] : table === captures ? [capture] : [];
@@ -333,6 +352,7 @@ function makeStitchDb(world: World, capture: Capture, sink: Sink) {
     }),
     execute: async () => { sink.executes += 1; },
   };
+  return db;
 }
 
 function fakeStorage() {
@@ -394,6 +414,9 @@ describe('handleStitch dispatch', () => {
     expect(sink.updates.some((u) => u.patch['status'] === 'generating_draft')).toBe(true);
     expect(sink.inserts.some((i) => i.vals['kind'] === 'generate_draft')).toBe(true);
     expect(sink.executes).toBe(1);
+    // §10 R27: the flip and the draft job are written in ONE transaction, so a
+    // crash between them cannot strand the world in generating_draft.
+    expect(sink.txWrites).toEqual(['update:generating_draft', 'insert:generate_draft']);
   });
 
   it('multi-frame WITH poses → spawns with --poses, uploads pano + preview', async () => {
