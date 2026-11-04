@@ -84,6 +84,9 @@ final class CaptureHUDState {
     var exposureLocked = false
     /// Tracking warning to surface, or nil.
     var warning: String?
+    /// Low-light preflight: AE is pinned near its ceiling before shot 0. The
+    /// HUD offers "continue anyway"; the engine holds the dwell until then.
+    var isTooDark = false
 
     // MARK: - HUD geometry (Stage B2)
 
@@ -154,6 +157,7 @@ final class CaptureHUDState {
         isSteady = false
         driftMeters = 0
         exposureLocked = false
+        isTooDark = false
         warning = nil
         cameraTransform = matrix_identity_float4x4
         cameraIntrinsics = matrix_identity_float3x3

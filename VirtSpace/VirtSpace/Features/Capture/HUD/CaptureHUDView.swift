@@ -16,6 +16,7 @@ import SwiftUI
 struct CaptureHUDView: View {
     let hud: CaptureHUDState
     var onCancel: () -> Void = {}
+    var onContinueInLowLight: () -> Void = {}
 
     @State private var showAbandonDialog = false
     @State private var flashOpacity: Double = 0
@@ -40,6 +41,10 @@ struct CaptureHUDView: View {
         .overlay(alignment: .topLeading) { closeButton.padding(.leading, 20) }
         .overlay(alignment: .topTrailing) { exposurePill.padding(.trailing, 20) }
         .overlay(alignment: .bottom) { bottomBar.padding(.bottom, 14) }
+        .overlay {
+            if hud.isTooDark { lowLightCard.transition(.opacity) }
+        }
+        .animation(.easeOut(duration: 0.25), value: hud.isTooDark)
         .onChange(of: hud.capturedCount) { old, new in
             guard new > old else { return }
             fireShotFlash()
@@ -285,6 +290,34 @@ struct CaptureHUDView: View {
             return hud.isSteady ? "Hold still…" : "Steady…"
         }
         return "\(Int(hud.angularDistanceDegrees.rounded()))° away"
+    }
+
+    // MARK: - Low-light preflight
+
+    /// Shown before shot 0 while AE is pinned near its ceiling (spec §6.1).
+    /// Clears by itself once the room is bright enough.
+    private var lowLightCard: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "lightbulb.max")
+                .font(.system(size: 30, weight: .light))
+                .foregroundStyle(.yellow)
+            Text("Too dark — turn on lights")
+                .font(.headline.weight(.bold))
+                .foregroundStyle(.white)
+            Text("Dim rooms scan noisy and blurry.")
+                .font(.footnote)
+                .foregroundStyle(.white.opacity(0.7))
+            Button("Continue anyway", action: onContinueInLowLight)
+                .font(.subheadline.weight(.semibold))
+                .padding(.horizontal, 20)
+                .padding(.vertical, 10)
+                .background(Color.white.opacity(0.15), in: Capsule())
+                .foregroundStyle(.white)
+        }
+        .multilineTextAlignment(.center)
+        .padding(22)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .padding(.horizontal, 40)
     }
 
     // MARK: - Vignette

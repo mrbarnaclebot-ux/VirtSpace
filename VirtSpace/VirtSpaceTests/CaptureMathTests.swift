@@ -148,3 +148,35 @@ struct ExposureMeterTests {
         #expect(meter.samples.count == ExposureMeter.windowSize)
     }
 }
+
+@Suite("Low light and steadiness scaling")
+struct LowLightTests {
+    private func sample(iso: Float, duration: Double = 1.0 / 60) -> ExposureSample {
+        ExposureSample(iso: iso, duration: duration, minISO: 32, maxISO: 3_000,
+                       minDuration: 1.0 / 10_000, maxDuration: 1.0 / 3)
+    }
+
+    @Test("ISO near the format ceiling reads as too dark; a bright room does not")
+    func tooDark() {
+        var dark = ExposureMeter()
+        for _ in 0..<5 { dark.add(sample(iso: 2_800)) }
+        #expect(dark.isTooDark)
+
+        var bright = ExposureMeter()
+        for _ in 0..<5 { bright.add(sample(iso: 200)) }
+        #expect(!bright.isTooDark)
+        #expect(!ExposureMeter().isTooDark)
+    }
+
+    @Test("Longer exposures need a proportionally steadier hold, with a floor")
+    func steadinessScales() {
+        let base = AlignmentMath.steadinessThresholdRadPerSec
+        #expect(AlignmentMath.steadinessThreshold(exposureDuration: 1.0 / 120) == base)
+        #expect(AlignmentMath.steadinessThreshold(exposureDuration: 1.0 / 60) == base)
+        #expect(abs(AlignmentMath.steadinessThreshold(exposureDuration: 1.0 / 30) - base / 2) < 1e-9)
+        #expect(AlignmentMath.steadinessThreshold(exposureDuration: 1) == AlignmentMath.minSteadinessThresholdRadPerSec)
+        // 0.08 rad/s is steady at 1/60 s but not at 1/30 s.
+        #expect(AlignmentMath.isSteady(rotationRate: 0.08, exposureDuration: 1.0 / 60))
+        #expect(!AlignmentMath.isSteady(rotationRate: 0.08, exposureDuration: 1.0 / 30))
+    }
+}

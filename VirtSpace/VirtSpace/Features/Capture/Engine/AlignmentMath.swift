@@ -19,6 +19,13 @@ nonisolated enum AlignmentMath {
     /// Camera counts as "steady" below this rotation rate (rad/s) — shots
     /// taken while turning would blur and break the stitch.
     static let steadinessThresholdRadPerSec: Double = 0.12
+    /// ponytail: the shutter the base threshold is taken to be tuned at. Blur
+    /// is rate x shutter, so a longer exposure must hold proportionally
+    /// steadier (R38). Tune both from device data.
+    static let steadinessReferenceExposure: Double = 1.0 / 60
+    /// ponytail: floor so a very long shutter never demands stiller than a
+    /// handheld phone can be (tremor is a few hundredths of a rad/s).
+    static let minSteadinessThresholdRadPerSec: Double = 0.04
     /// Aligned + steady must hold continuously this long before auto-fire.
     static let dwellSeconds: TimeInterval = 0.30
     /// Parallax coaching (spec §9): soft warning past this many meters of
@@ -93,8 +100,16 @@ nonisolated enum AlignmentMath {
         return angle / dt
     }
 
-    static func isSteady(rotationRate rate: Double) -> Bool {
-        rate <= steadinessThresholdRadPerSec
+    /// The steadiness threshold for a shutter time: the base threshold at or
+    /// below the reference exposure, scaled down by 1/exposure above it.
+    static func steadinessThreshold(exposureDuration: Double) -> Double {
+        guard exposureDuration > steadinessReferenceExposure else { return steadinessThresholdRadPerSec }
+        let scaled = steadinessThresholdRadPerSec * steadinessReferenceExposure / exposureDuration
+        return max(minSteadinessThresholdRadPerSec, scaled)
+    }
+
+    static func isSteady(rotationRate rate: Double, exposureDuration: Double = steadinessReferenceExposure) -> Bool {
+        rate <= steadinessThreshold(exposureDuration: exposureDuration)
     }
 
     private static func rotationMatrix(of transform: simd_float4x4) -> simd_float3x3 {

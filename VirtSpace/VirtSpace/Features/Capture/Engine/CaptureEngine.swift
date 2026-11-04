@@ -103,6 +103,10 @@ nonisolated final class CaptureEngine: @unchecked Sendable {
     private enum ExposurePhase { case metering, locking, locked }
     private var exposurePhase = ExposurePhase.metering
     private var meter = ExposureMeter()
+    /// Low-light preflight: the lock waits while AE is pinned near its ceiling
+    /// (turning the lights on clears it) unless the user chose to continue.
+    private var isShowingLowLight = false
+    private var lowLightAcknowledged = false
     /// A lock whose "applied" callback never comes must not wedge the dwell.
     private static let exposureApplyTimeout: TimeInterval = 0.5
 
@@ -266,6 +270,8 @@ nonisolated final class CaptureEngine: @unchecked Sendable {
         firstShotPosition = nil
         exposurePhase = .metering
         meter.reset()
+        isShowingLowLight = false
+        lowLightAcknowledged = false
         shots.reset()
         transientWarning = nil
         thermal.reset()
@@ -278,6 +284,11 @@ nonisolated final class CaptureEngine: @unchecked Sendable {
         source = nil
         AppLog.engine.error("Capture failed: \(message, privacy: .public)")
         publish { $0.state = .failed(message) }
+    }
+
+    /// The user chose to scan despite the low-light warning.
+    func continueInLowLight() {
+        queue.async { [weak self] in self?.lowLightAcknowledged = true }
     }
 
     // MARK: - Thermal mitigation (Stage B3 deliverable 2e)
@@ -327,14 +338,26 @@ nonisolated final class CaptureEngine: @unchecked Sendable {
         previousTimestamp = pose.timestamp
 
         if exposurePhase == .metering {
-            lockExposure()
+            if meter.isTooDark, !lowLightAcknowledged {
+                if !isShowingLowLight {
+                    isShowingLowLight = true
+                    AppLog.engine.log("Low light before shot 0: holding the exposure lock")
+                    publish { $0.isTooDark = true }
+                }
+            } else {
+                if isShowingLowLight {
+                    isShowingLowLight = false
+                    publish { $0.isTooDark = false }
+                }
+                lockExposure()
+            }
         }
 
         guard worldTargets.indices.contains(currentIndex) else { return }
         let target = worldTargets[currentIndex]
         let distance = AlignmentMath.angularDistanceDegrees(forward, target)
         let deltas = AlignmentMath.signedDeltas(cameraForward: forward, targetDirection: target)
-        let steady = AlignmentMath.isSteady(rotationRate: smoothedRate)
+        let steady = AlignmentMath.isSteady(rotationRate: smoothedRate, exposureDuration: pose.exposureDuration)
         let drift = firstShotPosition.map { AlignmentMath.translationDrift(from: $0, current: position) } ?? 0
 
         // Thermal coaching now flows through the dedicated `thermalState`

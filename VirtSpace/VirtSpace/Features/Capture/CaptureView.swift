@@ -75,7 +75,11 @@ struct CaptureView: View {
             ZStack {
                 cameraLayer
                 if !hud.state.isFinished {
-                    CaptureHUDView(hud: hud, onCancel: { model.engine.cancel() })
+                    CaptureHUDView(
+                        hud: hud,
+                        onCancel: { model.engine.cancel() },
+                        onContinueInLowLight: { model.engine.continueInLowLight() }
+                    )
                 }
             }
         }

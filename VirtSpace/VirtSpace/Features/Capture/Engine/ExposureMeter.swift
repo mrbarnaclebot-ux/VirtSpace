@@ -28,6 +28,11 @@ nonisolated struct ExposureMeter {
     /// ponytail: ~2 s of 60 Hz frames; a rolling window, so turning the lights
     /// on during the low-light warning clears it within a couple of seconds.
     static let windowSize = 120
+    /// ponytail: "near max" = 80% of the format's ISO / shutter ceiling. Tune
+    /// from device data (ARKit caps the shutter by frame rate, so ISO is the
+    /// signal that actually moves indoors).
+    static let nearMaxFraction: Double = 0.8
+
     private(set) var samples: [ExposureSample] = []
 
     mutating func add(_ sample: ExposureSample) {
@@ -39,6 +44,16 @@ nonisolated struct ExposureMeter {
 
     mutating func reset() {
         samples.removeAll()
+    }
+
+    /// True when AE is pinned near its ceiling: frames will be noisy and the
+    /// longer shutter blurs (spec §6.1 low-light preflight, R38).
+    var isTooDark: Bool {
+        guard let latest = samples.last else { return false }
+        let iso = Self.median(samples.map { Double($0.iso) })
+        let duration = Self.median(samples.map(\.duration))
+        return iso >= Self.nearMaxFraction * Double(latest.maxISO)
+            || duration >= Self.nearMaxFraction * latest.maxDuration
     }
 
     /// The custom exposure to lock: the window's median exposure (ISO x
