@@ -311,8 +311,20 @@ private struct PanoSphereView: UIViewRepresentable {
         let cameraNode = SCNNode()
         private var material: SCNMaterial?
 
+        /// Opening yaw: facing the capture's first shot. Shot 0 is the user's
+        /// starting look direction, ARKit world -Z (the session starts with the
+        /// camera looking down -Z), which the stitcher puts at lon ±180, the
+        /// equirect's left/right edge (reproject.py: +Z at lon 0, image centre).
+        /// With the `scale(-1,1,1)` + `.repeat` UV correction below, camera yaw
+        /// 0 (SceneKit looks down -Z) shows texture u = 0, that same edge, and
+        /// yaw -θ shows u = θ/360 (checked with an offscreen SceneKit render of
+        /// a sector-coded texture). So 0 already faces shot 0 for pose-path
+        /// panos; only pose-less fallback panos (nominal angles, shot 0 at lon
+        /// 0) open behind it, and those would want `.pi`.
+        static let initialYaw: Float = 0
+
         // Camera orientation, radians. yaw about +Y, pitch about +X.
-        private var yaw: Float = 0
+        private var yaw: Float = initialYaw
         private var pitch: Float = 0
         private var panStartYaw: Float = 0
         private var panStartPitch: Float = 0
