@@ -6,19 +6,19 @@ Read this first next session, then `CLAUDE.md` and `spec-doc.md` §10 (ledger **
 
 Everything is on `main` (`e8ec6bd`+) and the backend is **deployed** (api + worker, 2026-11-05): R20–R23, Railway IaC, capture v2 (stitcher v2, depth API, 4096 stitch), the World Labs `display_name` 64-char fix and **full-resolution splats** (worker stores `splat_full.spz`; iOS loads it on 8 GB+ iPhones, else 500k). iOS capture v2 and the R19/R15 refactor are merged (83/83 sim tests) and a Debug build of `main` with production Secrets is on the owner's iPhone 17 Pro. The owner's first capture-v2 world (`b936c74a`) ran end to end incl. **Enhance to HQ (R18 verified: complete, asset_version 2)**; its HQ full_res splat was backfilled by hand. Owner verdict: ghosting reduced, HQ sharper, but walking away from the capture spot blurs lettering and distorts unseen areas (single-pano limit; see the live-mapping research below).
 
-## In flight at time of writing (2026-11-05, agents in worktrees under `.claude/worktrees/`)
+## Landed 2026-11-05 (all on `main`; see the spec §10 "Status 2026-11-05" row for detail)
 
-Owner brief: work everything open **except login (R24)**; UI/UX redesign (clean modern flat, animations, onboarding, copy, spacing, settings, accurate toasts/alerts/progress); separate research on live whole-room/house mapping with an iPhone Pro + World Labs.
+| Item | Deployed? |
+|---|---|
+| Capture v2 iOS + R19/R15 merged; display_name 422 fix; full-res splats (worker + iOS) | worker yes; iOS = Debug build on the owner's phone |
+| Backend hardening (R26 CI + migrate URL, R28, R29, R30 zod 4, R33 Dockerfile/guards) | **no** |
+| Backend state + retry (R27, `:retry` R42, distinct 429 codes, budget default 2000) | **no** |
+| iOS robustness (R25 background uploads, R31 WebGL reload + Caches, R32 privacy, CaptureEngine split) | no (needs a device build) |
+| `docs/design/ui-spec.md` (UI/UX audit + redesign, WP1-WP5); `docs/research/live-mapping.md` | docs |
 
-| Branch | Scope | Status |
-|---|---|---|
-| `docs/ui-spec` | Designer: UI/UX audit + `docs/design/ui-spec.md` (tokens, IA, onboarding incl. R32 consent, copy deck, feedback accuracy audit, work packages) | running |
-| (no branch) | Research: live room/house mapping options + World Labs paths | running |
-| `feat/backend-state-retry` | R27 atomic flip+enqueue + claim attempts cap; `POST /v1/worlds/{id}:retry`; distinct 429 codes; DAILY_CREDIT_BUDGET default 2000 | running |
-| `chore/backend-hardening` | R28 pool errors/timeouts; R29 redirect SSRF; R30 audit; R33 storage guard, Dockerfile PID 1 + multi-stage, sslmode; `MIGRATE_DATABASE_URL` + api preDeploy; R26 CI workflow | running |
-| `fix/ios-robustness` | R25 background uploads; R31 WebGL termination + caches out of backup; R32 fixture.spz DEBUG-only + privacy manifest; CaptureEngine split; pano preview initial heading | running |
+**Pending owner decisions:** (1) deploy the backend (api first, then worker; new multi-stage image never built locally, Railway keeps the old deploy if the build fails); (2) set `MIGRATE_DATABASE_URL` (direct Neon host) on api, then `railway config plan` and `apply` to enable the api preDeploy migrate; (3) whether a draft `:retry` should charge a scan (currently yes); (4) viewer walk-radius limit; (5) the ~550-credit multi-station experiment from the live-mapping research.
 
-Next: orchestrator verifies + merges each, then UI implementation work packages from the design spec. If a session ends mid-flight, check `git worktree list` and each branch's log.
+**In flight:** WP1 UI foundation (`feat/ui-wp1-foundation`, agent worktree). Then WP2-WP5 in parallel per the design spec. Orchestrator lesson: agents pick their own branch names; always read `git -C <worktree> branch --show-current` before merging (a wrong-branch merge + `branch -D` happened once and was recovered from the SHA).
 
 ## What landed 2026-11-04
 
@@ -55,9 +55,9 @@ Upload worked: 28 frames + 28 LiDAR depth maps (~22 KB each) in R2, stitch v2 ra
 
 - Not GitHub-linked; pushing does not deploy. The repo **is** `railway link`ed to production. From the repo root: `railway up -p 1690518b-f063-41df-8839-19c0b00a33a1 -e production -s api --ci`, then `-s worker`. `railway up` ships the working tree, so deploy from a clean `main`.
 - **Config is IaC:** `.railway/railway.ts` declares both services; **a resource omitted there is deleted on apply**. Change with `railway config plan` then `railway config apply`; the SDK lives in `.railway/` (`cd .railway && npm ci`). Variables are unmanaged (secrets never in the file). api has healthcheck `/healthz`.
-- **Migrations do not run on deploy.** Apply by hand *before* `railway up`, over the direct (non-`-pooler`) host: `cd backend && DATABASE_URL=… AUTH_MODE=dev DEV_AUTH_TOKEN=x npx tsx src/migrate.ts`.
+- **Migrations do not run on deploy yet** (the api `preDeploy` is in `railway.ts` but not applied; needs `MIGRATE_DATABASE_URL` first). Apply by hand *before* `railway up`, over the direct (non-`-pooler`) host: `cd backend && DATABASE_URL=… AUTH_MODE=dev DEV_AUTH_TOKEN=x npx tsx src/migrate.ts`.
 - `ALLOW_DEV_AUTH=1` on api + worker (production still runs dev auth). Worker: `PROVIDER_MODE=live`, `DAILY_CREDIT_BUDGET=2000`. Base image must stay `node:24-trixie-slim` (numpy needs Python ≥3.12).
-- Post-deploy checks: `/healthz`; worker log shows `started; kinds=stitch,generate_draft,generate_hq,purge` and no `claim error`. The pg `sslmode` security warning in worker logs is known (R33).
+- Post-deploy checks: `/healthz`; worker log shows `started; kinds=stitch,generate_draft,generate_hq,purge` and no `claim error`. The pg `sslmode` warning disappears once the R33 fix is deployed.
 - Optional env vars (all defaulted) are listed in `backend/.env.example`.
 
 ## Standing rules learned the hard way
