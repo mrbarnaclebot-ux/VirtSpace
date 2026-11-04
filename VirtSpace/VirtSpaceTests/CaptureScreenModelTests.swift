@@ -37,7 +37,7 @@ struct CaptureScreenModelTests {
 
     @Test("An exhausted quota blocks capture before the engine starts")
     func exhaustedQuotaBlocksStart() async throws {
-        let model = CaptureScreenModel(api: APIClient())
+        let model = CaptureScreenModel(api: APIClient(), toasts: ToastCenter())
         model.applyQuota(try quota(remaining: 0, resetsAt: Date().addingTimeInterval(3_600)))
 
         #expect(model.isQuotaExhausted)
@@ -51,7 +51,7 @@ struct CaptureScreenModelTests {
 
     @Test("A failed quota check fails open")
     func unknownQuotaFailsOpen() throws {
-        let model = CaptureScreenModel(api: APIClient())
+        let model = CaptureScreenModel(api: APIClient(), toasts: ToastCenter())
         model.applyQuota(try quota(remaining: 0))
         model.applyQuota(nil)
 
@@ -63,7 +63,7 @@ struct CaptureScreenModelTests {
 
     @Test("Low-allowance hint below five scans only")
     func lowQuotaHint() throws {
-        let model = CaptureScreenModel(api: APIClient())
+        let model = CaptureScreenModel(api: APIClient(), toasts: ToastCenter())
         model.applyQuota(try quota(remaining: 1))
         #expect(model.lowQuotaHint == "1 scan left today")
         model.applyQuota(try quota(remaining: 4))

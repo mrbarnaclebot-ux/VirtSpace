@@ -15,7 +15,7 @@ struct LibraryView: View {
     @State private var worlds: [World] = []
     @State private var isLoading = false
     @State private var hasLoadedOnce = false
-    @State private var toast: Toast?
+    @Environment(ToastCenter.self) private var toasts
     @State private var pollTask: Task<Void, Never>?
 
     /// Client-truth "Uploading i/N" per world id, read from pending capture
@@ -49,7 +49,6 @@ struct LibraryView: View {
             }
             .navigationBarTitleDisplayMode(.inline)
             .background(Color(.systemBackground))
-            .toast($toast)
             .toolbar {
                 // A tappable title stands in for the nav title so the secret
                 // gesture has a reliable hit target.
@@ -173,7 +172,7 @@ struct LibraryView: View {
             await refreshUploadProgress()
         } catch {
             if showErrors, !Task.isCancelled {
-                toast = Toast(error)
+                toasts.show(error)
             }
         }
     }
@@ -388,5 +387,6 @@ struct StatusChip: View {
 #Preview {
     LibraryView()
         .environment(APIClient())
+        .environment(ToastCenter())
         .preferredColorScheme(.dark)
 }

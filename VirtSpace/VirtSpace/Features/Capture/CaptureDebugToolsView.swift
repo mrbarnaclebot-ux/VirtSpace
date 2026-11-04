@@ -105,7 +105,7 @@ struct CaptureDebugToolsView: View {
             try await api.framesDone(worldId: world.id)
             await model.announceUploadedAndSwitch("Test scan started — watch it in Library.")
         } catch {
-            model.toast = Toast(error)
+            model.toasts.show(error)
         }
     }
 

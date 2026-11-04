@@ -20,7 +20,6 @@ final class CaptureScreenModel {
     let engine: CaptureEngine
     var hud: CaptureHUDState { engine.hud }
 
-    var toast: Toast?
     /// Non-nil while an upload is in flight (frames done so far) — drives the
     /// full-screen upload overlay.
     private(set) var uploadedFrames: Int? {
@@ -38,11 +37,13 @@ final class CaptureScreenModel {
     private(set) var quotaResetsAt: Date?
 
     @ObservationIgnored private let api: APIClient
+    @ObservationIgnored let toasts: ToastCenter
     @ObservationIgnored let switchToLibrary: () -> Void
     @ObservationIgnored private var didResumePending = false
 
-    init(api: APIClient, switchToLibrary: @escaping () -> Void = {}) {
+    init(api: APIClient, toasts: ToastCenter, switchToLibrary: @escaping () -> Void = {}) {
         self.api = api
+        self.toasts = toasts
         self.switchToLibrary = switchToLibrary
         // Orphan-world prevention: abandoning a scan whose session already
         // minted a backend world (confirm-abandon in the HUD, thermal-overlay
@@ -138,7 +139,7 @@ final class CaptureScreenModel {
         // Never crash on a missing usage string: the OS kills the app on
         // camera access without NSCameraUsageDescription in the Info.plist.
         guard Bundle.main.object(forInfoDictionaryKey: "NSCameraUsageDescription") != nil else {
-            toast = Toast(message: "Camera permission text is missing from the build — capture is disabled.", style: .error)
+            toasts.show("Camera permission text is missing from the build — capture is disabled.", style: .error)
             return
         }
         switch AVCaptureDevice.authorizationStatus(for: .video) {
@@ -148,10 +149,10 @@ final class CaptureScreenModel {
             if await AVCaptureDevice.requestAccess(for: .video) {
                 engine.start()
             } else {
-                toast = Toast(message: "Camera access is needed to capture your space.", style: .error)
+                toasts.show("Camera access is needed to capture your space.", style: .error)
             }
         default:
-            toast = Toast(message: "Camera access is denied. Enable it in Settings → VirtSpace.", style: .error)
+            toasts.show("Camera access is denied. Enable it in Settings → VirtSpace.", style: .error)
         }
         #endif
     }
@@ -174,7 +175,7 @@ final class CaptureScreenModel {
         case .success:
             await announceUploadedAndSwitch()
         case .failure(let error):
-            toast = Toast(message: "Upload failed — your scan is saved. Retry from here or relaunch. (\((error as? LocalizedError)?.errorDescription ?? error.localizedDescription))", style: .error)
+            toasts.show("Upload failed — your scan is saved. Retry from here or relaunch. (\((error as? LocalizedError)?.errorDescription ?? error.localizedDescription))", style: .error)
         }
     }
 
@@ -193,13 +194,13 @@ final class CaptureScreenModel {
         case .succeeded:
             await announceUploadedAndSwitch()
         case .nothingToResume:
-            toast = Toast(message: "Nothing left to upload.", style: .success)
+            toasts.show("Nothing left to upload.", style: .success)
         case .failed(let reason):
             // Report what ACTUALLY went wrong — resumePending used to swallow
             // every error, so this always read "check your connection".
-            toast = Toast(message: "Upload failed again — \(reason)", style: .error)
+            toasts.show("Upload failed again — \(reason)", style: .error)
         case .deferred(let reason):
-            toast = Toast(message: "Upload not retried — \(reason).", style: .error)
+            toasts.show("Upload not retried — \(reason).", style: .error)
         }
     }
 
@@ -208,7 +209,7 @@ final class CaptureScreenModel {
         let discarded = await UploadManager.shared.kickDiscardPending(api: api).value
         await refreshPendingUpload()
         if discarded > 0 {
-            toast = Toast(message: "Scan discarded.", style: .success)
+            toasts.show("Scan discarded.", style: .success)
         }
     }
 
@@ -221,14 +222,14 @@ final class CaptureScreenModel {
         let outcome = await UploadManager.shared.kickResume(api: api).value
         await refreshPendingUpload()
         if case .succeeded(let worlds) = outcome, !worlds.isEmpty {
-            toast = Toast(message: "Resumed \(worlds.count) pending scan upload\(worlds.count == 1 ? "" : "s").", style: .success)
+            toasts.show("Resumed \(worlds.count) pending scan upload\(worlds.count == 1 ? "" : "s").", style: .success)
         }
     }
 
     /// Shared tail of a successful upload: confirm, let the toast land, then
     /// route to the Library where the world builds.
     func announceUploadedAndSwitch(_ message: String = "Scan uploaded — watch it build in Library.") async {
-        toast = Toast(message: message, style: .success)
+        toasts.show(message, style: .success)
         try? await Task.sleep(for: .milliseconds(700))
         switchToLibrary()
     }

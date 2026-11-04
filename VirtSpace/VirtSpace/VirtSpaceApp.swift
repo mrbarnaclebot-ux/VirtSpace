@@ -47,11 +47,14 @@ struct VirtSpaceApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @Environment(\.scenePhase) private var scenePhase
     @State private var apiClient = APIClient()
+    @State private var toasts = ToastCenter()
 
     var body: some Scene {
         WindowGroup {
             ContentView()
                 .environment(apiClient)
+                .environment(toasts)
+                .onAppear { ToastWindow.install(toasts) }
         }
         // Completion kick (launch + every return to foreground): finish any
         // pending session whose manifest shows createdWorldId + all frames

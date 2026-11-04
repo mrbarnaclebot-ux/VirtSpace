@@ -15,11 +15,12 @@ struct ContentView: View {
     }
 
     @Environment(APIClient.self) private var api
+    @Environment(ToastCenter.self) private var toasts
     @State private var selectedTab: Tab = .capture
 
     var body: some View {
         TabView(selection: $selectedTab) {
-            CaptureView(api: api, switchToLibrary: { selectedTab = .library })
+            CaptureView(api: api, toasts: toasts, switchToLibrary: { selectedTab = .library })
                 .tabItem {
                     Label("Capture", systemImage: "viewfinder")
                 }
@@ -39,4 +40,5 @@ struct ContentView: View {
 #Preview {
     ContentView()
         .environment(APIClient())
+        .environment(ToastCenter())
 }

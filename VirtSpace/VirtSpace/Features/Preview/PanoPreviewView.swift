@@ -43,7 +43,7 @@ struct PanoPreviewView: View {
     @State private var phase: Phase = .loading(0)
     @State private var image: UIImage?
     @State private var reloadToken = 0
-    @State private var toast: Toast?
+    @Environment(ToastCenter.self) private var toasts
     @State private var isSaving = false
     // Retained for the duration of a Photos save (UIKit completion target).
     @State private var photoSaver: PhotoSaver?
@@ -64,7 +64,6 @@ struct PanoPreviewView: View {
         }
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
-        .toast($toast)
         .task(id: reloadToken) { await load() }
         .onAppear { UIApplication.shared.isIdleTimerDisabled = true }
         .onDisappear { UIApplication.shared.isIdleTimerDisabled = false }
@@ -120,9 +119,9 @@ struct PanoPreviewView: View {
                 isSaving = false
                 photoSaver = nil
                 if let error {
-                    toast = Toast(message: "Couldn't save: \(error.localizedDescription)", style: .error)
+                    toasts.show("Couldn't save: \(error.localizedDescription)", style: .error)
                 } else {
-                    toast = Toast(message: "Saved to Photos.", style: .success)
+                    toasts.show("Saved to Photos.", style: .success)
                 }
             }
         }

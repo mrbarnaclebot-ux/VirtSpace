@@ -28,7 +28,7 @@ struct SettingsView: View {
     /// session to sign out of, so we swap to a fresh-install-like placeholder.
     @State private var accountDeleted = false
 
-    @State private var toast: Toast?
+    @Environment(ToastCenter.self) private var toasts
 
     #if DEBUG
     @State private var fixturePano: PanoFixture?
@@ -53,7 +53,6 @@ struct SettingsView: View {
                     Button("Done") { dismiss() }
                 }
             }
-            .toast($toast)
         }
         .task { await measure() }
         #if DEBUG
@@ -236,7 +235,7 @@ struct SettingsView: View {
         await SplatCache.shared.clear()
         await PanoCache.shared.clear()
         await measure()
-        toast = Toast(message: "Cache cleared.", style: .success)
+        toasts.show("Cache cleared.", style: .success)
     }
 
     private func deleteAccount() async {
@@ -251,14 +250,14 @@ struct SettingsView: View {
             await PanoCache.shared.clear()
             accountDeleted = true
         } catch {
-            toast = Toast(error)
+            toasts.show(error)
         }
     }
 
     #if DEBUG
     private func openFixturePano() {
         guard let url = Self.makeFixturePano() else {
-            toast = Toast(message: "Couldn't render the fixture pano.", style: .error)
+            toasts.show("Couldn't render the fixture pano.", style: .error)
             return
         }
         fixturePano = PanoFixture(url: url)
@@ -316,5 +315,6 @@ struct SettingsView: View {
 #Preview {
     SettingsView()
         .environment(APIClient())
+        .environment(ToastCenter())
         .preferredColorScheme(.dark)
 }

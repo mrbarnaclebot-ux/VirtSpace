@@ -20,7 +20,7 @@ struct WorldDetailView: View {
     /// `assets` object; seeded from the list item's thumbnail-only assets.
     @State var assets: WorldAssets?
 
-    @State private var toast: Toast?
+    @Environment(ToastCenter.self) private var toasts
     @State private var showDeleteConfirm = false
     @State private var isWorking = false
     @State private var pollTask: Task<Void, Never>?
@@ -81,7 +81,6 @@ struct WorldDetailView: View {
         .navigationTitle(world?.title ?? "World")
         .navigationBarTitleDisplayMode(.inline)
         .background(Color(.systemBackground))
-        .toast($toast)
         .fullScreenCover(item: $explorer) { presentation in
             ExplorerView(source: presentation.source, title: presentation.title)
         }
@@ -267,7 +266,7 @@ struct WorldDetailView: View {
 
     private func openPano(_ world: World) {
         guard let url = assets?.panoAsURL else {
-            toast = Toast(message: "This world has no 360° photo yet.", style: .error)
+            toasts.show("This world has no 360° photo yet.", style: .error)
             return
         }
         pano = PanoPresentation(
@@ -287,7 +286,7 @@ struct WorldDetailView: View {
     private func openExplorer(_ world: World) async {
         guard let splat = WorldAssets.explorerSplat(assets: assets),
               let remoteURL = URL(string: splat.url) else {
-            toast = Toast(message: "This world has no 3D asset yet.", style: .error)
+            toasts.show("This world has no 3D asset yet.", style: .error)
             return
         }
         isPreparingExplorer = true
@@ -304,7 +303,7 @@ struct WorldDetailView: View {
             }
             explorer = ExplorerPresentation(source: .file(local), title: world.title)
         } catch {
-            toast = Toast(error)
+            toasts.show(error)
         }
     }
 
@@ -317,7 +316,7 @@ struct WorldDetailView: View {
             assets = envelope.assets
         } catch {
             if showErrors, !Task.isCancelled {
-                toast = Toast(error)
+                toasts.show(error)
             }
         }
     }
@@ -345,11 +344,11 @@ struct WorldDetailView: View {
         world?.status = .generatingHq
         do {
             try await api.enhance(worldId: worldId)
-            toast = Toast(message: "Enhancing to HQ — this takes a few minutes.", style: .success)
+            toasts.show("Enhancing to HQ — this takes a few minutes.", style: .success)
             startPollingIfNeeded()
         } catch {
             world?.status = previous
-            toast = Toast(error)
+            toasts.show(error)
         }
     }
 
@@ -360,7 +359,7 @@ struct WorldDetailView: View {
             try await api.deleteWorld(id: worldId)
             dismiss()
         } catch {
-            toast = Toast(error)
+            toasts.show(error)
         }
     }
 }
@@ -499,5 +498,6 @@ struct StatusTimeline: View {
         WorldDetailView(worldId: "preview")
     }
     .environment(APIClient())
+    .environment(ToastCenter())
     .preferredColorScheme(.dark)
 }

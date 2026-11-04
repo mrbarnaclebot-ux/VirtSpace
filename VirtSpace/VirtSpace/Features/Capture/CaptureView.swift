@@ -20,8 +20,8 @@ struct CaptureView: View {
 
     /// `switchToLibrary` is set by the app shell so finished scans can route
     /// to the Library tab.
-    init(api: APIClient, switchToLibrary: @escaping () -> Void = {}) {
-        _model = State(initialValue: CaptureScreenModel(api: api, switchToLibrary: switchToLibrary))
+    init(api: APIClient, toasts: ToastCenter, switchToLibrary: @escaping () -> Void = {}) {
+        _model = State(initialValue: CaptureScreenModel(api: api, toasts: toasts, switchToLibrary: switchToLibrary))
     }
 
     var body: some View {
@@ -39,7 +39,6 @@ struct CaptureView: View {
             .animation(.easeOut(duration: 0.25), value: model.uploadedFrames == nil)
             .animation(.easeOut(duration: 0.25), value: hud.isThermallyPaused)
             .navigationBarHidden(true)
-            .toast($model.toast)
             .onChange(of: hud.state) { _, newState in
                 model.engineStateChanged(to: newState)
             }
@@ -176,7 +175,7 @@ struct CaptureView: View {
 }
 
 #Preview {
-    CaptureView(api: APIClient())
+    CaptureView(api: APIClient(), toasts: ToastCenter())
         .environment(APIClient())
         .preferredColorScheme(.dark)
 }
