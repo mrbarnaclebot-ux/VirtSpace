@@ -122,10 +122,11 @@ nonisolated final class ShotPipeline: @unchecked Sendable {
             exposureLocked: exposureLocked,
             iso: still.iso,
             exposureDuration: still.exposureDuration,
-            featureDepthMedian: still.featureDepthMedian
+            featureDepthMedian: still.featureDepthMedian,
+            depth: still.depth?.size
         )
         do {
-            try store.saveFrame(still.jpegData, pose: pose, in: session)
+            try store.saveFrame(still.jpegData, depthPNG: still.depth?.png, pose: pose, in: session)
         } catch {
             return .saveFailed(
                 index: index,

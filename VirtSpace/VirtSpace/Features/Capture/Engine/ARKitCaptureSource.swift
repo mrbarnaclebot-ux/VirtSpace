@@ -89,10 +89,13 @@ nonisolated final class ARKitCaptureSource: NSObject, CaptureSource, ARSessionDe
         // Thermal trim (Stage B3 deliverable 2a): this is a pure pose+still
         // capture — turn OFF every ARKit subsystem we don't use so the device
         // does less work and runs cooler. Plane detection, scene
-        // reconstruction (LiDAR mesh), frame semantics (segmentation/depth),
-        // environment texturing and light estimation are all unnecessary here.
+        // reconstruction (LiDAR mesh), segmentation, environment texturing and
+        // light estimation are all unnecessary here.
         configuration.planeDetection = []
-        configuration.frameSemantics = []
+        // The one exception is LiDAR scene depth on Pro iPhones (spec §5.2):
+        // the stitcher's translation-aware reprojection needs it.
+        configuration.frameSemantics = ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth)
+            ? [.sceneDepth] : []
         configuration.environmentTexturing = .none
         configuration.isLightEstimationEnabled = false
         if ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
@@ -240,7 +243,13 @@ nonisolated final class ARKitCaptureSource: NSObject, CaptureSource, ARSessionDe
             // current ISO is the one this frame was exposed at.
             iso: camera.device?.iso,
             exposureDuration: frame.camera.exposureDuration,
-            featureDepthMedian: Self.featureDepthMedian(frame.rawFeaturePoints != nil ? frame : live)
+            featureDepthMedian: Self.featureDepthMedian(frame.rawFeaturePoints != nil ? frame : live),
+            // The high-res frame may not carry depth; the live frame's map is
+            // from the same steady hold. Encoded untransformed — see
+            // FrameDepth for why that matches the JPEG.
+            depth: (frame.sceneDepth ?? live?.sceneDepth).flatMap {
+                FrameDepth.encode(depthMap: $0.depthMap, confidenceMap: $0.confidenceMap)
+            }
         ))
     }
 

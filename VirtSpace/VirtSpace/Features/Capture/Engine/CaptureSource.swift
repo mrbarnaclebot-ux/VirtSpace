@@ -48,6 +48,8 @@ nonisolated struct CapturedStill: Sendable {
     var exposureDuration: Double?
     /// Median depth (metres) of ARKit's raw feature points in view.
     var featureDepthMedian: Float?
+    /// LiDAR depth map for this still, same orientation and FOV as the JPEG.
+    var depth: EncodedDepth?
 }
 
 nonisolated enum CaptureSourceError: LocalizedError {

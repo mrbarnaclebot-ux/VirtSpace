@@ -302,6 +302,13 @@ struct FramePose: Codable, Hashable {
     var featureDepthMedian: Float?
 }
 
+/// Pixel size of a frame's depth map (spec §5.2 `depth`). Nonisolated: built
+/// on the camera's encode queue.
+nonisolated struct FrameDepthSize: Codable, Hashable, Sendable {
+    let width: Int
+    let height: Int
+}
+
 /// `POST /v1/worlds/:id/frames:done` body. `poses` is optional on the wire —
 /// the backend tolerates it being absent (older clients / test harness).
 struct FramesDoneRequest: Encodable {

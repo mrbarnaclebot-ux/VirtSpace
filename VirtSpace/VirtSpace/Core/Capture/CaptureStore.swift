@@ -4,8 +4,8 @@
 //
 //  Crash-proof on-disk capture sessions (spec §6.1: every frame + pose is
 //  written the moment it's taken; a killed app resumes the upload on next
-//  launch). Layout: Application Support/captures/<uuid>/frame_<i>.jpg plus
-//  poses.json (rewritten atomically after every shot). Sessions survive until
+//  launch). Layout: Application Support/captures/<uuid>/frame_<i>.jpg, an
+//  optional depth_<i>.png (LiDAR, spec §5.2) per frame, plus poses.json (rewritten atomically after every shot). Sessions survive until
 //  `purge(id:)` after a successful upload.
 //
 
@@ -40,6 +40,9 @@ nonisolated final class CaptureStore: @unchecked Sendable {
         let exposureDuration: Double?
         /// Median depth (metres) of ARKit raw feature points in view.
         let featureDepthMedian: Float?
+        /// Size of depth_<index>.png, set iff that file was written to disk.
+        /// On the wire it is sent only once the file is UPLOADED.
+        var depth: FrameDepthSize?
 
         init(
             index: Int,
@@ -49,7 +52,8 @@ nonisolated final class CaptureStore: @unchecked Sendable {
             exposureLocked: Bool,
             iso: Float? = nil,
             exposureDuration: Double? = nil,
-            featureDepthMedian: Float? = nil
+            featureDepthMedian: Float? = nil,
+            depth: FrameDepthSize? = nil
         ) {
             self.index = index
             self.timestamp = timestamp
@@ -65,6 +69,7 @@ nonisolated final class CaptureStore: @unchecked Sendable {
             self.iso = iso
             self.exposureDuration = exposureDuration
             self.featureDepthMedian = featureDepthMedian
+            self.depth = depth
         }
 
         /// The frames:done wire shape. Nil fields are omitted, never sent as
@@ -260,15 +265,27 @@ nonisolated final class CaptureStore: @unchecked Sendable {
         return Session(id: id, directory: directory)
     }
 
-    /// Persist one shot: frame_<i>.jpg written atomically, then poses.json
-    /// rewritten atomically. After this returns, the shot survives a crash.
+    /// Persist one shot: frame_<i>.jpg and (when present) depth_<i>.png written
+    /// atomically, then poses.json rewritten atomically. After this returns,
+    /// the shot survives a crash. A depth file that can't be written never
+    /// fails the shot: the pose just records no depth.
     ///
     /// Threading: intentionally synchronous — the write MUST complete before we
     /// return so the shot is crash-safe (spec §6.1). It is only ever called
     /// from the engine's background serial queue (never the main actor), so the
     /// blocking disk I/O stays off the UI thread. Do not call from MainActor.
-    func saveFrame(_ jpegData: Data, pose: FramePose, in session: Session) throws {
+    func saveFrame(_ jpegData: Data, depthPNG: Data? = nil, pose: FramePose, in session: Session) throws {
         try jpegData.write(to: frameURL(index: pose.index, in: session.directory), options: .atomic)
+        var pose = pose
+        if let depthPNG, pose.depth != nil {
+            do {
+                try depthPNG.write(to: depthURL(index: pose.index, in: session.directory), options: .atomic)
+            } catch {
+                pose.depth = nil
+            }
+        } else {
+            pose.depth = nil
+        }
         var manifest = manifests[session.id] ?? (try? readManifest(in: session.directory))
             ?? Manifest(sessionID: session.id, expectedFrameCount: pose.index + 1, createdAt: Date(), frames: [])
         manifest.frames.removeAll { $0.index == pose.index }
@@ -451,6 +468,10 @@ nonisolated final class CaptureStore: @unchecked Sendable {
 
     func frameURL(index: Int, in directory: URL) -> URL {
         directory.appendingPathComponent("frame_\(index).jpg")
+    }
+
+    func depthURL(index: Int, in directory: URL) -> URL {
+        directory.appendingPathComponent("depth_\(index).png")
     }
 
     private func manifestURL(in directory: URL) -> URL {
