@@ -27,6 +27,7 @@ import {
   type WorldModel,
 } from './provider/index.js';
 import { sendPush, type SendPush } from './push.js';
+import { stageDepthMaps } from './depth.js';
 
 // Stage 2 worker loop (spec §4 steps 1–6, §7 state machine, §14 credit safety).
 // Entrypoint: `npm run worker`. Claims jobs of kinds [stitch, generate_draft,
@@ -207,6 +208,8 @@ export interface StitcherArgs {
   width: number;
   previewPath?: string | null;
   posesPath?: string | null;
+  /** Dir of depth_<i>.png maps; only passed when at least one was staged. */
+  depthDir?: string | null;
 }
 
 /**
@@ -222,6 +225,7 @@ export function buildStitcherArgs(a: StitcherArgs): string[] {
   ];
   if (a.posesPath) args.push('--poses', a.posesPath);
   if (a.previewPath) args.push('--preview-out', a.previewPath);
+  if (a.depthDir) args.push('--depth-dir', a.depthDir);
   return args;
 }
 
@@ -857,6 +861,18 @@ export async function handleStitch(deps: WorkerDeps, job: Job): Promise<void> {
       await writeFile(posesPath, serializePoses(capture.posesJson));
     }
 
+    // Optional LiDAR depth (spec §5.2 item 4). Best-effort by contract: depth
+    // problems degrade that frame to depth-less, they never fail the job.
+    const depthDir = path.join(workDir, 'depth');
+    await mkdir(depthDir, { recursive: true });
+    const depthStaged = await stageDepthMaps({
+      storage,
+      prefix: framePrefix,
+      posesJson: capture.posesJson,
+      frameCount: capture.frameCount,
+      depthDir,
+    });
+
     const outPath = path.join(workDir, 'pano.jpg');
     const previewPath = path.join(workDir, 'pano_preview.jpg');
     const args = buildStitcherArgs({
@@ -866,6 +882,7 @@ export async function handleStitch(deps: WorkerDeps, job: Job): Promise<void> {
       width: config.STITCHER_WIDTH,
       previewPath,
       posesPath,
+      depthDir: depthStaged > 0 ? depthDir : null,
     });
 
     // Stream the child's stdout for PROGRESS lines and mirror them (throttled)

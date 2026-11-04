@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
-import { writeFile } from 'node:fs/promises';
+import { readdir, readFile, writeFile } from 'node:fs/promises';
+import path from 'node:path';
 import {
   stitchPlan,
   serializePoses,
@@ -96,6 +97,12 @@ describe('buildStitcherArgs', () => {
   it('omits --poses when no poses path (nominal fallback)', () => {
     const args = buildStitcherArgs({ ...base, posesPath: null });
     expect(args).not.toContain('--poses');
+  });
+
+  it('includes --depth-dir only when a depth dir is given', () => {
+    const args = buildStitcherArgs({ ...base, depthDir: '/tmp/w/depth' });
+    expect(args[args.indexOf('--depth-dir') + 1]).toBe('/tmp/w/depth');
+    expect(buildStitcherArgs({ ...base, depthDir: null })).not.toContain('--depth-dir');
   });
 
   it('includes --preview-out only when a preview path is given', () => {
@@ -550,5 +557,125 @@ describe('handleStitch failure classification', () => {
     const late = await runFailing({ code: 137, timedOut: true }, 2);
     expect(late.err).toBeInstanceOf(NonRetryableJobError);
     expect((late.err as Error).message).toContain('timed out');
+  });
+});
+
+// --- optional LiDAR depth (spec §5.2 items 2 + 4) ----------------------------
+
+describe('handleStitch depth maps', () => {
+  const PNG = Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    Buffer.from('depthdata'),
+  ]);
+  const pose = (index: number, depth?: { width: number; height: number }) => ({
+    index, transform: Array(16).fill(0), intrinsics: Array(9).fill(1),
+    ...(depth ? { depth } : {}),
+  });
+
+  /** Storage backed by a key → bytes map; objectSize may be overridden per key. */
+  function mapStorage(objects: Record<string, Buffer>, sizes: Record<string, number> = {}) {
+    const gets: string[] = [];
+    const storage = {
+      kind: 'local',
+      presignUpload: vi.fn(),
+      presignDownload: vi.fn(),
+      putObject: vi.fn(),
+      getObject: vi.fn(async (key: string) => {
+        gets.push(key);
+        const b = objects[key];
+        if (!b) throw new Error('NoSuchKey');
+        return b;
+      }),
+      deleteObject: vi.fn(),
+      objectSize: vi.fn(async (key: string) => {
+        if (key in sizes) return sizes[key]!;
+        const b = objects[key];
+        if (!b) throw new Error('NoSuchKey');
+        return b.length;
+      }),
+    } as unknown as StorageDriver;
+    return { storage, gets };
+  }
+
+  /** Records argv and the staged depth dir's contents at spawn time (the work
+   * dir is deleted once the handler returns). */
+  function recordingSpawner() {
+    const seen: { args: string[]; depthFiles: Record<string, Buffer> | null } = {
+      args: [], depthFiles: null,
+    };
+    const inner = fakeSpawner();
+    const fn: StitcherSpawner = async (bin, args, t, onStdout) => {
+      seen.args = args;
+      const i = args.indexOf('--depth-dir');
+      if (i >= 0) {
+        const dir = args[i + 1]!;
+        seen.depthFiles = {};
+        for (const f of await readdir(dir)) seen.depthFiles[f] = await readFile(path.join(dir, f));
+      }
+      return inner(bin, args, t, onStdout);
+    };
+    return { fn, seen };
+  }
+
+  const frames = (n: number) =>
+    Object.fromEntries(
+      Array.from({ length: n }, (_v, i) => [`captures/cap-1/frame_${i}.heic`, Buffer.from('jpg')]),
+    );
+
+  it('stages valid depth maps and passes --depth-dir; skips missing/invalid/oversize', async () => {
+    const sink: Sink = { updates: [], inserts: [], executes: 0 };
+    const d = { width: 256, height: 192 };
+    const poses = [pose(0, d), pose(1, d), pose(2, d), pose(3, d), pose(4)];
+    const db = makeStitchDb(fakeWorld(), fakeCapture(5, poses), sink);
+    const { storage, gets } = mapStorage(
+      {
+        ...frames(5),
+        'captures/cap-1/depth_0.png': PNG, // valid
+        // depth_1 missing
+        'captures/cap-1/depth_2.png': Buffer.from('not a png at all'),
+        'captures/cap-1/depth_3.png': PNG,
+        'captures/cap-1/depth_4.png': PNG, // pose 4 has no `depth` → never read
+      },
+      { 'captures/cap-1/depth_3.png': 1024 * 1024 + 1 },
+    );
+    const { fn, seen } = recordingSpawner();
+    const log = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    await handleStitch(deps(db, storage, fn), stitchJob);
+
+    expect(Object.keys(seen.depthFiles ?? {})).toEqual(['depth_0.png']);
+    expect(seen.depthFiles!['depth_0.png']!.equals(PNG)).toBe(true);
+    expect(gets).not.toContain('captures/cap-1/depth_3.png'); // oversize never read
+    expect(gets).not.toContain('captures/cap-1/depth_4.png');
+    expect(log).toHaveBeenCalledTimes(3);
+    expect(sink.updates.some((u) => u.patch['status'] === 'generating_draft')).toBe(true);
+    log.mockRestore();
+  });
+
+  it('every depth map unusable → no --depth-dir, job still succeeds', async () => {
+    const sink: Sink = { updates: [], inserts: [], executes: 0 };
+    const poses = [pose(0, { width: 256, height: 192 }), pose(1, { width: 256, height: 192 })];
+    const db = makeStitchDb(fakeWorld(), fakeCapture(2, poses), sink);
+    const { storage } = mapStorage(frames(2));
+    const { fn, seen } = recordingSpawner();
+    const log = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    await handleStitch(deps(db, storage, fn), stitchJob);
+
+    expect(seen.args).not.toContain('--depth-dir');
+    expect(sink.updates.some((u) => u.patch['status'] === 'generating_draft')).toBe(true);
+    log.mockRestore();
+  });
+
+  it('no depth fields → no depth reads, no --depth-dir', async () => {
+    const sink: Sink = { updates: [], inserts: [], executes: 0 };
+    const db = makeStitchDb(fakeWorld(), fakeCapture(2, [pose(0), pose(1)]), sink);
+    const { storage, gets } = mapStorage(frames(2));
+    const { fn, seen } = recordingSpawner();
+
+    await handleStitch(deps(db, storage, fn), stitchJob);
+
+    expect(seen.args).not.toContain('--depth-dir');
+    expect(gets.some((k) => k.includes('depth_'))).toBe(false);
   });
 });
