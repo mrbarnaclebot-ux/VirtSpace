@@ -332,7 +332,6 @@
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_NSCameraUsageDescription = "VirtSpace uses the camera to capture 360° photos of your space.";
-				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "Your location tags scans with the place they were captured (optional).";
 				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "Saves your 360° panoramas to Photos when you choose to download them.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
@@ -365,10 +364,10 @@
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 7G2CQMAK7G;
+				EXCLUDED_SOURCE_FILE_NAMES = fixture.spz;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_NSCameraUsageDescription = "VirtSpace uses the camera to capture 360° photos of your space.";
-				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "Your location tags scans with the place they were captured (optional).";
 				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "Saves your 360° panoramas to Photos when you choose to download them.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;

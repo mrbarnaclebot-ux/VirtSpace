@@ -7,6 +7,10 @@
 	<key>NSPrivacyTrackingDomains</key>
 	<array/>
 	<key>NSPrivacyCollectedDataTypes</key>
+	<!-- Audited 2026-11 (spec §10 R32): capture frames + LiDAR depth maps
+	     (PhotosorVideos), per-frame camera pose/exposure metadata
+	     (OtherDataTypes), and the account id the API identifies the user by
+	     (UserID). No location, no device identifier, no analytics. -->
 	<array>
 		<dict>
 			<key>NSPrivacyCollectedDataType</key>
@@ -22,7 +26,7 @@
 		</dict>
 		<dict>
 			<key>NSPrivacyCollectedDataType</key>
-			<string>NSPrivacyCollectedDataTypePreciseLocation</string>
+			<string>NSPrivacyCollectedDataTypeOtherDataTypes</string>
 			<key>NSPrivacyCollectedDataTypeLinked</key>
 			<true/>
 			<key>NSPrivacyCollectedDataTypeTracking</key>
