@@ -4,8 +4,6 @@ tools/
 .claude/
 *.mp4
 node_modules
-package.json
-package-lock.json
 .railwayignore
 spec-doc.md
 CLAUDE.md

@@ -17,8 +17,12 @@ calls happen at import or boot.
 
 ## Setup
 
+Run every npm command from inside `backend/` — it holds the only lockfile, the
+same one the Docker image installs from (there is no root workspace).
+
 ```bash
-npm install
+cd backend
+npm ci
 cp .env.example .env      # fill in DATABASE_URL + DEV_AUTH_TOKEN at minimum
 npm run db:generate       # (already committed) generate SQL from the schema
 npm run db:migrate        # apply migrations to the DB in DATABASE_URL
