@@ -1139,17 +1139,22 @@ export async function handleJobError(db: Db, job: Job, err: unknown): Promise<vo
   if (nonRetryable) {
     console.error(`[worker] job ${job.id} (${job.kind}) parked DEAD: ${message}`);
     await parkJobDead(db, job.id, message);
-    const failed = failedStatusFor(job.kind);
-    if (failed) {
-      await db
-        .update(worlds)
-        .set({ status: failed, progress: null, updatedAt: sql`now()` })
-        .where(eq(worlds.id, job.worldId))
-        .catch(() => undefined);
-    }
   } else {
     console.error(`[worker] job ${job.id} (${job.kind}) failed (retryable): ${message}`);
-    await failJob(db, job.id, message);
+    // A retryable failure that exhausts MAX_ATTEMPTS is just as dead: without
+    // the world update below it sat in stitching/generating_* forever while the
+    // app polled. Nothing else is unwound on either path — a credit reservation
+    // stays put because generate may already have been called (spec §14).
+    if ((await failJob(db, job.id, message)) !== 'dead') return;
+    console.error(`[worker] job ${job.id} (${job.kind}) exhausted its retries, now DEAD`);
+  }
+  const failed = failedStatusFor(job.kind);
+  if (failed) {
+    await db
+      .update(worlds)
+      .set({ status: failed, progress: null, updatedAt: sql`now()` })
+      .where(eq(worlds.id, job.worldId))
+      .catch(() => undefined);
   }
 }
 

@@ -383,3 +383,37 @@ describe('handleJobError with a lost lease', () => {
     expect(sink.updates.some((u) => u.patch['status'] === 'failed_stitch')).toBe(true);
   });
 });
+
+// --- retry exhaustion must fail the world, not strand it ---------------------
+
+describe('handleJobError on a retryable failure', () => {
+  it('a retry left → job requeued, world untouched', async () => {
+    const sink = newSink();
+    const db = makeDb({ world: fakeWorld(), sink, heartbeatRows: () => [{ phase: 'queued' }] });
+
+    await handleJobError(db, stitchJob, new Error('disk hiccup'));
+
+    expect(sink.executes.some((s) => s.includes('RETURNING phase'))).toBe(true);
+    expect(sink.updates).toEqual([]);
+  });
+
+  it.each([
+    ['stitch', 'failed_stitch'],
+    ['generate_draft', 'failed_generating_draft'],
+    ['generate_hq', 'failed_generating_hq'],
+  ] as const)('5th failure of %s → job dead AND world %s', async (kind, status) => {
+    // failJob's CASE turned the 5th attempt dead; it reports that via RETURNING.
+    const sink = newSink();
+    const db = makeDb({ world: fakeWorld(), sink, heartbeatRows: () => [{ phase: 'dead' }] });
+
+    await handleJobError(db, { ...stitchJob, kind, attempts: 5 }, new Error('provider 503'));
+
+    expect(sink.updates).toEqual([
+      { table: worlds, patch: { status, progress: null, updatedAt: expect.anything() } },
+    ]);
+    // Same as the non-retryable path: nothing is enqueued and no credit row is
+    // written or unwound (a reservation stays put — generate may have run, §14).
+    expect(sink.inserts).toEqual([]);
+    expect(sink.executes).toHaveLength(1);
+  });
+});

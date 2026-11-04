@@ -1,6 +1,6 @@
 import { sql } from 'drizzle-orm';
 import type { Db } from './db/client.js';
-import { jobs, type Job, type JobKind } from './db/schema.js';
+import { jobs, type Job, type JobKind, type JobPhase } from './db/schema.js';
 
 // Postgres-backed job queue (spec §7 / §14). No worker loop yet — Stage 2.
 // Uses FOR UPDATE SKIP LOCKED so multiple workers can claim jobs concurrently
@@ -158,14 +158,15 @@ export async function completeJob(db: Db, jobId: string): Promise<void> {
 /**
  * Fail a job: record the error, release the lease, and schedule a retry with
  * exponential backoff. Once attempts reach MAX_ATTEMPTS the job is parked as
- * 'dead' (DLQ-equivalent, spec §14).
+ * 'dead' (DLQ-equivalent, spec §14). Returns the resulting phase (null if the
+ * row is gone) so the caller can fail the world when retries are exhausted.
  */
 export async function failJob(
   db: Db,
   jobId: string,
   error: string,
-): Promise<void> {
-  await db.execute(sql`
+): Promise<JobPhase | null> {
+  const result = await db.execute<{ phase: JobPhase }>(sql`
     UPDATE jobs
     SET last_error = ${error},
         locked_at = NULL,
@@ -174,7 +175,10 @@ export async function failJob(
         run_after = now() + (LEAST(POWER(2, attempts) * ${BASE_BACKOFF_SECONDS}, ${MAX_BACKOFF_SECONDS}) * interval '1 second'),
         updated_at = now()
     WHERE id = ${jobId}
+    RETURNING phase
   `);
+  const rows = (result as unknown as { rows: { phase: JobPhase }[] }).rows;
+  return rows[0]?.phase ?? null;
 }
 
 /**

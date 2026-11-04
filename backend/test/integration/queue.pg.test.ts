@@ -150,6 +150,22 @@ describe.skipIf(!url)('queue against real Postgres', () => {
     await completeJob(db, jobId);
   });
 
+  it('failJob reports dead once a job exhausts MAX_ATTEMPTS (5)', async () => {
+    const jobId = await enqueue(db, 'stitch', worldId);
+    await claimNextJob(db, ['stitch'], 'worker-A'); // attempts = 1
+    expect(await failJob(db, jobId, 'first')).toBe('queued');
+
+    // Jump to the 5th claim: attempts = 4 here, the claim makes it 5.
+    await pool.query(
+      "UPDATE jobs SET attempts = 4, run_after = now() - interval '1 second' WHERE id = $1",
+      [jobId],
+    );
+    const fifth = await claimNextJob(db, ['stitch'], 'worker-A');
+    expect(fifth!.attempts).toBe(5);
+    expect(await failJob(db, jobId, 'fifth')).toBe('dead');
+    expect(await claimNextJob(db, ['stitch'], 'worker-A')).toBeNull();
+  });
+
   it('lease expiry: a crashed worker\'s job is re-claimable after LEASE_SECONDS', async () => {
     const jobId = await enqueue(db, 'purge', worldId);
     const claimed = await claimNextJob(db, ['purge'], 'worker-crash');
