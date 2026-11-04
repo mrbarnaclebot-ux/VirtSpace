@@ -35,6 +35,7 @@ Coordinate conventions (derived in full in ARKIT_TO_PROJ and build()):
 Usage:
   reproject.py --frames-dir DIR --out pano.jpg [--poses poses.json]
                [--width 4096] [--preview-out pano_preview.jpg]
+               [--depth-dir DIR] [--proxy-depth 2.5]
 
 On success: prints progress lines to stdout and exits 0.
 On failure: prints a message to stderr and exits one of the EXIT_* codes below.
@@ -71,6 +72,14 @@ from geom import (  # noqa: E402  (re-exported: tests use R.<name>)
     intrinsics_fx_fy_cx_cy,
     rmat,
 )
+from depth import (  # noqa: E402
+    FIELD_WIDTH,
+    depth_points,
+    inverse_depth_field,
+    proxy_field,
+    read_depth_png,
+)
+from warp import Cam, center_weight, pano_rays, project, sample, sample_field  # noqa: E402
 
 
 # Winning fallback parameters (spike Phase 0.5 gate).
@@ -83,7 +92,12 @@ DEFAULT_PITCH_SIGN = -1
 # at which it starts to alias.
 PREFILTER_OVERSAMPLE = 1.3
 
-REMAP_CHUNK = 8192  # cv2.remap 2D grid width cap (stay under SHRT_MAX).
+# Fixed proxy distance (m) from the pano centre when a frame has neither a
+# depth map nor a featureDepthMedian. On the 2026-09-17 bedroom capture the
+# bench.py overlap error is flat from 1.25 to 2.0 m (min 1.5, +0.5% at 2.0) and
+# 13% worse rotation-only; 2.0 is the far end of that plateau so bigger rooms
+# are not over-corrected. Wrong-by-x error scales with |1/d_true - 1/d_proxy|.
+DEFAULT_PROXY_DEPTH_M = 2.0
 POLE_LAT_DEG = 60.0  # frames looking steeper than this get the pole weight boost.
 POLE_BOOST = 8.0
 
@@ -284,17 +298,16 @@ def upright(img):
     return cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
 
 
-def frame_orientation(i, img_shape, pose_by_index, angles, hfov_deg):
-    """(r_proj, focal_x, focal_y, is_pole, label) for frame `i`.
-
-    Pure given the frame's UPRIGHT (hf, wf) shape — recomputed identically for
-    every band, so band-chunking cannot drift a frame's geometry mid-pano.
-    """
+def frame_camera(i, img_shape, pose_by_index, angles, hfov_deg):
+    """(Cam, is_pole, label) for frame `i` sampled from an UPRIGHT image of
+    `img_shape`. Focals are FOV-derived, so the same call serves the full-res
+    frame, its prefiltered copy and its depth map."""
     hf, wf = img_shape[:2]
     if pose_by_index is not None:
         p = pose_by_index[i]
         try:
             r_proj = derive_pose_rotation(p["transform"])
+            origin = np.array([float(x) for x in p["transform"][12:15]], np.float64)
             intr = p.get("intrinsics")
             if intr is not None:
                 focal_x, focal_y = focals_from_intrinsics(intr, wf, hf)
@@ -305,49 +318,82 @@ def frame_orientation(i, img_shape, pose_by_index, angles, hfov_deg):
         # forward direction in world = row 2 of R_proj; its latitude tells
         # us whether this is a pole (zenith/nadir) frame.
         fwd_lat = math.degrees(math.asin(max(-1.0, min(1.0, float(r_proj[2, 1])))))
-        is_pole = abs(fwd_lat) > POLE_LAT_DEG
-        return r_proj, focal_x, focal_y, is_pole, f"pose(lat={fwd_lat:.0f})"
+        cam = Cam(r_proj, origin, focal_x, focal_y, wf, hf)
+        return cam, abs(fwd_lat) > POLE_LAT_DEG, f"pose(lat={fwd_lat:.0f})"
 
     yaw, pitch, roll = angles[i]
     # world -> projection camera. FLIP_RIGHT turns rmat's proper rotation into
     # the (right, up, forward) basis the reprojection equations expect, giving
-    # the same det = -1 the ARKit path derives from ARKIT_TO_PROJ.
+    # the same det = -1 the ARKit path derives from ARKIT_TO_PROJ. No poses =>
+    # no translation: every camera sits at the origin (rotation-only).
     r_proj = FLIP_RIGHT @ rmat(yaw, pitch, roll).T
-    focal_x = focal_y = (wf / 2.0) / math.tan(math.radians(hfov_deg) / 2.0)
-    # Pattern-independent pole detection (zenith/nadir at +/-90).
-    is_pole = abs(pitch) > POLE_LAT_DEG
-    return r_proj, focal_x, focal_y, is_pole, f"pose(y={yaw:.0f},p={pitch:.0f})"
+    focal = (wf / 2.0) / math.tan(math.radians(hfov_deg) / 2.0)
+    cam = Cam(r_proj, np.zeros(3), focal, focal, wf, hf)
+    return cam, abs(pitch) > POLE_LAT_DEG, f"pose(y={yaw:.0f},p={pitch:.0f})"
+
+
+def load_frames(frames_dir, indices, pose_by_index, angles, hfov_deg, width):
+    """{i: (prefiltered upright image, Cam, is_pole, label)} for every frame
+    present. Decoded ONCE: at the pano's density a 12 MP frame shrinks ~10x in
+    area, so holding all of them is cheaper than re-decoding per band."""
+    frames = {}
+    for i in indices:
+        raw = load_frame(frames_dir, i)
+        if raw is None:
+            log(f"frame {i}: missing, skipped")
+            continue
+        img = upright(raw)
+        del raw
+        cam, _, _ = frame_camera(i, img.shape, pose_by_index, angles, hfov_deg)
+        img = prefilter(img, max(cam.fx, cam.fy), width)
+        frames[i] = (img,) + frame_camera(i, img.shape, pose_by_index, angles, hfov_deg)
+    return frames
+
+
+def scene_depth(frames, pose_by_index, depth_dir, center, proxy_m):
+    """Pano-space inverse depth (scalar or field), see depth.py for priority."""
+    points, cams, depths = [], [], []
+    for i, (_, cam, _, _) in frames.items():
+        p = pose_by_index.get(i, {}) if pose_by_index else {}
+        fdm = p.get("featureDepthMedian")
+        ok_fdm = isinstance(fdm, (int, float)) and math.isfinite(fdm) and fdm > 0
+        cams.append(cam)
+        depths.append(float(fdm) if ok_fdm else proxy_m)
+        if depth_dir and pose_by_index:
+            dm, why = read_depth_png(os.path.join(depth_dir, f"depth_{i}.png"))
+            if dm is None:
+                if why != "missing":
+                    log(f"WARN frame {i}: depth ignored ({why})")
+                continue
+            dm = upright(dm)
+            dcam = frame_camera(i, dm.shape, pose_by_index, None, DEFAULT_HFOV)[0]
+            points.append(depth_points(dm, dcam))
+    if points:
+        log(f"depth: {len(points)} depth maps")
+    proxy = proxy_field(cams, depths, center, FIELD_WIDTH, FIELD_WIDTH // 2, proxy_m)
+    return inverse_depth_field(points, proxy, center)
 
 
 def build(width, frames_dir, poses, yaw_dir, pitch_sign, hfov_deg, power=2.0,
-          band_height=None):
+          band_height=None, depth_dir=None, proxy_m=None):
     """Reproject all frames into an equirect pano. Returns (pano, coverage%, mask).
 
     MEMORY (spec §10 R8). The pano is filled in horizontal row BANDS of
-    `band_height` rows. The full-frame version allocated the ray grid (3 x N
-    float32), its rotated copy (3 x N float64), the accumulator (N x 3 float32),
-    the weight sum and the normalized output at SPHERE resolution — >1.3 GB
-    before a single frame was decoded at 8192x4096. Banding makes every one of
-    those O(band_height x width); only the uint8 output pano and the coverage
-    mask stay full size (~135 MB combined at 8192).
+    `band_height` rows, so the ray grid and accumulators are O(band) not
+    O(sphere); only the uint8 pano, the coverage mask and the prefiltered
+    frames are held whole.
 
     Output is BIT-IDENTICAL to a single-band run: each equirect pixel's value
     depends only on its own ray and the frames, accumulated in the same frame
-    order, so splitting the pixel set changes nothing. `band_height=h` reproduces
-    the original allocation pattern exactly and is what the equivalence test
-    compares against.
-
-    Frames are decoded ONCE and kept prefiltered (see prefilter()): at the
-    pano's density a 12 MP frame shrinks ~10x in area, so holding all of them
-    costs less than the old per-band re-decode saved.
+    order, so splitting the pixel set changes nothing.
     """
     w = width
     h = width // 2
     if band_height is None:
         band_height = band_rows(w, h)
     band_height = max(1, min(h, int(band_height)))
+    proxy_m = DEFAULT_PROXY_DEPTH_M if proxy_m is None else proxy_m
 
-    # Determine which frame indices to process.
     if poses is not None:
         indices = [int(p["index"]) for p in poses]
         pose_by_index = {int(p["index"]): p for p in poses}
@@ -360,151 +406,62 @@ def build(width, frames_dir, poses, yaw_dir, pitch_sign, hfov_deg, power=2.0,
         indices = list(range(len(angles)))
         pose_by_index = None
 
-    # Full-size outputs (uint8): everything else is per band.
+    frames = load_frames(frames_dir, indices, pose_by_index, angles, hfov_deg, w)
+    if not frames:
+        die_input(f"no usable frames found in {frames_dir}")
+    # Pano centre = centroid of the camera positions: the user orbits the phone
+    # on their arm, so the centroid is ~2x closer to every camera than shot 0.
+    center = np.mean([f[1].o for f in frames.values()], axis=0)
+    invd = scene_depth(frames, pose_by_index, depth_dir, center, proxy_m)
+    log(f"center {np.round(center, 3).tolist()} proxy {proxy_m} m")
+
     pano = np.zeros((h, w, 3), np.uint8)
     cover = np.zeros((h, w), np.uint8)
-
-    # Longitude terms are band-independent — compute them once.
-    u = (np.arange(w) + 0.5) / w
-    lon = (u * 2 - 1) * math.pi  # -pi..pi, increasing with image-x
-    sin_lon = np.sin(lon)
-    cos_lon = np.cos(lon)
-
-    total = len(indices)
+    cols = np.arange(w)
     n_bands = (h + band_height - 1) // band_height
-    steps = max(1, total * n_bands)
+    steps = max(1, len(frames) * n_bands)
     step = 0
-    covered_px = {i: 0 for i in indices}
-    labels = {}
-    # index -> (r_proj, focal_x, focal_y, is_pole, hf, wf) of the PREFILTERED
-    # frame, or None when the frame is missing; imgs holds the pixels.
-    meta = {}
-    imgs = {}
-    for i in indices:
-        raw = load_frame(frames_dir, i)
-        if raw is None:
-            log(f"frame {i}: missing, skipped")
-            meta[i] = None
-            continue
-        img = upright(raw)
-        del raw
-        # Full-res geometry only sizes the prefilter; the frame's focals are
-        # then re-derived for the shrunken image (they are FOV-based).
-        _, focal_x, focal_y, _, _ = frame_orientation(
-            i, img.shape, pose_by_index, angles, hfov_deg
-        )
-        img = prefilter(img, max(focal_x, focal_y), w)
-        r_proj, focal_x, focal_y, is_pole, label = frame_orientation(
-            i, img.shape, pose_by_index, angles, hfov_deg
-        )
-        labels[i] = label
-        meta[i] = (r_proj, focal_x, focal_y, is_pole) + img.shape[:2]
-        imgs[i] = img
+    covered_px = {i: 0 for i in frames}
 
-    for band, r0 in enumerate(range(0, h, band_height)):
+    for r0 in range(0, h, band_height):
         r1 = min(h, r0 + band_height)
-        bh = r1 - r0
-        n = bh * w
+        rows = np.arange(r0, r1)
+        dx, dy, dz = pano_rays(rows, cols, w, h)
+        band_invd = sample_field(invd, rows, cols, w, h)
+        accum = np.zeros((r1 - r0, w, 3), np.float32)
+        wsum = np.zeros((r1 - r0, w), np.float32)
 
-        # equirect ray grid (world directions) for THIS band, +Y up, +Z at
-        # lon=lat=0. Identical values to the full grid's rows r0..r1.
-        #
-        # The MINUS on dx is the panorama's handedness and is load-bearing. The
-        # pano is meant to be viewed from INSIDE the sphere, so increasing
-        # image-x must swing the ray to the VIEWER's right; facing +Z with +Y up
-        # in this right-handed world, the viewer's right is -X (right x up =
-        # -forward — the very left-handedness ARKIT_TO_PROJ encodes). With
-        # +sin(lon) the grid disagrees with every det = -1 R_proj, which
-        # mirrors each frame's sampling AND reverses the order the frames are
-        # laid out in: the horizontally-mirrored pano that shipped until
-        # 2026-09-17 (text in the scene came out mirror-written).
-        v = (np.arange(r0, r1) + 0.5) / h
-        lat = (0.5 - v) * math.pi  # +pi/2..-pi/2
-        clat = np.cos(lat)
-        dx = (-clat[:, None] * sin_lon[None, :]).astype(np.float32)
-        dy = np.repeat(np.sin(lat).astype(np.float32), w)
-        dz = (clat[:, None] * cos_lon[None, :]).astype(np.float32)
-        d = np.stack([dx.ravel(), dy, dz.ravel()], 0)  # 3 x n
-        del dx, dz
-
-        accum = np.zeros((n, 3), np.float32)
-        wsum = np.zeros((n,), np.float32)
-        cover_band = cover[r0:r1].reshape(n)
-
-        for k, i in enumerate(indices):
+        for i, (img, cam, is_pole, _) in frames.items():
             # Per-frame reprojection spans PROGRESS 5..70 across ALL bands
             # (blend/inpaint/write take the rest — see main()).
             progress(5 + 65 * step / steps)
             step += 1
-
-            if meta[i] is None:
-                continue
-            r_proj, focal_x, focal_y, is_pole, hf, wf = meta[i]
-
-            # Projection-camera-frame rays. Written as an explicit 3-term
-            # combination per row rather than `r_proj @ d`: matmul would promote
-            # the whole float32 grid to a float64 CAST BUFFER *and* a float64
-            # 3 x n result (100 MB per band at 8192) where this needs one row at
-            # a time. Verified bit-identical to the matmul — that equality is
-            # what test/stitcher.banding.test.ts pins.
-            zc = r_proj[2, 0] * d[0] + r_proj[2, 1] * d[1] + r_proj[2, 2] * d[2]
-            valid = zc > 1e-6
-            px = np.full(n, -1.0, np.float32)
-            py = np.full(n, -1.0, np.float32)
-            dc_row = r_proj[0, 0] * d[0] + r_proj[0, 1] * d[1] + r_proj[0, 2] * d[2]
-            px[valid] = focal_x * dc_row[valid] / zc[valid] + wf / 2.0
-            dc_row = r_proj[1, 0] * d[0] + r_proj[1, 1] * d[1] + r_proj[1, 2] * d[2]
-            py[valid] = hf / 2.0 - focal_y * dc_row[valid] / zc[valid]
-            del dc_row, zc
-            inb = valid & (px >= 0) & (px < wf - 1) & (py >= 0) & (py < hf - 1)
-            del valid
+            px, py, inb = project(cam, center, dx, dy, dz, band_invd)
             hits = int(inb.sum())
             covered_px[i] += hits
             if hits == 0:
                 continue
-
-            img = imgs[i]
-            # bilinear sample via remap on the in-bounds subset (reshaped to 2D).
-            mx = px[inb].astype(np.float32)
-            my = py[inb].astype(np.float32)
-            m = mx.shape[0]
-            pad = (-m) % REMAP_CHUNK
-            mxp = np.concatenate([mx, np.zeros(pad, np.float32)]).reshape(-1, REMAP_CHUNK)
-            myp = np.concatenate([my, np.zeros(pad, np.float32)]).reshape(-1, REMAP_CHUNK)
-            sampg = cv2.remap(img, mxp, myp, cv2.INTER_LINEAR)
-            samp = sampg.reshape(-1, 3)[:m]
-
-            # feather weight: center falloff in normalized image coords.
-            nx = (px[inb] - wf / 2.0) / (wf / 2.0)
-            ny = (py[inb] - hf / 2.0) / (hf / 2.0)
-            wc = np.clip(1 - np.abs(nx), 0, 1) * np.clip(1 - np.abs(ny), 0, 1)
-            weight = (wc ** power).astype(np.float32)
+            weight = (center_weight(cam, px, py) ** power) * inb
             if is_pole:  # pole frames dominate their caps to avoid smeared bleed.
                 weight *= POLE_BOOST
+            accum += sample(img, px, py).astype(np.float32) * weight[:, :, None]
+            wsum += weight
+            del px, py, inb, weight
 
-            idx = np.nonzero(inb)[0]
-            accum[idx] += samp.astype(np.float32) * weight[:, None]
-            wsum[idx] += weight
-            cover_band[idx] = 1
-            del img, sampg, samp, px, py, inb, idx, weight
-
-        # Feather-blend normalization for this band, in place (identical to
-        # `out[nz] = accum[nz] / wsum[nz, None]` — untouched pixels are 0 in both).
         nz = wsum > 0
         accum[nz] /= wsum[nz, None]
-        pano[r0:r1] = accum.reshape(bh, w, 3).astype(np.uint8)
-        del d, accum, wsum, nz
+        pano[r0:r1] = accum.astype(np.uint8)
+        cover[r0:r1] = nz
+        del dx, dy, dz, accum, wsum, nz
 
     # Per-frame coverage totals, reported once (not once per band).
     processed = 0
-    for i in indices:
-        if meta.get(i) is None:
-            continue
+    for i, (_, _, _, label) in frames.items():
         if covered_px[i] == 0:
             log(f"frame {i}: 0 px")
             continue
         processed += 1
-        log(f"frame {i}: {labels[i]} covered {covered_px[i]} px")
+        log(f"frame {i}: {label} covered {covered_px[i]} px")
 
     if processed == 0:
         die_input(f"no usable frames found in {frames_dir}")
@@ -630,6 +587,14 @@ def main(argv=None):
         "--band-rows", type=int, default=None,
         help="rows per reprojection band (default: sized from BAND_TARGET_PIXELS)",
     )
+    ap.add_argument(
+        "--depth-dir", default=None,
+        help="optional dir of depth_<i>.png (16-bit mm, 0 = invalid); missing files are fine",
+    )
+    ap.add_argument(
+        "--proxy-depth", type=float, default=DEFAULT_PROXY_DEPTH_M,
+        help="fallback surface distance in metres (inf = rotation-only)",
+    )
     # Nominal-fallback tuning (defaults are the Phase 0.5 winning parameters).
     ap.add_argument("--hfov", type=float, default=DEFAULT_HFOV)
     ap.add_argument("--yaw-dir", type=int, default=DEFAULT_YAW_DIR)
@@ -642,6 +607,8 @@ def main(argv=None):
         # A caller asking for more than the product's pano width is a
         # misconfiguration; honouring it would OOM the worker (spec §10 R8).
         die_input(f"--width {args.width} exceeds the maximum {MAX_WIDTH}")
+    if not args.proxy_depth > 0:
+        die_input("--proxy-depth must be > 0 (inf for rotation-only)")
     if not os.path.isdir(args.frames_dir):
         die_input(f"frames dir not found: {args.frames_dir}")
 
@@ -668,7 +635,7 @@ def main(argv=None):
     pano, cov, mask = build(
         args.width, args.frames_dir, poses,
         args.yaw_dir, args.pitch_sign, args.hfov,
-        band_height=bh,
+        band_height=bh, depth_dir=args.depth_dir, proxy_m=args.proxy_depth,
     )
     log(f"coverage {cov:.1f}% before inpaint")
     progress(75)  # blend done; inpainting residual holes next.
