@@ -10,7 +10,13 @@
 //  Frames upload FROM FILE (the bytes already live in the CaptureStore session
 //  dir), which background sessions require. Completion is delegate-based and
 //  bridged to async/await via `BackgroundUploadCoordinator`. Per-frame retry
-//  (2 attempts) is preserved.
+//  (2 attempts) is preserved, except for a 403: that is an expired presign,
+//  and re-PUTting to the same URL can't fix it (the caller refreshes, R25).
+//
+//  Every task is named after its object key (`taskDescription`). A relaunched
+//  app re-attaches to a PUT the previous process left in flight, or adopts one
+//  that finished while no continuation was waiting, instead of sending the
+//  bytes again (spec §10 R25).
 //
 
 import Foundation
@@ -44,6 +50,12 @@ nonisolated final class BackgroundUploadCoordinator: NSObject, URLSessionDataDel
 
     private let lock = NSLock()
     private var continuations: [Int: CheckedContinuation<HTTPURLResponse, Error>] = [:]
+    /// Successful completions nobody was awaiting (the process that started
+    /// them died, the relaunch delivered them), by task description, so the
+    /// next flow adopts them instead of re-PUTting.
+    /// ponytail: memory only, so a second kill loses them and those frames are
+    /// re-PUT (idempotent, just bytes); persist here if that ever matters.
+    private var unclaimedSuccesses: [String: HTTPURLResponse] = [:]
     private var storedSession: URLSession?
 
     /// The one background session, created on first use under `lock`. This was
@@ -86,14 +98,35 @@ nonisolated final class BackgroundUploadCoordinator: NSObject, URLSessionDataDel
         activate()
     }
 
-    /// Start a background upload task from a file and await its completion.
-    func upload(fileURL: URL, request: URLRequest) async throws -> HTTPURLResponse {
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<HTTPURLResponse, Error>) in
+    /// Await the background upload named `taskDescription`: adopt a finished
+    /// one nobody claimed, attach to one still in flight from a previous
+    /// process, or start a new task from `fileURL`.
+    func upload(fileURL: URL, request: URLRequest, taskDescription: String) async throws -> HTTPURLResponse {
+        let session = session
+        let inFlight = await session.allTasks.first {
+            $0.taskDescription == taskDescription && $0.state != .completed
+        }
+        return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<HTTPURLResponse, Error>) in
+            lock.lock()
+            if let done = unclaimedSuccesses.removeValue(forKey: taskDescription) {
+                lock.unlock()
+                cont.resume(returning: done)
+                return
+            }
+            if let inFlight {
+                // Under the lock, so its completion either already landed in
+                // `unclaimedSuccesses` (checked above) or will find this.
+                continuations[inFlight.taskIdentifier] = cont
+                lock.unlock()
+                AppLog.upload.log("Re-attached to in-flight upload \(taskDescription, privacy: .public)")
+                return
+            }
+            lock.unlock()
             let task = session.uploadTask(with: request, fromFile: fileURL)
+            task.taskDescription = taskDescription
             lock.lock()
             continuations[task.taskIdentifier] = cont
             lock.unlock()
-            task.taskDescription = request.url?.lastPathComponent
             task.resume()
         }
     }
@@ -113,7 +146,12 @@ nonisolated final class BackgroundUploadCoordinator: NSObject, URLSessionDataDel
             finish(task.taskIdentifier, with: .failure(APIError.invalidResponse))
             return
         }
-        finish(task.taskIdentifier, with: .success(http))
+        if !finish(task.taskIdentifier, with: .success(http)),
+           (200..<300).contains(http.statusCode), let description = task.taskDescription {
+            lock.lock()
+            unclaimedSuccesses[description] = http
+            lock.unlock()
+        }
     }
 
     /// The session became unusable (invalidated / unrecoverable error). Fail
@@ -128,16 +166,18 @@ nonisolated final class BackgroundUploadCoordinator: NSObject, URLSessionDataDel
         for (_, cont) in pending { cont.resume(throwing: failure) }
     }
 
-    /// Resume the continuation for `taskIdentifier` exactly once, or do nothing
-    /// if it was already resumed / belongs to a prior process (the app was
-    /// terminated mid-upload and relaunched — those bytes already reached R2
-    /// and the resume flow re-PUTs anything not marked uploaded).
-    private func finish(_ taskIdentifier: Int, with result: Result<HTTPURLResponse, Error>) {
+    /// Resume the continuation for `taskIdentifier` exactly once. Returns
+    /// false when nobody is waiting: it was already resumed, or the task
+    /// belongs to a prior process (the app was terminated mid-upload and
+    /// relaunched), in which case a success is kept for the next flow to adopt.
+    @discardableResult
+    private func finish(_ taskIdentifier: Int, with result: Result<HTTPURLResponse, Error>) -> Bool {
         lock.lock()
         let cont = continuations.removeValue(forKey: taskIdentifier)
         lock.unlock()
-        guard let cont else { return }
+        guard let cont else { return false }
         cont.resume(with: result)
+        return true
     }
 
     func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
@@ -196,13 +236,14 @@ struct FrameUploader: FrameUploading {
         var lastError: Error = APIError.invalidResponse
         for attempt in 1...max(1, maxAttempts) {
             do {
-                let http = try await coordinator.upload(fileURL: fileURL, request: request)
+                let http = try await coordinator.upload(fileURL: fileURL, request: request, taskDescription: slot.key)
                 guard (200..<300).contains(http.statusCode) else {
                     throw APIError.server(http.statusCode, "Frame \(slot.index) upload failed")
                 }
                 return
             } catch {
                 lastError = (error as? APIError) ?? APIError.network(error)
+                if (lastError as? APIError)?.isExpiredPresign == true { break }
                 if attempt < maxAttempts {
                     // Brief backoff before the retry.
                     try? await Task.sleep(for: .milliseconds(400))

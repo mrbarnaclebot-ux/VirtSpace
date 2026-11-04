@@ -3,13 +3,16 @@
 //  VirtSpace
 //
 //  Glue between a finished on-disk capture session and the backend:
-//  createWorld → sequential presigned frame uploads (FrameUploader) →
-//  frames:done → purge the local session. Frames upload as image/jpeg using
-//  exactly the headers the API returned per slot; LiDAR depth maps (spec §5.2)
-//  ride alongside as depth_<i>.png to their `depth_uploads` slots, best
-//  effort: a missing or failed depth file never blocks or parks a session. Resumable: a failed upload
-//  keeps the session directory; `resumePending()` retries complete sessions
-//  found on disk (crash/offline recovery, spec §6.1).
+//  createWorld → presigned frame uploads (FrameUploader), all enqueued on the
+//  background session at once → frames:done → purge the local session. Frames
+//  upload as image/jpeg using exactly the headers the API returned per slot;
+//  LiDAR depth maps (spec §5.2) ride alongside as depth_<i>.png to their
+//  `depth_uploads` slots, best effort: a missing or failed depth file never
+//  blocks or parks a session. Resumable: a failed upload keeps the session
+//  directory; `resumePending()` retries complete sessions found on disk
+//  (crash/offline recovery, spec §6.1). A 403 from a presigned PUT is an
+//  expired URL: re-presigned and retried in the same attempt, never counted
+//  (spec §10 R25).
 //
 //  Retry policy (spec §10 R4 — this used to retry forever, minting a fresh
 //  BILLABLE world per attempt for a session the backend kept rejecting):
@@ -449,37 +452,53 @@ final class CaptureUploader {
         } else {
             (world, slots, depthSlots) = try await createFreshWorld(session: session, frameCount: frameCount, depthFrames: depthFrames, renewKey: renewWorldKey)
         }
-        let depthSlotsByIndex = Dictionary(depthSlots.map { ($0.index, $0) }, uniquingKeysWith: { first, _ in first })
-        var depthUploaded = Set(manifest.uploadedDepthIndices)
         let framesWithDepth = Set((depthFrames ?? []).map(\.index))
+        var depthUploaded = Set(manifest.uploadedDepthIndices)
 
         // Count frames already confirmed uploaded (resume) toward progress.
         var done = manifest.uploadedFrameIndices.count
         AppLog.upload.log("resume: \(done)/\(frameCount) already uploaded")
         progress(done)
-        for slot in slots.sorted(by: { $0.index < $1.index }) {
-            // Skip frames a previous (possibly killed) run already confirmed.
-            if !manifest.isUploaded(slot.index) {
-                // Upload straight from the on-disk session file via the background
-                // session; the transfer itself runs in URLSession, off the main thread.
-                let fileURL = sessions.frameURL(index: slot.index, in: session.directory)
-                do {
-                    try await frameUploader.upload(fileURL: fileURL, to: slot)
-                } catch {
-                    AppLog.upload.error("Frame \(slot.index) upload failed: \(error.localizedDescription, privacy: .public)")
-                    throw error
-                }
-                // Mark uploaded immediately (crash-safe) so a later resume skips it.
-                try await sessions.markFrameUploaded(index: slot.index, forSession: session.id, in: session.directory)
-                done += 1
-                progress(done)
+
+        // Every remaining PUT, frames and depth alike, goes onto the background
+        // session AT ONCE, so the OS keeps transferring the whole batch while
+        // the app is suspended. Serial uploads created the next task only when
+        // the previous one finished, i.e. never, once suspended (spec §10 R25).
+        // Depth is retried for frames a killed run already uploaded too.
+        var pendingFrames = Set(slots.map(\.index)).filter { !manifest.isUploaded($0) }
+        var pendingDepth = framesWithDepth.subtracting(depthUploaded)
+        var frameSlots = slots
+        var currentDepthSlots = depthSlots
+        var refreshes = 0
+        while !pendingFrames.isEmpty || !pendingDepth.isEmpty {
+            let round = await uploadBatch(
+                frames: frameSlots.filter { pendingFrames.contains($0.index) },
+                depth: currentDepthSlots.filter { pendingDepth.contains($0.index) },
+                session: session,
+                onFrameUploaded: { done += 1; progress(done) }
+            )
+            depthUploaded.formUnion(round.uploadedDepth)
+            if let failure = round.frameErrors.values.first(where: { ($0 as? APIError)?.isExpiredPresign != true }) {
+                throw failure
             }
-            // Depth after its frame, also for frames a killed run already
-            // uploaded, so an interrupted depth PUT gets another chance.
-            if framesWithDepth.contains(slot.index), !depthUploaded.contains(slot.index),
-               let depthSlot = depthSlotsByIndex[slot.index],
-               await uploadDepth(index: slot.index, to: depthSlot, session: session) {
-                depthUploaded.insert(slot.index)
+            pendingFrames = Set(round.frameErrors.keys)
+            pendingDepth = round.expiredDepth
+            if pendingFrames.isEmpty, pendingDepth.isEmpty { break }
+            // Only expired presigns are left. Re-presign and go again while
+            // that keeps making progress; a 403 that survives a fresh presign
+            // with nothing else landing is a real failure.
+            if refreshes > 0, round.uploadedFrames.isEmpty, round.uploadedDepth.isEmpty {
+                if let failure = round.frameErrors.values.first { throw failure }
+                break
+            }
+            refreshes += 1
+            AppLog.upload.log("\(pendingFrames.count) frame / \(pendingDepth.count) depth presign(s) expired — refreshing (\(refreshes))")
+            do {
+                (_, frameSlots, currentDepthSlots) = try await api.refreshUploads(worldId: world.id, depthFrames: depthFrames)
+            } catch {
+                // Depth alone never fails a session.
+                if pendingFrames.isEmpty { break }
+                throw error
             }
         }
 
@@ -502,19 +521,69 @@ final class CaptureUploader {
         return world
     }
 
-    /// Best effort, by contract: a depth file that is missing, fails to upload
-    /// or can't be recorded is logged and skipped — never thrown, never
-    /// counted toward parking. That frame's pose then simply carries no
-    /// `depth`. Returns whether the upload is confirmed and recorded.
-    private func uploadDepth(index: Int, to slot: FrameUpload, session: CaptureStore.PendingSession) async -> Bool {
-        let fileURL = sessions.depthURL(index: index, in: session.directory)
-        do {
-            try await frameUploader.upload(fileURL: fileURL, to: slot)
-            try await sessions.markDepthUploaded(index: index, forSession: session.id, in: session.directory)
-            return true
-        } catch {
-            AppLog.upload.error("Depth \(index) upload skipped: \(error.localizedDescription, privacy: .public)")
-            return false
+    /// What one concurrent batch of PUTs did. Depth failures other than an
+    /// expired presign are best effort by contract: logged, then dropped (that
+    /// frame's pose simply carries no `depth`), never thrown or counted.
+    private struct BatchResult {
+        var uploadedFrames: Set<Int> = []
+        var uploadedDepth: Set<Int> = []
+        var frameErrors: [Int: Error] = [:]
+        var expiredDepth: Set<Int> = []
+    }
+
+    /// Start every PUT in the batch at once and wait for all of them to settle,
+    /// recording each success on disk the moment it lands (crash-safe: a later
+    /// resume skips it). Waiting for the stragglers instead of failing fast
+    /// keeps every frame that did make it.
+    private func uploadBatch(
+        frames: [FrameUpload],
+        depth: [FrameUpload],
+        session: CaptureStore.PendingSession,
+        onFrameUploaded: @escaping () -> Void
+    ) async -> BatchResult {
+        let id = session.id
+        let directory = session.directory
+        return await withTaskGroup(of: (Int, Bool, Error?).self) { group in
+            for job in frames.map({ ($0, false) }) + depth.map({ ($0, true) }) {
+                let (slot, isDepth) = job
+                group.addTask {
+                    do {
+                        try await self.put(slot, isDepth: isDepth, session: id, in: directory)
+                        return (slot.index, isDepth, nil)
+                    } catch {
+                        return (slot.index, isDepth, error)
+                    }
+                }
+            }
+            var result = BatchResult()
+            for await (index, isDepth, error) in group {
+                switch (isDepth, error) {
+                case (false, nil):
+                    result.uploadedFrames.insert(index)
+                    onFrameUploaded()
+                case (true, nil):
+                    result.uploadedDepth.insert(index)
+                case (false, let error?):
+                    AppLog.upload.error("Frame \(index) upload failed: \(error.localizedDescription, privacy: .public)")
+                    result.frameErrors[index] = error
+                case (true, let error?):
+                    AppLog.upload.error("Depth \(index) upload skipped: \(error.localizedDescription, privacy: .public)")
+                    if (error as? APIError)?.isExpiredPresign == true { result.expiredDepth.insert(index) }
+                }
+            }
+            return result
+        }
+    }
+
+    private func put(_ slot: FrameUpload, isDepth: Bool, session id: UUID, in directory: URL) async throws {
+        let fileURL = isDepth
+            ? sessions.depthURL(index: slot.index, in: directory)
+            : sessions.frameURL(index: slot.index, in: directory)
+        try await frameUploader.upload(fileURL: fileURL, to: slot)
+        if isDepth {
+            try await sessions.markDepthUploaded(index: slot.index, forSession: id, in: directory)
+        } else {
+            try await sessions.markFrameUploaded(index: slot.index, forSession: id, in: directory)
         }
     }
 

@@ -58,6 +58,15 @@ enum APIError: Error, LocalizedError {
         return true
     }
 
+    /// True for a 403 from a presigned PUT. The URLs live 900 s, so on a slow
+    /// run this is an expired signature: re-presign (`uploads:refresh`) and
+    /// retry, never count it as a failed attempt (spec §10 R25). A 403 that
+    /// survives a fresh presign is a real failure and counts as usual.
+    var isExpiredPresign: Bool {
+        guard case let .server(status, _) = self else { return false }
+        return status == 403
+    }
+
     /// True when the failure is "the network isn't there right now" — the
     /// device is offline, the request timed out, the connection dropped. These
     /// say nothing about whether the capture or the backend is healthy, so they

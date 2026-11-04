@@ -349,6 +349,70 @@ struct CaptureUploaderTests {
         #expect(frames.uploadedIndices == [1])
     }
 
+    // MARK: - Background batch (R25)
+
+    @Test("Every remaining PUT is on the background session at once")
+    func allUploadsEnqueuedUpFront() async throws {
+        let fixture = StoreFixture()
+        let session = try fixture.makeCompleteSession(frameCount: 4)
+        let frames = FakeFrameUploader()
+        frames.holdUntilInFlight = 4
+        let uploader = makeUploader(fixture, api: FakeUploadAPI(), frames: frames)
+
+        _ = try await uploader.upload(
+            result: CaptureResult(sessionID: session.id, directory: session.directory, frameCount: 4)
+        )
+
+        // Serial uploads never had more than one task in flight.
+        #expect(frames.maxInFlight == 4)
+        #expect(frames.uploadedIndices.sorted() == [0, 1, 2, 3])
+    }
+
+    @Test("An expired presign (403) re-presigns and retries without counting")
+    func expiredPresignRefreshes() async throws {
+        let fixture = StoreFixture()
+        let session = try fixture.makeCompleteSession(frameCount: 2)
+        let api = FakeUploadAPI()
+        api.onRefreshUploads = { id in (Fixtures.world(id: id), Fixtures.slots(count: 2, batch: "fresh")) }
+        let frames = FakeFrameUploader()
+        // Frame 1's original URL expired; frame 0 made it in time.
+        frames.onUpload = { slot in
+            if slot.url.hasSuffix("upload/1") { throw APIError.server(403, "Request has expired") }
+        }
+        let uploader = makeUploader(fixture, api: api, frames: frames)
+
+        let world = try await uploader.upload(
+            result: CaptureResult(sessionID: session.id, directory: session.directory, frameCount: 2)
+        )
+
+        #expect(world.id == "world-1")
+        #expect(api.refreshedWorldIds == ["world-1"])
+        // Only the expired frame goes again.
+        #expect(frames.uploadedIndices.sorted() == [0, 1])
+        #expect(api.framesDoneWorldIds == ["world-1"])
+        #expect(fixture.pending(session.id) == nil)
+    }
+
+    @Test("A 403 that survives a fresh presign is one counted failure")
+    func persistent403Counts() async throws {
+        let fixture = StoreFixture()
+        let session = try fixture.makeCompleteSession(frameCount: 2)
+        let api = FakeUploadAPI()
+        let frames = FakeFrameUploader()
+        frames.onUpload = { _ in throw APIError.server(403, "AccessDenied") }
+        let uploader = makeUploader(fixture, api: api, frames: frames)
+
+        await #expect(throws: (any Error).self) {
+            try await uploader.upload(
+                result: CaptureResult(sessionID: session.id, directory: session.directory, frameCount: 2)
+            )
+        }
+
+        #expect(api.refreshedWorldIds == ["world-1"])
+        #expect(api.framesDoneWorldIds.isEmpty)
+        #expect(fixture.manifest(session.id)?.attemptCount == 1)
+    }
+
     @Test("A stranded session goes straight to frames:done")
     func strandedRecovery() async throws {
         let fixture = StoreFixture()
@@ -450,7 +514,7 @@ struct CaptureUploaderDepthTests {
         )
         #expect(api.createDepthFrames == [[DepthFrameDeclaration(index: 0, bytes: size), DepthFrameDeclaration(index: 1, bytes: size)]])
         // A failed depth PUT and a missing depth file never block the frames.
-        #expect(frames.uploadedIndices == [0, 1, 2])
+        #expect(frames.uploadedIndices.sorted() == [0, 1, 2])
         #expect(frames.uploadedDepthIndices == [0])
         let poses = try #require(api.lastPoses)
         #expect(poses.map { $0.depth != nil } == [true, false, false])

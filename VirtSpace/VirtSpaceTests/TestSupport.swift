@@ -74,12 +74,13 @@ enum Fixtures {
         return try! JSONDecoder().decode(World.self, from: json)
     }
 
-    static func slots(count: Int) -> [FrameUpload] {
+    /// `batch` tags the URLs, so a refreshed presign is distinguishable.
+    static func slots(count: Int, batch: String = "upload") -> [FrameUpload] {
         (0..<count).map {
             FrameUpload(
                 index: $0,
                 key: "frames/\($0).jpg",
-                url: "https://example.invalid/upload/\($0)",
+                url: "https://example.invalid/\(batch)/\($0)",
                 method: "PUT",
                 headers: ["Content-Type": "image/jpeg"]
             )
@@ -182,8 +183,20 @@ final class FakeFrameUploader: FrameUploading, @unchecked Sendable {
     var error: Error?
     /// Depth slot indices whose PUT fails.
     var failingDepthIndices: Set<Int> = []
+    /// Per-slot scripted outcome, checked before everything else.
+    var onUpload: ((FrameUpload) throws -> Void)?
+    /// Each PUT stays in flight until this many are (bounded, so a serial
+    /// uploader finishes instead of hanging); `maxInFlight` records the peak.
+    var holdUntilInFlight = 0
+    private var inFlight = 0
+    private(set) var maxInFlight = 0
 
     func upload(fileURL: URL, to slot: FrameUpload) async throws {
+        inFlight += 1
+        maxInFlight = max(maxInFlight, inFlight)
+        defer { inFlight -= 1 }
+        for _ in 0..<1_000 where inFlight < holdUntilInFlight { await Task.yield() }
+        try onUpload?(slot)
         if slot.key.contains("depth_") {
             if failingDepthIndices.contains(slot.index) { throw APIError.server(500, "depth put failed") }
             uploadedDepthIndices.append(slot.index)
