@@ -38,6 +38,10 @@ export const MAX_DISPLAY_NAME = 64;
  */
 export const DEFAULT_ASSET_HOSTS = ['api.worldlabs.ai', '.worldlabs.ai'];
 
+/** Redirects downloadAsset follows (each re-checked) before giving up. */
+export const MAX_ASSET_REDIRECTS = 3;
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+
 /** Default ceiling on a single downloaded asset (200 MB). */
 export const DEFAULT_ASSET_MAX_BYTES = 200 * 1024 * 1024;
 
@@ -214,9 +218,6 @@ export function createWorldLabsProvider(opts: WorldLabsOptions): WorldGenProvide
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const assetHosts = parseAssetHosts(opts.assetHosts);
   const assetMaxBytes = opts.assetMaxBytes ?? DEFAULT_ASSET_MAX_BYTES;
-  // The API host is the ONLY host our key is ever sent to (see downloadAsset).
-  // Derived from baseUrl so a test/staging base URL stays self-consistent.
-  const apiHost = new URL(baseUrl).hostname.toLowerCase();
 
   const jsonHeaders = (): Record<string, string> => ({
     'WLT-Api-Key': opts.apiKey,
@@ -237,6 +238,10 @@ export function createWorldLabsProvider(opts: WorldLabsOptions): WorldGenProvide
         headers: init?.headers ?? jsonHeaders(),
         body: init?.body,
         signal: controller.signal,
+        // Spec §10 R29: fetch follows redirects by default and would carry
+        // WLT-Api-Key to wherever a 3xx points. The API never redirects, so a
+        // redirect is refused outright (surfaces as a network ProviderError).
+        redirect: 'error',
       });
     } catch (err) {
       if (err instanceof Error && err.name === 'AbortError') {
@@ -435,37 +440,58 @@ export function createWorldLabsProvider(opts: WorldLabsOptions): WorldGenProvide
 
     async downloadAsset(rawUrl): Promise<Buffer> {
       // The URL comes from the PROVIDER's JSON, so it is untrusted input.
-      const url = assertDownloadableUrl(rawUrl, assetHosts);
+      let url = assertDownloadableUrl(rawUrl, assetHosts);
 
-      // Send the API key ONLY to the API host. CDN asset URLs are already signed
-      // and do not need it, and attaching it to whatever host the response named
-      // is exactly how a credential leaks.
-      const headers: Record<string, string> = {};
-      if (url.hostname.toLowerCase() === apiHost) {
-        headers['WLT-Api-Key'] = opts.apiKey;
-      }
-
+      // Never send the API key here (spec §10 R29). Asset URLs are signed CDN
+      // links — the live-verified spike downloads them with no credential — and
+      // attaching it to a provider-chosen host is exactly how a key leaks.
+      //
+      // Redirects are followed by hand so EVERY hop is re-checked against the
+      // allowlist; fetch's own following checks only the first URL. One
+      // controller/timer covers the whole chain.
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
-      let res: Response;
       try {
-        res = await doFetch(url.toString(), {
-          method: 'GET',
-          headers,
-          signal: controller.signal,
-        });
-      } catch (err) {
-        clearTimeout(timer);
-        if (err instanceof Error && err.name === 'AbortError') {
-          throw new ProviderTimeoutError(`asset download timed out after ${timeoutMs}ms`, rawUrl);
+        let res: Response;
+        for (let hop = 0; ; hop++) {
+          try {
+            res = await doFetch(url.toString(), {
+              method: 'GET',
+              signal: controller.signal,
+              redirect: 'manual',
+            });
+          } catch (err) {
+            if (err instanceof Error && err.name === 'AbortError') {
+              throw new ProviderTimeoutError(
+                `asset download timed out after ${timeoutMs}ms`,
+                rawUrl,
+              );
+            }
+            throw new ProviderError(`network error: ${String(err)}`, {
+              endpoint: rawUrl,
+              cause: err,
+            });
+          }
+          const location = res.headers.get('location');
+          if (!REDIRECT_STATUSES.has(res.status) || !location) break;
+          await res.body?.cancel().catch(() => undefined);
+          if (hop >= MAX_ASSET_REDIRECTS) {
+            throw new ProviderError(
+              `asset download exceeded ${MAX_ASSET_REDIRECTS} redirects`,
+              { endpoint: rawUrl },
+            );
+          }
+          let next: string;
+          try {
+            next = new URL(location, url).toString();
+          } catch {
+            throw new ProviderError(`asset redirect has an invalid Location: ${location}`, {
+              endpoint: rawUrl,
+            });
+          }
+          url = assertDownloadableUrl(next, assetHosts);
         }
-        throw new ProviderError(`network error: ${String(err)}`, {
-          endpoint: rawUrl,
-          cause: err,
-        });
-      }
 
-      try {
         if (!res.ok) {
           throw new ProviderError(`asset download failed: ${res.status}`, {
             status: res.status,

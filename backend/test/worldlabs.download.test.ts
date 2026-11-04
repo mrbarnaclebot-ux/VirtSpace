@@ -142,10 +142,10 @@ describe('assertDownloadableUrl', () => {
 });
 
 describe('downloadAsset', () => {
-  it('sends the API key to the API host', async () => {
+  it('never sends the API key, even to the API host (spec §10 R29)', async () => {
     const { fetch, calls } = fetchReturning(() => new Response('bytes', { status: 200 }));
     await provider(fetch).downloadAsset('https://api.worldlabs.ai/asset.spz');
-    expect(calls[0]!.headers['WLT-Api-Key']).toBe(KEY);
+    expect(JSON.stringify(calls[0]!.headers)).not.toContain(KEY);
   });
 
   it('does NOT send the API key to the CDN host', async () => {
@@ -223,5 +223,84 @@ describe('downloadAsset', () => {
 
   it('defaults the cap to 200 MB', () => {
     expect(DEFAULT_ASSET_MAX_BYTES).toBe(200 * 1024 * 1024);
+  });
+});
+
+// Spec §10 R29: fetch's own redirect following checks only the first URL, so a
+// 3xx from an allowlisted host could bounce the request anywhere.
+describe('downloadAsset redirects', () => {
+  /** Replays `responses` in order, recording url + redirect mode + headers. */
+  function chain(responses: Response[]) {
+    const calls: { url: string; redirect?: RequestRedirect; headers: string }[] = [];
+    let i = 0;
+    const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+      calls.push({
+        url: String(url),
+        redirect: init?.redirect,
+        headers: JSON.stringify(init?.headers ?? {}),
+      });
+      const res = responses[i++];
+      if (!res) throw new Error('unexpected extra fetch');
+      return res;
+    }) as unknown as FetchLike;
+    return { fetch: fetchImpl, calls };
+  }
+  const to = (location: string, status = 302) =>
+    new Response(null, { status, headers: { location } });
+
+  it('follows an allowlisted redirect by hand, re-checking the hop', async () => {
+    const { fetch, calls } = chain([
+      to('https://cdn.marble.worldlabs.ai/real.spz', 307),
+      new Response('bytes', { status: 200 }),
+    ]);
+    const buf = await provider(fetch).downloadAsset('https://api.worldlabs.ai/a.spz');
+    expect(buf.toString()).toBe('bytes');
+    expect(calls.map((c) => c.url)).toEqual([
+      'https://api.worldlabs.ai/a.spz',
+      'https://cdn.marble.worldlabs.ai/real.spz',
+    ]);
+    expect(calls.every((c) => c.redirect === 'manual')).toBe(true);
+    expect(calls.every((c) => !c.headers.includes(KEY))).toBe(true);
+  });
+
+  it('resolves a relative Location against the current hop', async () => {
+    const { fetch, calls } = chain([to('/b.spz'), new Response('ok', { status: 200 })]);
+    await provider(fetch).downloadAsset('https://cdn.marble.worldlabs.ai/a/a.spz');
+    expect(calls[1]!.url).toBe('https://cdn.marble.worldlabs.ai/b.spz');
+  });
+
+  it('refuses a redirect off the allowlist without dialling it', async () => {
+    const { fetch, calls } = chain([to('https://evil.example.com/steal')]);
+    await expect(
+      provider(fetch).downloadAsset('https://cdn.marble.worldlabs.ai/a.spz'),
+    ).rejects.toThrow(/not in the allowlist/);
+    expect(calls).toHaveLength(1);
+  });
+
+  it('refuses a redirect to cloud metadata or plain http', async () => {
+    for (const loc of ['https://169.254.169.254/latest', 'http://cdn.marble.worldlabs.ai/a']) {
+      const { fetch, calls } = chain([to(loc)]);
+      await expect(
+        provider(fetch, { assetHosts: '169.254.169.254,.worldlabs.ai' }).downloadAsset(
+          'https://cdn.marble.worldlabs.ai/a.spz',
+        ),
+      ).rejects.toThrow(/non-routable|must be https/);
+      expect(calls).toHaveLength(1);
+    }
+  });
+
+  it('gives up after 3 redirects', async () => {
+    const hop = () => to('https://cdn.marble.worldlabs.ai/loop');
+    const { fetch, calls } = chain([hop(), hop(), hop(), hop()]);
+    await expect(
+      provider(fetch).downloadAsset('https://cdn.marble.worldlabs.ai/loop'),
+    ).rejects.toThrow(/exceeded 3 redirects/);
+    expect(calls).toHaveLength(4);
+  });
+
+  it('API calls refuse redirects outright', async () => {
+    const { fetch, calls } = chain([new Response('{}', { status: 200 })]);
+    await provider(fetch).getOperation('op-1');
+    expect(calls[0]!.redirect).toBe('error');
   });
 });
