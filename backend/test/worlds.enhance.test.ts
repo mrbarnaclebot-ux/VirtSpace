@@ -86,7 +86,8 @@ interface DbState {
  * the same fake sees exactly what a second request would see in Postgres.
  */
 function makeFakeDb(state: DbState) {
-  return {
+  const db = {
+    transaction: async <T>(fn: (tx: unknown) => Promise<T>) => fn(db),
     select: () => ({
       from: (table: unknown) => {
         const chain = {
@@ -105,8 +106,11 @@ function makeFakeDb(state: DbState) {
         where: () => ({
           returning: async () => {
             // Conditional update: only the request that finds the world still
-            // in draft_ready flips it (and therefore gets a row back).
-            if (table !== worlds || state.world?.status !== 'draft_ready') return [];
+            // in draft_ready flips it (and therefore gets a row back). Only the
+            // enhance flip is modelled; frames:done's flip never matches a
+            // draft_ready world, so it matches nothing here either.
+            if (table !== worlds || patch['status'] !== 'generating_hq') return [];
+            if (state.world?.status !== 'draft_ready') return [];
             state.updates.push({ table, patch });
             state.world = { ...state.world, ...(patch as Partial<World>) };
             return [state.world];
@@ -123,6 +127,7 @@ function makeFakeDb(state: DbState) {
       }),
     }),
   };
+  return db;
 }
 
 async function makeApp(state: DbState) {
@@ -325,8 +330,11 @@ describe('POST /v1/worlds/{id}:enhance', () => {
       method: 'POST',
       url: `/v1/worlds/${WORLD_ID}/frames:done`,
     });
+    // Reached the frames:done handler (not enhance): a draft_ready world is a
+    // replay, so it answers 200 with no job instead of flipping to generating_hq.
     expect(framesDone.statusCode).toBe(200);
-    expect(state.inserts.at(-1)!.vals['kind']).toBe('stitch');
+    expect(framesDone.json().job_id).toBeNull();
+    expect(state.inserts).toHaveLength(0);
 
     const del = await app.inject({ method: 'DELETE', url: `/v1/worlds/${WORLD_ID}` });
     expect(del.statusCode).toBe(200);

@@ -1,5 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import Fastify from 'fastify';
+import { PgDialect } from 'drizzle-orm/pg-core';
+import type { SQL } from 'drizzle-orm';
 
 // Mock the lazy DB module BEFORE importing the routes. The factory reads
 // `currentDb` at call time, so each test swaps in its own fake.
@@ -68,9 +70,23 @@ interface DbState {
   inserts: { table: unknown; vals: Record<string, unknown> }[];
 }
 
+const dialect = new PgDialect();
+
+/**
+ * Would the route's conditional world flip match the fake row? Renders the
+ * route's real WHERE clause and applies its IN-list to the row's status, so the
+ * test exercises the predicate the route ships rather than a copy of it.
+ */
+function flipMatches(state: DbState, where: SQL): boolean {
+  const { sql, params } = dialect.sqlToQuery(where);
+  expect(sql).toContain('"deleted_at" is null');
+  return state.world.deletedAt === null && params.slice(1).includes(state.world.status);
+}
+
 /** Minimal chainable stand-in for the drizzle calls this route makes. */
 function makeFakeDb(state: DbState) {
-  return {
+  const db = {
+    transaction: async <T>(fn: (tx: unknown) => Promise<T>) => fn(db),
     select: () => ({
       from: (table: unknown) => {
         const rows =
@@ -89,8 +105,17 @@ function makeFakeDb(state: DbState) {
     }),
     update: (table: unknown) => ({
       set: (patch: Record<string, unknown>) => ({
-        where: async () => {
-          state.updates.push({ table, patch });
+        where: (where: SQL) => {
+          // The world flip is conditional and read via RETURNING; the capture
+          // write is awaited directly. Record only writes that actually apply.
+          const applies = table !== worlds || flipMatches(state, where);
+          if (applies) {
+            state.updates.push({ table, patch });
+            if (table === worlds) state.world = { ...state.world, ...patch } as World;
+          }
+          return Object.assign(Promise.resolve(), {
+            returning: async () => (applies ? [state.world] : []),
+          });
         },
       }),
     }),
@@ -103,6 +128,7 @@ function makeFakeDb(state: DbState) {
       }),
     }),
   };
+  return db;
 }
 
 async function makeApp(state: DbState) {
@@ -201,6 +227,52 @@ describe('POST /v1/worlds/:id/frames:done', () => {
     expect(res.json().error).toBe('invalid_body');
     expect(state.updates).toHaveLength(0); // world untouched…
     expect(state.inserts).toHaveLength(0); // …and no stitch job enqueued.
+    await app.close();
+  });
+
+  it('replay after draft_ready → 200 with current world, no job, no writes', async () => {
+    // iOS stranded-session recovery replays frames:done when a response was
+    // lost. Re-stitching here would enqueue a second billable generate_draft.
+    const state = freshState();
+    state.world.status = 'draft_ready';
+    const app = await makeApp(state);
+    const res = await app.inject({
+      method: 'POST',
+      url: '/v1/worlds/w-1/frames:done',
+      payload: { poses: [validPose] },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().job_id).toBeNull();
+    expect(res.json().world.status).toBe('draft_ready');
+    expect(state.updates).toHaveLength(0); // no status flip, no poses overwrite
+    expect(state.inserts).toHaveLength(0); // no stitch job
+    await app.close();
+  });
+
+  it.each(['stitching', 'generating_draft', 'generating_hq', 'complete'] as const)(
+    'replay while %s → no job enqueued',
+    async (status) => {
+      const state = freshState();
+      state.world.status = status;
+      const app = await makeApp(state);
+      const res = await app.inject({ method: 'POST', url: '/v1/worlds/w-1/frames:done' });
+      expect(res.statusCode).toBe(200);
+      expect(state.inserts).toHaveLength(0);
+      expect(state.world.status).toBe(status);
+      await app.close();
+    },
+  );
+
+  it('after failed_stitch → re-stitch allowed', async () => {
+    const state = freshState();
+    state.world.status = 'failed_stitch';
+    const app = await makeApp(state);
+    const res = await app.inject({ method: 'POST', url: '/v1/worlds/w-1/frames:done' });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().job_id).toBe('job-1');
+    expect(state.world.status).toBe('stitching');
+    expect(state.inserts[0]!.vals['kind']).toBe('stitch');
     await app.close();
   });
 

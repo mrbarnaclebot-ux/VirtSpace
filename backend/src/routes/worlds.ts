@@ -1,4 +1,4 @@
-import { and, desc, eq, isNull } from 'drizzle-orm';
+import { and, desc, eq, inArray, isNull } from 'drizzle-orm';
 import { z } from 'zod';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { getDb } from '../db/client.js';
@@ -345,31 +345,54 @@ export function worldsRoutes(app: FastifyInstance, deps: RouteDeps): void {
       const world = await findOwnedWorld(db, req.params.id, userId);
       if (!world) return reply.code(404).send({ error: 'world_not_found' });
 
-      // Store poses on the world's (latest) capture row when provided.
-      if (poses && poses.length > 0) {
-        const [capture] = await db
-          .select()
-          .from(captures)
-          .where(eq(captures.worldId, world.id))
-          .orderBy(desc(captures.createdAt))
-          .limit(1);
-        if (capture) {
-          await db
-            .update(captures)
-            .set({ posesJson: poses })
-            .where(eq(captures.id, capture.id));
+      // iOS stranded-session recovery REPLAYS frames:done when a response was
+      // lost. An unconditional flip let a replay after draft_ready/complete
+      // re-stitch → finalizeStitch enqueues a second generate_draft (a second
+      // bill, an HQ world knocked back to draft, scan quota bypassed). So the
+      // flip only fires from the statuses where (re)stitching is legitimate,
+      // as one statement (same pattern as enhance / finalizeStitch), and the
+      // poses write + enqueue share its transaction: a refused flip writes and
+      // enqueues nothing.
+      const flipped = await db.transaction(async (tx) => {
+        const [row] = await tx
+          .update(worlds)
+          // Entering a new status → progress resets; updated_at is the heartbeat.
+          .set({ status: 'stitching', progress: null, updatedAt: new Date() })
+          .where(
+            and(
+              eq(worlds.id, world.id),
+              inArray(worlds.status, ['uploading', 'failed_stitch']),
+              isNull(worlds.deletedAt),
+            ),
+          )
+          .returning();
+        if (!row) return null;
+
+        // Store poses on the world's (latest) capture row when provided.
+        if (poses && poses.length > 0) {
+          const [capture] = await tx
+            .select()
+            .from(captures)
+            .where(eq(captures.worldId, world.id))
+            .orderBy(desc(captures.createdAt))
+            .limit(1);
+          if (capture) {
+            await tx
+              .update(captures)
+              .set({ posesJson: poses })
+              .where(eq(captures.id, capture.id));
+          }
         }
+        return { world: row, jobId: await enqueue(tx, 'stitch', world.id) };
+      });
+
+      if (!flipped) {
+        // Replay (or a world already past stitching): 200, not 409 — a 409
+        // would make the iOS recovery retry forever. job_id is optional on iOS.
+        const current = await findOwnedWorld(db, world.id, userId);
+        return reply.send({ world: serializeWorld(current ?? world), job_id: null });
       }
-
-      // Entering a new status → progress resets; updated_at is the heartbeat.
-      await db
-        .update(worlds)
-        .set({ status: 'stitching', progress: null, updatedAt: new Date() })
-        .where(eq(worlds.id, world.id));
-      const jobId = await enqueue(db, 'stitch', world.id);
-
-      const [updated] = await db.select().from(worlds).where(eq(worlds.id, world.id)).limit(1);
-      return reply.send({ world: serializeWorld(updated!), job_id: jobId });
+      return reply.send({ world: serializeWorld(flipped.world), job_id: flipped.jobId });
     },
   );
 

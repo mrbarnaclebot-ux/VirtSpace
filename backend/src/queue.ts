@@ -45,9 +45,10 @@ export function backoffSeconds(attempts: number): number {
   return Math.min(raw, MAX_BACKOFF_SECONDS);
 }
 
-/** Insert a job row. Returns the created job id. */
+/** Insert a job row. Returns the created job id. Takes only `insert` so a
+ * caller can enqueue inside its own transaction (frames:done). */
 export async function enqueue(
-  db: Db,
+  db: Pick<Db, 'insert'>,
   kind: JobKind,
   worldId: string,
   payload?: unknown,
