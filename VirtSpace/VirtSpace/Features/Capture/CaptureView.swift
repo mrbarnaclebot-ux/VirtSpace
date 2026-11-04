@@ -242,7 +242,7 @@ struct CaptureView: View {
         // Refresh the allowance each time the start screen appears so the
         // remaining-scans hint / limit notice is current before a capture.
         .task {
-            refreshPendingUpload()
+            await refreshPendingUpload()
             await refreshQuota()
         }
     }
@@ -333,13 +333,13 @@ struct CaptureView: View {
         switch await handle.value {
         case .success:
             engine.reset()
-            refreshPendingUpload()
+            await refreshPendingUpload()
             toast = Toast(message: "Scan uploaded — watch it build in Library.", style: .success)
             try? await Task.sleep(for: .milliseconds(700))
             switchToLibrary()
         case .failure(let error):
             engine.reset()
-            refreshPendingUpload()
+            await refreshPendingUpload()
             toast = Toast(message: "Upload failed — your scan is saved. Retry from here or relaunch. (\((error as? LocalizedError)?.errorDescription ?? error.localizedDescription))", style: .error)
         }
     }
@@ -354,7 +354,7 @@ struct CaptureView: View {
             Task { @MainActor in uploadedFrames = done }
         }
         let outcome = await handle.value
-        refreshPendingUpload()
+        await refreshPendingUpload()
         switch outcome {
         case .succeeded:
             toast = Toast(message: "Scan uploaded — watch it build in Library.", style: .success)
@@ -374,7 +374,7 @@ struct CaptureView: View {
     /// Give up on the parked session(s) at the user's request.
     private func discardPendingUpload() async {
         let discarded = await UploadManager.shared.kickDiscardPending(api: api).value
-        refreshPendingUpload()
+        await refreshPendingUpload()
         if discarded > 0 {
             toast = Toast(message: "Scan discarded.", style: .success)
         }
@@ -388,7 +388,7 @@ struct CaptureView: View {
         guard !didResumePending else { return }
         didResumePending = true
         let outcome = await UploadManager.shared.kickResume(api: api).value
-        refreshPendingUpload()
+        await refreshPendingUpload()
         if case .succeeded(let worlds) = outcome, !worlds.isEmpty {
             toast = Toast(message: "Resumed \(worlds.count) pending scan upload\(worlds.count == 1 ? "" : "s").", style: .success)
         }
@@ -396,8 +396,8 @@ struct CaptureView: View {
 
     /// Re-read what's waiting on disk (pending / parked) for the affordances
     /// on the start screen.
-    private func refreshPendingUpload() {
-        pendingUpload = UploadManager.shared.pendingSummary(api: api)
+    private func refreshPendingUpload() async {
+        pendingUpload = await UploadManager.shared.pendingSummary(api: api)
     }
 
     // MARK: - Quota

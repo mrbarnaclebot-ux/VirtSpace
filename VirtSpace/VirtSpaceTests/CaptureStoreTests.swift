@@ -126,8 +126,8 @@ struct CaptureStoreDiskTests {
 
         #expect(fixture.manifest(session.id)?.isComplete == true)
 
-        fixture.store.setCreatedWorldId("world-9", forSession: session.id, in: session.directory)
-        fixture.store.markFrameUploaded(index: 0, forSession: session.id, in: session.directory)
+        try fixture.store.setCreatedWorldId("world-9", forSession: session.id, in: session.directory)
+        try fixture.store.markFrameUploaded(index: 0, forSession: session.id, in: session.directory)
 
         let reread = CaptureStore(baseDirectory: fixture.root)
         let manifest = reread.loadPending().first { $0.id == session.id }?.manifest
@@ -140,14 +140,14 @@ struct CaptureStoreDiskTests {
         let fixture = StoreFixture()
         let session = try fixture.makeCompleteSession(frameCount: 1)
 
-        let first = fixture.store.worldRequestId(forSession: session.id, in: session.directory)
+        let first = try fixture.store.worldRequestId(forSession: session.id, in: session.directory)
         #expect(first == session.id)
         // Stable across retries of the same logical request.
-        #expect(fixture.store.worldRequestId(forSession: session.id, in: session.directory) == first)
+        #expect(try fixture.store.worldRequestId(forSession: session.id, in: session.directory) == first)
         // Persisted, not just remembered.
         #expect(fixture.manifest(session.id)?.worldRequestId == first)
 
-        let renewed = fixture.store.worldRequestId(forSession: session.id, in: session.directory, renew: true)
+        let renewed = try fixture.store.worldRequestId(forSession: session.id, in: session.directory, renew: true)
         #expect(renewed != first)
         #expect(fixture.manifest(session.id)?.worldRequestId == renewed)
     }
@@ -158,16 +158,16 @@ struct CaptureStoreDiskTests {
         let session = try fixture.makeCompleteSession(frameCount: 1)
         let now = Date(timeIntervalSince1970: 1_700_000_000)
 
-        fixture.store.recordFailedAttempt(forSession: session.id, in: session.directory, countsTowardParking: true, at: now)
+        try fixture.store.recordFailedAttempt(forSession: session.id, in: session.directory, countsTowardParking: true, at: now)
         #expect(fixture.manifest(session.id)?.attemptCount == 1)
         #expect(fixture.manifest(session.id)?.lastAttemptAt == now)
 
         // Quota / offline: clock moves, counter doesn't.
-        fixture.store.recordFailedAttempt(forSession: session.id, in: session.directory, countsTowardParking: false, at: now.addingTimeInterval(60))
+        try fixture.store.recordFailedAttempt(forSession: session.id, in: session.directory, countsTowardParking: false, at: now.addingTimeInterval(60))
         #expect(fixture.manifest(session.id)?.attemptCount == 1)
         #expect(fixture.manifest(session.id)?.lastAttemptAt == now.addingTimeInterval(60))
 
-        fixture.store.resetUploadAttempts(forSession: session.id, in: session.directory)
+        try fixture.store.resetUploadAttempts(forSession: session.id, in: session.directory)
         #expect(fixture.manifest(session.id)?.attemptCount == 0)
         #expect(fixture.manifest(session.id)?.lastAttemptAt == nil)
     }

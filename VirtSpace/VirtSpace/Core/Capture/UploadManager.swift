@@ -92,8 +92,8 @@ final class UploadManager {
     }
 
     /// What's waiting on disk, for the capture screen's affordances.
-    func pendingSummary(api: APIClient) -> PendingUploadSummary {
-        CaptureUploader(api: api).pendingSummary()
+    func pendingSummary(api: APIClient) async -> PendingUploadSummary {
+        await CaptureUploader(api: api).pendingSummary()
     }
 
     /// Completion kick (launch + every scenePhase → .active): any pending
@@ -120,9 +120,10 @@ final class UploadManager {
     /// these closures are written inside this @MainActor type, and an
     /// unstructured `Task` formed here inherits that isolation. The flows below
     /// therefore run their bookkeeping ON the main actor and suspend at each
-    /// `await` (the network and disk transfers themselves are off-main inside
-    /// URLSession). Spelling it out stops the next reader assuming otherwise —
-    /// and stops anyone silently moving it.
+    /// `await`: network transfers run inside URLSession, and every manifest
+    /// read/write hops to the uploader's `PendingSessionStore` actor (R15), so
+    /// none of that I/O touches the main thread. Spelling it out stops the next
+    /// reader assuming otherwise — and stops anyone silently moving it.
     private func enqueue<T>(_ op: @escaping @MainActor () async -> T) -> Task<T, Never> {
         Task { await op() }
     }

@@ -107,14 +107,36 @@ struct CaptureUploaderTests {
         #expect(api.createKeys.last != session.id)
     }
 
+    @Test("A key that can't be persisted never reaches createWorld")
+    func unpersistableKeyRefusesToMint() async throws {
+        let fixture = StoreFixture()
+        let session = try fixture.makeCompleteSession(frameCount: 2)
+        // A read-only session directory makes every atomic poses.json write
+        // fail, the same way a full disk would.
+        let fm = FileManager.default
+        try fm.setAttributes([.posixPermissions: 0o555], ofItemAtPath: session.directory.path)
+        defer { try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: session.directory.path) }
+        let api = FakeUploadAPI()
+        let uploader = makeUploader(fixture, api: api)
+
+        await #expect(throws: (any Error).self) {
+            try await uploader.upload(
+                result: CaptureResult(sessionID: session.id, directory: session.directory, frameCount: 2)
+            )
+        }
+
+        #expect(api.createCount == 0)
+        #expect(fixture.manifest(session.id)?.worldRequestId == nil)
+    }
+
     // MARK: - World gone
 
     @Test("A world deleted server-side is replaced under a NEW persisted key")
     func worldGoneMintsWithNewKey() async throws {
         let fixture = StoreFixture()
         let session = try fixture.makeCompleteSession(frameCount: 2)
-        fixture.store.setCreatedWorldId("dead-world", forSession: session.id, in: session.directory)
-        fixture.store.markFrameUploaded(index: 0, forSession: session.id, in: session.directory)
+        try fixture.store.setCreatedWorldId("dead-world", forSession: session.id, in: session.directory)
+        try fixture.store.markFrameUploaded(index: 0, forSession: session.id, in: session.directory)
 
         let api = FakeUploadAPI()
         api.onRefreshUploads = { _ in throw Fixtures.worldGone }
@@ -144,7 +166,7 @@ struct CaptureUploaderTests {
     func quotaDuringWorldGoneMintsNothing() async throws {
         let fixture = StoreFixture()
         let session = try fixture.makeCompleteSession(frameCount: 2)
-        fixture.store.setCreatedWorldId("dead-world", forSession: session.id, in: session.directory)
+        try fixture.store.setCreatedWorldId("dead-world", forSession: session.id, in: session.directory)
 
         let api = FakeUploadAPI()
         api.onRefreshUploads = { _ in throw Fixtures.worldGone }
@@ -214,7 +236,7 @@ struct CaptureUploaderTests {
         #expect(api.createCount == CaptureStore.Manifest.maxAutomaticAttempts)
         if case .deferred = outcome {} else { Issue.record("expected deferral, got \(outcome)") }
 
-        let summary = uploader.pendingSummary()
+        let summary = await uploader.pendingSummary()
         #expect(summary.pendingCount == 1)
         #expect(summary.parkedCount == 1)
     }
@@ -312,8 +334,8 @@ struct CaptureUploaderTests {
     func resumeSkipsUploadedFrames() async throws {
         let fixture = StoreFixture()
         let session = try fixture.makeCompleteSession(frameCount: 2)
-        fixture.store.setCreatedWorldId("world-1", forSession: session.id, in: session.directory)
-        fixture.store.markFrameUploaded(index: 0, forSession: session.id, in: session.directory)
+        try fixture.store.setCreatedWorldId("world-1", forSession: session.id, in: session.directory)
+        try fixture.store.markFrameUploaded(index: 0, forSession: session.id, in: session.directory)
 
         let api = FakeUploadAPI()
         let frames = FakeFrameUploader()
@@ -330,9 +352,9 @@ struct CaptureUploaderTests {
     func strandedRecovery() async throws {
         let fixture = StoreFixture()
         let session = try fixture.makeCompleteSession(frameCount: 2)
-        fixture.store.setCreatedWorldId("world-1", forSession: session.id, in: session.directory)
-        fixture.store.markFrameUploaded(index: 0, forSession: session.id, in: session.directory)
-        fixture.store.markFrameUploaded(index: 1, forSession: session.id, in: session.directory)
+        try fixture.store.setCreatedWorldId("world-1", forSession: session.id, in: session.directory)
+        try fixture.store.markFrameUploaded(index: 0, forSession: session.id, in: session.directory)
+        try fixture.store.markFrameUploaded(index: 1, forSession: session.id, in: session.directory)
 
         let api = FakeUploadAPI()
         let uploader = makeUploader(fixture, api: api)
@@ -350,12 +372,12 @@ struct CaptureUploaderTests {
     func strandedRecoverySkipsParked() async throws {
         let fixture = StoreFixture()
         let session = try fixture.makeCompleteSession(frameCount: 2)
-        fixture.store.setCreatedWorldId("world-1", forSession: session.id, in: session.directory)
-        fixture.store.markFrameUploaded(index: 0, forSession: session.id, in: session.directory)
-        fixture.store.markFrameUploaded(index: 1, forSession: session.id, in: session.directory)
+        try fixture.store.setCreatedWorldId("world-1", forSession: session.id, in: session.directory)
+        try fixture.store.markFrameUploaded(index: 0, forSession: session.id, in: session.directory)
+        try fixture.store.markFrameUploaded(index: 1, forSession: session.id, in: session.directory)
         // Park it.
         for _ in 0..<CaptureStore.Manifest.maxAutomaticAttempts {
-            fixture.store.recordFailedAttempt(forSession: session.id, in: session.directory, countsTowardParking: true)
+            try fixture.store.recordFailedAttempt(forSession: session.id, in: session.directory, countsTowardParking: true)
         }
 
         let api = FakeUploadAPI()
@@ -375,7 +397,7 @@ struct CaptureUploaderTests {
     func discardPending() async throws {
         let fixture = StoreFixture()
         let session = try fixture.makeCompleteSession(frameCount: 2)
-        fixture.store.setCreatedWorldId("world-1", forSession: session.id, in: session.directory)
+        try fixture.store.setCreatedWorldId("world-1", forSession: session.id, in: session.directory)
         let api = FakeUploadAPI()
         let uploader = makeUploader(fixture, api: api)
 
@@ -384,6 +406,6 @@ struct CaptureUploaderTests {
         #expect(discarded == 1)
         #expect(api.deletedWorldIds == ["world-1"])
         #expect(fixture.pending(session.id) == nil)
-        #expect(uploader.pendingSummary().pendingCount == 0)
+        #expect(await uploader.pendingSummary().pendingCount == 0)
     }
 }

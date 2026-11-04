@@ -22,7 +22,7 @@ struct LibraryView: View {
     /// session manifests on each refresh tick (the server only knows the
     /// world is `uploading`; the manifest knows how many frames landed).
     @State private var uploadProgressByWorld: [String: UploadProgress] = [:]
-    private let captureStore = CaptureStore()
+    private let pendingSessions = PendingSessionStore()
 
     struct UploadProgress: Equatable {
         let uploaded: Int
@@ -170,7 +170,7 @@ struct LibraryView: View {
         defer { isLoading = false }
         do {
             worlds = try await api.listWorlds()
-            refreshUploadProgress()
+            await refreshUploadProgress()
         } catch {
             if showErrors, !Task.isCancelled {
                 toast = Toast(error)
@@ -180,10 +180,10 @@ struct LibraryView: View {
 
     /// Consult pending capture-session manifests for every world the server
     /// still reports as `uploading` — client truth for "Uploading i/N".
-    private func refreshUploadProgress() {
+    private func refreshUploadProgress() async {
         var byWorld: [String: UploadProgress] = [:]
         for world in worlds where world.status == .uploading {
-            if let (uploaded, total) = captureStore.pendingSessionProgress(worldId: world.id) {
+            if let (uploaded, total) = await pendingSessions.pendingSessionProgress(worldId: world.id) {
                 byWorld[world.id] = UploadProgress(uploaded: uploaded, total: total)
             }
         }

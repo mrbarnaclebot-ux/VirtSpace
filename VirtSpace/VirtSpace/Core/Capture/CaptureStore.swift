@@ -12,12 +12,13 @@
 import Foundation
 import simd
 
-/// Confined to whichever single queue its owner uses — the engine queue for a
-/// live capture, the upload flow's task for a resume. `manifests` is the only
-/// mutable state and is never shared between the two: an engine's store and an
-/// uploader's store are separate instances. The blocking disk I/O is the whole
-/// point (see `saveFrame`), so this is deliberately NOT an actor and
-/// deliberately NOT main-actor isolated.
+/// Confined to whichever single executor its owner uses — the engine queue for
+/// a live capture, a `PendingSessionStore` actor for upload flows and the
+/// Library. `manifests` is the only mutable state and is never shared between
+/// owners: each owns its own instance. The blocking disk I/O is the whole point
+/// (see `saveFrame`), so this is deliberately NOT an actor and deliberately NOT
+/// main-actor isolated; main-actor code reaches it through
+/// `PendingSessionStore`, never directly (spec §10 R15).
 nonisolated final class CaptureStore: @unchecked Sendable {
     // MARK: - Types
 
@@ -247,8 +248,8 @@ nonisolated final class CaptureStore: @unchecked Sendable {
 
     /// Persist the backend world id for a session so a later resume reuses it
     /// (spec §6.1 crash-safe resume; never orphan a world). Idempotent.
-    func setCreatedWorldId(_ worldId: String, forSession id: UUID, in directory: URL) {
-        mutateManifest(id: id, in: directory) { $0.createdWorldId = worldId }
+    func setCreatedWorldId(_ worldId: String, forSession id: UUID, in directory: URL) throws {
+        try mutateManifest(id: id, in: directory) { $0.createdWorldId = worldId }
     }
 
     /// Reset a session's server-side world binding so a resume starts completely
@@ -257,8 +258,8 @@ nonisolated final class CaptureStore: @unchecked Sendable {
     /// when the backend reports the created world is gone (404 / world_not_found)
     /// — the frames + poses (the real capture data) are left untouched on disk so
     /// they can be re-uploaded to a brand-new world.
-    func resetWorldState(forSession id: UUID, in directory: URL) {
-        mutateManifest(id: id, in: directory) { m in
+    func resetWorldState(forSession id: UUID, in directory: URL) throws {
+        try mutateManifest(id: id, in: directory) { m in
             m.createdWorldId = nil
             m.uploadedFrameIndices = []
         }
@@ -276,10 +277,14 @@ nonisolated final class CaptureStore: @unchecked Sendable {
     ///   genuinely wanted: the previous world was deleted server-side. Written
     ///   to disk before the request returns, so a kill in that window still
     ///   can't double-create — the retry replays the new key.
+    ///
+    /// Throws when the key can't be persisted (e.g. disk full). The caller must
+    /// then NOT send the request: an unpersisted renewed key would be replaced
+    /// by yet another one on the next attempt, and each could bill a world.
     @discardableResult
-    func worldRequestId(forSession id: UUID, in directory: URL, renew: Bool = false) -> UUID {
+    func worldRequestId(forSession id: UUID, in directory: URL, renew: Bool = false) throws -> UUID {
         var assigned = id
-        mutateManifest(id: id, in: directory) { m in
+        try mutateManifest(id: id, in: directory) { m in
             if renew || m.worldRequestId == nil {
                 m.worldRequestId = renew ? UUID() : m.sessionID
             }
@@ -298,8 +303,8 @@ nonisolated final class CaptureStore: @unchecked Sendable {
         in directory: URL,
         countsTowardParking: Bool,
         at date: Date = Date()
-    ) {
-        mutateManifest(id: id, in: directory) { m in
+    ) throws {
+        try mutateManifest(id: id, in: directory) { m in
             if countsTowardParking { m.attemptCount += 1 }
             m.lastAttemptAt = date
         }
@@ -307,8 +312,8 @@ nonisolated final class CaptureStore: @unchecked Sendable {
 
     /// Clear the attempt counter — a user-initiated retry starts the automatic
     /// budget over (and un-parks the session).
-    func resetUploadAttempts(forSession id: UUID, in directory: URL) {
-        mutateManifest(id: id, in: directory) { m in
+    func resetUploadAttempts(forSession id: UUID, in directory: URL) throws {
+        try mutateManifest(id: id, in: directory) { m in
             m.attemptCount = 0
             m.lastAttemptAt = nil
         }
@@ -316,8 +321,8 @@ nonisolated final class CaptureStore: @unchecked Sendable {
 
     /// Mark one frame confirmed-uploaded (crash-safe). Called after each frame's
     /// PUT succeeds so a resume re-PUTs only what's missing.
-    func markFrameUploaded(index: Int, forSession id: UUID, in directory: URL) {
-        mutateManifest(id: id, in: directory) { m in
+    func markFrameUploaded(index: Int, forSession id: UUID, in directory: URL) throws {
+        try mutateManifest(id: id, in: directory) { m in
             guard !m.uploadedFrameIndices.contains(index) else { return }
             m.uploadedFrameIndices.append(index)
             m.uploadedFrameIndices.sort()
@@ -326,18 +331,17 @@ nonisolated final class CaptureStore: @unchecked Sendable {
 
     /// Read-modify-write poses.json atomically. Reads the on-disk manifest first
     /// (resume sessions from a previous launch aren't in the in-memory cache),
-    /// falling back to the cache.
-    ///
-    /// NOTE: this used to claim it "runs off the main actor from the upload
-    /// flow". It does not — UploadManager's flows are @MainActor (see
-    /// `UploadManager.enqueue`), so every manifest read/write during an upload
-    /// is synchronous disk I/O on the main thread. Left as-is here because
-    /// moving it is a behaviour change, not a migration; see spec §10.
-    private func mutateManifest(id: UUID, in directory: URL, _ body: (inout Manifest) -> Void) {
-        guard var manifest = (try? readManifest(in: directory)) ?? manifests[id] else { return }
+    /// falling back to the cache. Not reentrant-safe on its own: concurrent
+    /// callers must be serialized by the owner (`PendingSessionStore` does).
+    /// Throws when there is no manifest to update or the write fails, so a
+    /// caller never proceeds as if unpersisted state were on disk.
+    private func mutateManifest(id: UUID, in directory: URL, _ body: (inout Manifest) -> Void) throws {
+        guard var manifest = (try? readManifest(in: directory)) ?? manifests[id] else {
+            throw CocoaError(.fileNoSuchFile, userInfo: [NSFilePathErrorKey: manifestURL(in: directory).path])
+        }
         body(&manifest)
+        try writeManifest(manifest, to: directory)
         manifests[id] = manifest
-        try? writeManifest(manifest, to: directory)
     }
 
     // MARK: - Reading back
