@@ -5,10 +5,12 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-// Equivalence proof for the spec §10 R8 row-band rewrite of reproject.py's
-// build(): the banded implementation must produce the SAME pano, coverage and
-// hole mask as the pre-banding full-frame code, which is vendored verbatim in
-// test/fixtures/reproject_legacy.py.
+// Band invariance for reproject.py's build() (spec §10 R8): filling the
+// equirect in row bands (to bound peak RSS) must not change the pano. The
+// reference is a single whole-sphere band of the SAME code. (Until the capture
+// v2 pipeline this compared against a vendored copy of the pre-banding code;
+// the prefilter and blend stages intentionally changed the pixels, so that
+// reference retired.)
 //
 // Needs cv2 + numpy (skipIf otherwise) — point STITCHER_TEST_PYTHON at a venv.
 const PY = process.env.STITCHER_TEST_PYTHON ?? 'python3';
@@ -24,7 +26,6 @@ function pyHasDeps(): boolean {
 
 const available = pyHasDeps();
 const script = fileURLToPath(new URL('../stitcher/reproject.py', import.meta.url));
-const legacyDir = fileURLToPath(new URL('./fixtures', import.meta.url));
 
 /**
  * Build a small synthetic capture: `count` textured landscape frames at yaw
@@ -63,7 +64,7 @@ for i in range(N):
 json.dump(poses, open(${JSON.stringify(posesPath)}, 'w'))
 `;
 
-/** Import reproject.py + the legacy reference, run both, print a JSON verdict. */
+/** Run build() whole-sphere and banded, print a JSON verdict. */
 const COMPARE_PY = (
   framesDir: string,
   posesPath: string,
@@ -71,22 +72,20 @@ const COMPARE_PY = (
   bandRows: number,
   withFill: boolean,
 ) => `
-import sys, json, importlib.util
+import sys, json
 sys.path.insert(0, ${JSON.stringify(path.dirname(script))})
-sys.path.insert(0, ${JSON.stringify(legacyDir)})
 import numpy as np
 import reproject as new
-import reproject_legacy as old
 
 poses = json.load(open(${JSON.stringify(posesPath)}))
 poses = sorted(poses, key=lambda p: int(p['index']))
 fd = ${JSON.stringify(framesDir)}
 
-# Silence the two modules' progress/log chatter so stdout carries only the verdict.
+# Silence progress/log chatter so stdout carries only the verdict.
 new.log = new.progress = lambda *a, **k: None
-old.log = old.progress = lambda *a, **k: None
 
-o_pano, o_cov, o_mask = old.build(${width}, fd, poses, 1, -1, 52.0)
+o_pano, o_cov, o_mask = new.build(${width}, fd, poses, 1, -1, 52.0,
+                                  band_height=${width} // 2)
 n_pano, n_cov, n_mask = new.build(${width}, fd, poses, 1, -1, 52.0,
                                   band_height=${bandRows})
 diff = np.abs(n_pano.astype(np.int16) - o_pano.astype(np.int16))
@@ -94,6 +93,7 @@ verdict = {
     'shape': list(n_pano.shape),
     'bands': int(np.ceil((${width} // 2) / ${bandRows})),
     'pano_max_abs_diff': int(diff.max()),
+    'pano_mean_abs_diff': float(diff.mean()),
     'pano_bit_identical': bool(np.array_equal(n_pano, o_pano)),
     'mask_identical': bool(np.array_equal(n_mask, o_mask)),
     'cov_identical': bool(n_cov == o_cov),
@@ -102,9 +102,7 @@ verdict = {
     'coverage_pct': float(o_cov),
 }
 if ${withFill ? 'True' : 'False'}:
-    # Telea inpaint always runs at 2048 wide, so this is the slow half — only
-    # the headline case pays for it.
-    o_filled = old.fill_holes(o_pano.copy(), o_mask)
+    o_filled = new.fill_holes(o_pano.copy(), o_mask)
     n_filled = new.fill_holes(n_pano.copy(), n_mask)
     fdiff = np.abs(n_filled.astype(np.int16) - o_filled.astype(np.int16))
     verdict['filled_max_abs_diff'] = int(fdiff.max())
@@ -113,7 +111,7 @@ print(json.dumps(verdict))
 `;
 
 describe.skipIf(!available)('reproject.py row banding (spec §10 R8)', () => {
-  it('banded build is bit-identical to the pre-banding full-frame build', () => {
+  it('banded build is bit-identical to a whole-sphere build', () => {
     const dir = mkdtempSync(path.join(tmpdir(), 'stitch-band-'));
     try {
       const framesDir = path.join(dir, 'frames');

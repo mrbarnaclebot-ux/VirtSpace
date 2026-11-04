@@ -78,6 +78,11 @@ DEFAULT_HFOV = 52.0
 DEFAULT_YAW_DIR = 1
 DEFAULT_PITCH_SIGN = -1
 
+# Source px/deg kept per pano px/deg by prefilter(): a little over 1 so the
+# bilinear remap still has sub-pixel detail to interpolate, well under the ~4x
+# at which it starts to alias.
+PREFILTER_OVERSAMPLE = 1.3
+
 REMAP_CHUNK = 8192  # cv2.remap 2D grid width cap (stay under SHRT_MAX).
 POLE_LAT_DEG = 60.0  # frames looking steeper than this get the pole weight boost.
 POLE_BOOST = 8.0
@@ -251,6 +256,24 @@ def load_frame(frames_dir, i):
     return None
 
 
+def prefilter(img, focal_px, pano_width):
+    """INTER_AREA-shrink a frame to PREFILTER_OVERSAMPLE x the pano's angular
+    density before remap.
+
+    A 12 MP iPhone frame carries ~49 px/deg at its centre; a 4096 pano holds
+    ~11. Bilinear remap from the full frame point-samples it and aliases fine
+    texture into moire/sparkle, and Marble rebuilds that noise as geometry.
+    Area-averaging first is the anti-alias filter (and makes remap cheaper).
+    Never upsamples.
+    """
+    s = PREFILTER_OVERSAMPLE * (pano_width / (2.0 * math.pi)) / focal_px
+    if s >= 1.0:
+        return img
+    hf, wf = img.shape[:2]
+    size = (max(2, round(wf * s)), max(2, round(hf * s)))
+    return cv2.resize(img, size, interpolation=cv2.INTER_AREA)
+
+
 def upright(img):
     """Rotate an ARKit-native landscape frame 90 deg clockwise to portrait."""
     return cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
@@ -309,9 +332,9 @@ def build(width, frames_dir, poses, yaw_dir, pitch_sign, hfov_deg, power=2.0,
     the original allocation pattern exactly and is what the equivalence test
     compares against.
 
-    The trade is decode work: each frame is re-read once per band. That is
-    bounded (JPEG decode of a ~12 MP frame is tens of ms) and buys a ~4-5x lower
-    peak RSS, which is what actually kills the worker.
+    Frames are decoded ONCE and kept prefiltered (see prefilter()): at the
+    pano's density a 12 MP frame shrinks ~10x in area, so holding all of them
+    costs less than the old per-band re-decode saved.
     """
     w = width
     h = width // 2
@@ -348,11 +371,30 @@ def build(width, frames_dir, poses, yaw_dir, pitch_sign, hfov_deg, power=2.0,
     step = 0
     covered_px = {i: 0 for i in indices}
     labels = {}
-    # index -> (r_proj, focal_x, focal_y, is_pole, hf, wf), or None when the
-    # frame is missing. Populated on the first band (the only one that must
-    # decode every frame to learn its dimensions) and reused afterwards so later
-    # bands can decide whether a frame touches them BEFORE paying for a decode.
+    # index -> (r_proj, focal_x, focal_y, is_pole, hf, wf) of the PREFILTERED
+    # frame, or None when the frame is missing; imgs holds the pixels.
     meta = {}
+    imgs = {}
+    for i in indices:
+        raw = load_frame(frames_dir, i)
+        if raw is None:
+            log(f"frame {i}: missing, skipped")
+            meta[i] = None
+            continue
+        img = upright(raw)
+        del raw
+        # Full-res geometry only sizes the prefilter; the frame's focals are
+        # then re-derived for the shrunken image (they are FOV-based).
+        _, focal_x, focal_y, _, _ = frame_orientation(
+            i, img.shape, pose_by_index, angles, hfov_deg
+        )
+        img = prefilter(img, max(focal_x, focal_y), w)
+        r_proj, focal_x, focal_y, is_pole, label = frame_orientation(
+            i, img.shape, pose_by_index, angles, hfov_deg
+        )
+        labels[i] = label
+        meta[i] = (r_proj, focal_x, focal_y, is_pole) + img.shape[:2]
+        imgs[i] = img
 
     for band, r0 in enumerate(range(0, h, band_height)):
         r1 = min(h, r0 + band_height)
@@ -390,23 +432,7 @@ def build(width, frames_dir, poses, yaw_dir, pitch_sign, hfov_deg, power=2.0,
             progress(5 + 65 * step / steps)
             step += 1
 
-            img = None
-            if i not in meta:
-                # First band: decode to learn the frame's upright dimensions,
-                # which the focal-length derivation needs.
-                raw = load_frame(frames_dir, i)
-                if raw is None:
-                    log(f"frame {i}: missing, skipped")
-                    meta[i] = None
-                    continue
-                img = upright(raw)
-                del raw
-                r_proj, focal_x, focal_y, is_pole, label = frame_orientation(
-                    i, img.shape, pose_by_index, angles, hfov_deg
-                )
-                labels[i] = label
-                meta[i] = (r_proj, focal_x, focal_y, is_pole) + img.shape[:2]
-            elif meta[i] is None:
+            if meta[i] is None:
                 continue
             r_proj, focal_x, focal_y, is_pole, hf, wf = meta[i]
 
@@ -432,11 +458,7 @@ def build(width, frames_dir, poses, yaw_dir, pitch_sign, hfov_deg, power=2.0,
             if hits == 0:
                 continue
 
-            # This band is actually covered, so the pixels are needed: decode now
-            # if an earlier band already learned this frame's geometry.
-            if img is None:
-                img = upright(load_frame(frames_dir, i))
-
+            img = imgs[i]
             # bilinear sample via remap on the in-bounds subset (reshaped to 2D).
             mx = px[inb].astype(np.float32)
             my = py[inb].astype(np.float32)
