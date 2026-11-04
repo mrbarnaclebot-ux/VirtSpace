@@ -404,52 +404,49 @@ worker starts, logs claim errors, and idles instead of exiting.
 
 ### Stitcher (spec §5 / Phase 0.5)
 
-Multi-frame captures are stitched into an 8192×4096 equirectangular pano by
-`stitcher/reproject.py` — the Phase 0.5 gate-winning algorithm, spawned as a
-subprocess by the worker's `stitch` handler.
+Multi-frame captures are stitched into a 4096×2048 equirectangular pano
+(capture v2, spec §5.2; Marble works at 2560×1280) by `stitcher/reproject.py`,
+spawned as a subprocess by the worker's `stitch` handler. Stages live in small
+modules beside it (`geom.py`, `poses.py`, `warp.py`, `depth.py`, `fill.py`, …).
 
-**Algorithm.** Each ARKit-native landscape frame is rotated 90° CW to upright,
-then **rotation-only reprojected** onto an equirect sphere (camera translation
-is ignored — this is a pure orientation panorama). Overlaps are **feather
-blended** (center-weighted, `weight = ((1-|nx|)(1-|ny|))²`, pole frames boosted
-so caps don't smear), and residual holes are **Telea-inpainted** at reduced res
-then composited back.
+**Pipeline (poses provided).** Each frame is decoded once and `INTER_AREA`
+prefiltered to ~1.3× the pano's angular density (anti-aliasing). The pano is
+centred on the **centroid of camera positions** and reprojected
+**translation-aware**: each pano ray is placed at a depth and sampled by every
+camera through its full pose. Depth per frame, in priority order: LiDAR depth
+maps from `--depth-dir` (forward-projected into one pano-space depth, nearest
+surface wins) → `featureDepthMedian` → `--proxy-depth` (default 2.0 m, chosen on
+the 2026-09-17 capture). Then per-frame gain compensation over overlaps (seeded
+by `iso × exposureDuration` when every pose has both), graph-cut seam selection
+(`cv2.detail`, colour-gradient cost, at 1024 wide), a banded multi-band blend
+that wraps at ±180°, and a nadir cap mask (`--nadir-cap-deg`, default 20°; the
+user's body) refilled from the surrounding floor in a top-down view.
 
-Two orientation modes:
+**Poses absent** — rotation-only fallback on the nominal guided-capture angles,
+exactly as the Phase 0.5 spike (R17 orientation tests still cover it).
 
-- **poses provided** (`captures.poses_json` present) — each frame's orientation
-  comes from its ARKit 4×4 camera-to-world `transform` and its intrinsics-derived
-  FOV. This gives a level horizon and correct relative yaw/roll from real device
-  attitude.
-- **poses absent** — falls back to the nominal 16-target guided-capture angles
-  with the winning parameters (`pitch_sign=-1`, `hfov=52`), exactly as the spike.
+Benchmark on the 28-frame 2026-09-17 capture at 4096 (`stitcher/bench.py`):
+overlap error 11.43 → 9.06, edge-doubling score 0.076 → 0.048, 4.8 s,
+~1 GB peak RSS (macOS high-water mark). At 8192: 12.8 s, 1.43 GB.
 
 **Coordinate reconciliation.** Equirect world and ARKit world are both
 right-handed, +Y up (gravity), so the horizon stays level. The ARKit camera is
 right-handed (+X right, +Y up, optical axis **−Z**); after the 90° CW upright
 rotation the fixed rebasing `X_proj=+Y_ak, Y_proj=−X_ak, Z_proj=−Z_ak` maps it
 into the left-handed pinhole the reprojection equations use (forward **+Z**).
-Intrinsics (native-landscape `fx,fy,cx,cy`) yield resolution-independent FOVs;
-after rotation the upright **width** spans the native **vertical** FOV and the
-upright **height** the native **horizontal** FOV.
 
 **Memory (spec §10 R8).** The equirect is filled in **horizontal row bands**
-(`BAND_TARGET_PIXELS`, 1 Mpx → 128 rows at 8192 wide) rather than allocating the
-ray grid, accumulator and output at sphere resolution. `--width` is capped at
-**8192**. Measured peak RSS at 8192×4096 on a 28-frame capture: **4.53 GB →
-397 MB** (full coverage) and **4.24 GB → 447 MB** (36.9 % coverage, inpaint
-exercised), with no runtime regression. Output is unchanged — the 8192-wide
-panos are byte-identical to the pre-banding implementation, which is kept in
-`test/fixtures/reproject_legacy.py` purely so `test/stitcher.banding.test.ts`
-can keep proving it.
+rather than at sphere resolution; `--width` is capped at **8192**.
+`test/stitcher.banding.test.ts` proves banded output equals a whole-pano run of
+the same code.
 
 **CLI** (deterministic; progress on stdout; stderr + an EXIT CODE on failure):
 
 ```bash
 python3 stitcher/reproject.py \
   --frames-dir DIR --out pano.jpg \
-  [--poses poses.json] [--width 8192] [--preview-out pano_preview.jpg] \
-  [--band-rows N]
+  [--poses poses.json] [--width 4096] [--preview-out pano_preview.jpg] \
+  [--depth-dir DIR] [--proxy-depth M] [--nadir-cap-deg D] [--band-rows N]
 ```
 
 **Exit codes** — the worker classifies retryability from the code, never by
