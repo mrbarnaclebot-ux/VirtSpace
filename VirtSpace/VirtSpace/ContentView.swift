@@ -14,11 +14,12 @@ struct ContentView: View {
         case library
     }
 
+    @Environment(APIClient.self) private var api
     @State private var selectedTab: Tab = .capture
 
     var body: some View {
         TabView(selection: $selectedTab) {
-            CaptureView(switchToLibrary: { selectedTab = .library })
+            CaptureView(api: api, switchToLibrary: { selectedTab = .library })
                 .tabItem {
                     Label("Capture", systemImage: "viewfinder")
                 }

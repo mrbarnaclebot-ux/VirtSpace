@@ -81,9 +81,10 @@ nonisolated final class CaptureEngine: @unchecked Sendable {
     private var running = false
     /// Fired (on the engine queue) with the backend world id when a session
     /// that already minted a world is permanently discarded (abandon flow).
-    /// The owner (CaptureView) uses it for a best-effort server-side delete;
-    /// the worker's 24 h uploading reaper is the backstop.
-    var onSessionDiscarded: ((String) -> Void)?
+    /// The owner (CaptureScreenModel) uses it for a best-effort server-side
+    /// delete; the worker's 24 h uploading reaper is the backstop. Fixed at
+    /// init so the engine queue never reads it while the main actor writes it.
+    private let onSessionDiscarded: @Sendable (String) -> Void
     /// True from dwell-fire until the next target is ready — gates the dwell
     /// machine while a still is in flight.
     private var isTakingStill = false
@@ -107,10 +108,14 @@ nonisolated final class CaptureEngine: @unchecked Sendable {
     /// (Stage B3 deliverable 2b) — see HUDPublishThrottle.
     private var throttle = HUDPublishThrottle()
 
-    init(store: CaptureStore = CaptureStore()) {
+    init(
+        store: CaptureStore = CaptureStore(),
+        onSessionDiscarded: @escaping @Sendable (String) -> Void = { _ in }
+    ) {
         let queue = DispatchQueue(label: "com.virtspace.capture-engine")
         self.queue = queue
         self.store = store
+        self.onSessionDiscarded = onSessionDiscarded
         self.thermal = ThermalGovernor(queue: queue)
         self.shots = ShotPipeline(store: store, queue: queue)
 
@@ -182,7 +187,7 @@ nonisolated final class CaptureEngine: @unchecked Sendable {
             self.source = nil
             if let session = self.session {
                 if let worldId = self.store.createdWorldId(forSession: session.id, in: session.directory) {
-                    self.onSessionDiscarded?(worldId)
+                    self.onSessionDiscarded(worldId)
                 }
                 self.store.purge(id: session.id)
             }
