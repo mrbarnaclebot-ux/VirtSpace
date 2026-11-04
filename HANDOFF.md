@@ -4,32 +4,35 @@ Read this first next session, then `CLAUDE.md` and `spec-doc.md` §10 (ledger **
 
 ## State in one paragraph
 
-Backend is on `main` and **deployed** (2026-11-04): the R20–R23 P1 fixes, the Railway IaC migration (R26 part) and **capture v2 backend** (stitcher v2 = R36 ghosting fix, 4096-wide stitch = R40, depth upload API = §5.2). iOS capture v2 (R34, R37, R38, R39, R31 relocalization, LiDAR depth) lives on branch **`feat/capture-v2`**, stacked on **`refactor/r19-r15-capture-split`** (R19 + R15). Both are unmerged: 80/80 unit tests pass on the iOS 27 simulator and a Debug device build exists, but **no device capture has been done with it yet**. That capture is the gate for merging.
+Everything is on `main` (`e8ec6bd`+) and the backend is **deployed** (api + worker, 2026-11-05): R20–R23, Railway IaC, capture v2 (stitcher v2, depth API, 4096 stitch), the World Labs `display_name` 64-char fix and **full-resolution splats** (worker stores `splat_full.spz`; iOS loads it on 8 GB+ iPhones, else 500k). iOS capture v2 and the R19/R15 refactor are merged (83/83 sim tests) and a Debug build of `main` with production Secrets is on the owner's iPhone 17 Pro. The owner's first capture-v2 world (`b936c74a`) ran end to end incl. **Enhance to HQ (R18 verified: complete, asset_version 2)**; its HQ full_res splat was backfilled by hand. Owner verdict: ghosting reduced, HQ sharper, but walking away from the capture spot blurs lettering and distorts unseen areas (single-pano limit; see the live-mapping research below).
 
-## Owner's next steps (device)
+## In flight at time of writing (2026-11-05, agents in worktrees under `.claude/worktrees/`)
 
-1. Unlock + plug in the iPhone 17 Pro, then install the prebuilt capture-v2 Debug build (production backend):
-   `xcrun devicectl device install app --device 00008150-00060CD23E21401C /private/tmp/claude-501/dd-capture-v2-device/Build/Products/Debug-iphoneos/VirtSpace.app`
-   (`/private/tmp` may be wiped; if so, rebuild from the `capture-v2` worktree after copying the main checkout's `Secrets.swift` in, then restore the worktree's localhost copy.)
-2. One full capture in a lit room (one 150-credit draft). Check: AE/AWB locked before shot 0 (no brightness jumps), low-light card in a dark room, pivot indicator nudges past ~15 cm drift, column order (12 around, 6 up, 8 down), relocalization / "Restart scan" after an interruption, no crash at the last shot (R16), un-mirrored text (R17), no doubled objects in the pano.
-3. Optionally tap **Enhance to HQ** on a `draft_ready` world (1500 credits, budget 2000/UTC day) to verify R18 end to end.
-4. Crash logs: `xcrun devicectl device info files --device <udid> --domain-type systemCrashLogs`, then `device copy from … --source <name>.ips`.
+Owner brief: work everything open **except login (R24)**; UI/UX redesign (clean modern flat, animations, onboarding, copy, spacing, settings, accurate toasts/alerts/progress); separate research on live whole-room/house mapping with an iPhone Pro + World Labs.
 
-After a clean capture: rebase `refactor/r19-r15-capture-split` then `feat/capture-v2` onto `main`, re-run the sim tests, fast-forward `main`, push, and remove both worktrees (`.claude/worktrees/r19-qa`, `.claude/worktrees/capture-v2`).
+| Branch | Scope | Status |
+|---|---|---|
+| `docs/ui-spec` | Designer: UI/UX audit + `docs/design/ui-spec.md` (tokens, IA, onboarding incl. R32 consent, copy deck, feedback accuracy audit, work packages) | running |
+| (no branch) | Research: live room/house mapping options + World Labs paths | running |
+| `feat/backend-state-retry` | R27 atomic flip+enqueue + claim attempts cap; `POST /v1/worlds/{id}:retry`; distinct 429 codes; DAILY_CREDIT_BUDGET default 2000 | running |
+| `chore/backend-hardening` | R28 pool errors/timeouts; R29 redirect SSRF; R30 audit; R33 storage guard, Dockerfile PID 1 + multi-stage, sslmode; `MIGRATE_DATABASE_URL` + api preDeploy; R26 CI workflow | running |
+| `fix/ios-robustness` | R25 background uploads; R31 WebGL termination + caches out of backup; R32 fixture.spz DEBUG-only + privacy manifest; CaptureEngine split; pano preview initial heading | running |
+
+Next: orchestrator verifies + merges each, then UI implementation work packages from the design spec. If a session ends mid-flight, check `git worktree list` and each branch's log.
 
 ## What landed 2026-11-04
 
 | Item | What |
 |---|---|
 | Reviews | Three code reviews + two capture reviews → ledger rows **R20–R41** in `spec-doc.md` §10 |
-| R15, R19 | `PendingSessionStore` actor (manifest I/O off the main actor); `CaptureView` 627 → 177 lines via `CaptureScreenModel`, `CaptureStartView`, DEBUG-only `CaptureDebugToolsView`. Branch only. |
+| R15, R19 | `PendingSessionStore` actor (manifest I/O off the main actor); `CaptureView` 627 → 177 lines via `CaptureScreenModel`, `CaptureStartView`, DEBUG-only `CaptureDebugToolsView`. Merged 2026-11-05. |
 | R20 | `frames:done` is a conditional flip in a transaction (only `uploading`/`failed_stitch` → `stitching`); replay returns the current world with `job_id: null`. Deployed. |
 | R21 | Fastify `trustProxy` as a hop-count function (`TRUST_PROXY_HOPS`; **production api = 2**, measured — with 1 the logged client is a CDN77 edge IP). Spoofed `X-Forwarded-For` verified ignored. Deployed. |
 | R22 | `failJob` returns the phase; a job going `dead` applies the failed world status. Deployed. |
 | R23 | Root workspace + root lockfile deleted; `backend/package-lock.json` is the only app lockfile. Run commands inside `backend/`. |
 | R26 (part) | `railway.json` (deprecated, cutoff 2026-12-01, never read) replaced by IaC `.railway/railway.ts`; see Deploy. |
 | Capture v2 backend | Stitcher split into `geom/poses/warp/depth/fill/bench.py`; translation-aware reprojection about the camera centroid with a depth proxy (LiDAR when sent, else 2 m), gain compensation, GraphCut seams, banded multi-band blend, nadir body mask, width 4096. Depth API: `"depth": true` + `depth_frames` on create/`uploads:refresh`, response `depth_uploads`; worker stages `depth_<i>.png` best-effort. 09-17 benchmark: overlap error 11.43 → 9.06, edge-doubling 0.076 → 0.048, 4.8 s. Deployed. |
-| Capture v2 iOS | AE/AWB lock before shot 0 (AF continuous), low-light card, centroid drift + `PivotIndicatorView` (15 cm soft gate after 3 s), column order 12/6/8, relocalization + restart after 10 s, iOS 26.0 shot-0 guard, per-frame LiDAR depth PNG uploaded best-effort. Branch only. |
+| Capture v2 iOS | AE/AWB lock before shot 0 (AF continuous), low-light card, centroid drift + `PivotIndicatorView` (15 cm soft gate after 3 s), column order 12/6/8, relocalization + restart after 10 s, iOS 26.0 shot-0 guard, per-frame LiDAR depth PNG uploaded best-effort. Merged 2026-11-05. |
 
 **Verified test state (2026-11-04):** backend `tsc` clean, vitest **348 passed / 12 skipped** (skips = Postgres integration suites) with `STITCHER_TEST_PYTHON` set. iOS `feat/capture-v2`: **80/80** on a freshly erased iPhone 18 Pro simulator (iOS 27):
 `xcodebuild test -project VirtSpace/VirtSpace.xcodeproj -scheme VirtSpace -destination 'platform=iOS Simulator,name=iPhone 18 Pro'`
@@ -40,7 +43,8 @@ Upload worked: 28 frames + 28 LiDAR depth maps (~22 KB each) in R2, stitch v2 ra
 
 ## Open items
 
-- **Owner's verdict on the `b936c74a` capture** (phone flow + world quality), then merge both iOS branches. Add an in-app/ops retry for `failed_generating_draft`. R16/R17/R18 also still unseen on the phone.
+- R16 (no crash at last shot) and R17 (un-mirrored) passed implicitly on the 11-05 capture; R18 verified. In-app retry for failed generation is being built (`:retry`).
+- Viewer walk-radius limit (keep users near the capture spot) was proposed, not yet approved by the owner.
 - **Stitcher residuals:** faint doubling on objects ≲0.5 m without LiDAR (overlap-based depth estimate deferred); a hard seam where content changed between shots (e.g. a playing monitor).
 - **Follow-ups:** split `CaptureEngine.swift` (620 lines: exposure/relocalization out); `MIGRATE_DATABASE_URL` on the direct Neon host, then `preDeploy: "node dist/migrate.js"` on api in `railway.ts`.
 - **Backlog (not started):** R24 real auth before sharing the app (P1); R25 background uploads (P1); rest of R26 (CI, deploy from a clean commit); R27 status-flip + enqueue atomicity; R28 pg pool error/timeouts, structured logs; R29 redirect SSRF; R30 `npm audit` (zod high); rest of R31 (WebGL process termination, caches in Application Support); R32 terms + consent screen, `fixture.spz` in Release, privacy manifest; R33 `STORAGE_DRIVER` default, PID 1, image size, pg `sslmode` warning; R35 modernisation (Spark 2.4, three r187, `worker.ts` 1328 lines, …).
