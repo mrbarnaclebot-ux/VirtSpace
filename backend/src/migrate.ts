@@ -4,6 +4,7 @@ import { drizzle } from 'drizzle-orm/node-postgres';
 import { migrate } from 'drizzle-orm/node-postgres/migrator';
 import pg from 'pg';
 import { getConfig } from './config.js';
+import { withVerifyFullSslMode } from './db/client.js';
 
 // Programmatic migrator (spec §10 R10).
 //
@@ -43,7 +44,7 @@ export const MIGRATIONS_FOLDER = fileURLToPath(new URL('../drizzle', import.meta
  * different backends. Ending the client releases the lock even if we throw.
  */
 export async function runMigrations(connectionString: string): Promise<void> {
-  const client = new pg.Client({ connectionString });
+  const client = new pg.Client({ connectionString: withVerifyFullSslMode(connectionString) });
   await client.connect();
   try {
     const db = drizzle(client);

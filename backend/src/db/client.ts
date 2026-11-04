@@ -30,9 +30,28 @@ export const POOL_OPTIONS = {
   keepAlive: true,
 } as const;
 
+/**
+ * Pin `sslmode=verify-full` semantics (spec §10 R33).
+ *
+ * pg 8 already treats prefer/require/verify-ca as aliases of verify-full (full
+ * certificate + hostname check) but warns at boot that pg 9 will switch to
+ * libpq semantics, where `require` encrypts WITHOUT verifying the server. Neon
+ * hands out `sslmode=require` URLs, so rewriting the mode here keeps today's
+ * exact behaviour, keeps it across the pg 9 upgrade, and silences the warning,
+ * without touching the env var. A URL that opts into libpq semantics
+ * (uselibpqcompat) or disables/relaxes TLS is left as written.
+ */
+export function withVerifyFullSslMode(url: string): string {
+  if (/[?&]uselibpqcompat=/i.test(url)) return url;
+  return url.replace(/([?&])sslmode=(prefer|require|verify-ca)(?=&|#|$)/, '$1sslmode=verify-full');
+}
+
 export function getPool(): pg.Pool {
   if (!pool) {
-    pool = new pg.Pool({ connectionString: getConfig().DATABASE_URL, ...POOL_OPTIONS });
+    pool = new pg.Pool({
+      connectionString: withVerifyFullSslMode(getConfig().DATABASE_URL),
+      ...POOL_OPTIONS,
+    });
     // An idle client dropped by the server (Neon suspend, pooler restart)
     // emits 'error' on the pool; with no listener that kills the process. The
     // pool already discards the broken client, so logging is all that's left.
