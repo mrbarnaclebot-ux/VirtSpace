@@ -17,11 +17,15 @@ describe('loadConfig', () => {
     expect(cfg.DAILY_SCAN_QUOTA).toBe(10);
     expect(cfg.LOCAL_STORAGE_DIR).toBe('./data');
     expect(cfg.PUBLIC_BASE_URL).toBe('http://localhost:8080');
+    expect(cfg.STITCHER_WIDTH).toBe(4096);
   });
 
   it('coerces numeric env vars', () => {
-    const cfg = loadConfig({ ...base, PORT: '9090', DAILY_SCAN_QUOTA: '3' } as NodeJS.ProcessEnv);
+    const cfg = loadConfig(
+      { ...base, PORT: '9090', DAILY_SCAN_QUOTA: '3', STITCHER_WIDTH: '8192' } as NodeJS.ProcessEnv,
+    );
     expect(cfg.PORT).toBe(9090);
+    expect(cfg.STITCHER_WIDTH).toBe(8192);
     expect(cfg.DAILY_SCAN_QUOTA).toBe(3);
   });
 

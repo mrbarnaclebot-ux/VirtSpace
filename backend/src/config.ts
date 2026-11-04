@@ -91,8 +91,9 @@ const baseSchema = z.object({
   // Wall-clock ceiling for a single reproject.py run before it's killed and the
   // stitch job fails (retryable). Default 5 minutes.
   STITCHER_TIMEOUT_MS: numberFromEnv(300000),
-  // Equirect pano width (height = width/2). Default 8192 → 8192x4096.
-  STITCHER_WIDTH: numberFromEnv(8192),
+  // Equirect pano width (height = width/2). Default 4096 → 4096x2048 (spec §10
+  // R40): Marble works at 2560 wide, so 8192 only doubled stitch time/memory.
+  STITCHER_WIDTH: numberFromEnv(4096),
   // Python interpreter used to run stitcher/reproject.py.
   PYTHON_BIN: z.string().default('python3'),
 });

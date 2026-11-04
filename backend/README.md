@@ -467,7 +467,7 @@ matching message text:
 capture carries poses, spawns `PYTHON_BIN` with a `STITCHER_TIMEOUT_MS` ceiling,
 and on success uploads `pano.jpg` (+ optional `pano_preview.jpg`). The temp dir
 is always cleaned. Config: `STITCHER_TIMEOUT_MS` (300000), `STITCHER_WIDTH`
-(8192), `PYTHON_BIN` (`python3`).
+(4096, spec §10 R40), `PYTHON_BIN` (`python3`).
 
 **About the `.heic` frame keys.** Frames are presigned, stored and downloaded as
 `frame_<i>.heic` with an `image/heic` content-type, but **the bytes the iOS app
