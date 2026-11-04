@@ -188,6 +188,23 @@ struct WorldAssets: Decodable, Hashable {
         case colliderGLBURL = "collider_glb_url"
     }
 
+    /// The splat the 3D explorer loads, plus its tier tag (the cache key part
+    /// that keeps a cached 500k file from ever being served as full_res).
+    /// full_res is about 4x the splats of 500k (sharp lettering up close) and
+    /// needs the headroom: 7 GiB admits every 8 GB iPhone (they report ~7.5 GiB)
+    /// and up, and keeps 6 GB and smaller devices on 500k.
+    static func explorerSplat(
+        assets: WorldAssets?,
+        physicalMemory: UInt64 = ProcessInfo.processInfo.physicalMemory
+    ) -> (url: String, tier: String)? {
+        if physicalMemory >= 7 * 1024 * 1024 * 1024,
+           let full = assets?.spzFullURL, !full.isEmpty {
+            return (full, "full")
+        }
+        guard let k500 = assets?.spz500kURL, !k500.isEmpty else { return nil }
+        return (k500, "500k")
+    }
+
     /// Thumbnail as a URL, when the signed URL is present.
     var thumbnailAsURL: URL? {
         guard let thumbnailURL, !thumbnailURL.isEmpty else { return nil }

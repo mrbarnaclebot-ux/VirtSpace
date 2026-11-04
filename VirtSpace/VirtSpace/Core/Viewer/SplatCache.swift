@@ -4,7 +4,8 @@
 //
 //  Download-and-cache manager for world SPZ splats (spec §8: "aggressive
 //  on-device caching keyed by world-id+version"). Files live under
-//  Application Support/splats/{worldId}_v{version}.spz. A missing file is
+//  Application Support/splats/{worldId}_v{version}_{tier}.spz (tier = 500k or
+//  full, so one tier's file is never served as the other). A missing file is
 //  streamed from its presigned R2 URL with progress, written to a temp file,
 //  then atomically moved into place. Total cache is held under a 1 GB budget by
 //  evicting least-recently-used files.
@@ -35,18 +36,18 @@ actor SplatCache {
         }
     }
 
-    private func fileURL(worldId: String, version: Int) throws -> URL {
+    private func fileURL(worldId: String, version: Int, tier: String) throws -> URL {
         // Sanitize the id so it can't escape the directory.
         let safe = worldId.replacingOccurrences(of: "/", with: "_")
             .replacingOccurrences(of: "..", with: "_")
-        return try directory.appendingPathComponent("\(safe)_v\(version).spz")
+        return try directory.appendingPathComponent("\(safe)_v\(version)_\(tier).spz")
     }
 
     // MARK: - API
 
     /// The cached file, if present. Touches it so LRU sees a fresh access.
-    func cached(worldId: String, version: Int) -> URL? {
-        guard let url = try? fileURL(worldId: worldId, version: version),
+    func cached(worldId: String, version: Int, tier: String) -> URL? {
+        guard let url = try? fileURL(worldId: worldId, version: version, tier: tier),
               fm.fileExists(atPath: url.path) else { return nil }
         touch(url)
         return url
@@ -60,10 +61,11 @@ actor SplatCache {
     func ensure(
         worldId: String,
         version: Int,
+        tier: String,
         remoteURL: URL,
         progress: @Sendable @escaping (Double) -> Void
     ) async throws -> URL {
-        let dest = try fileURL(worldId: worldId, version: version)
+        let dest = try fileURL(worldId: worldId, version: version, tier: tier)
         if fm.fileExists(atPath: dest.path) {
             touch(dest)
             return dest

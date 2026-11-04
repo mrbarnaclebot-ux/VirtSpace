@@ -23,7 +23,7 @@ struct ExplorerView: View {
     /// with the loading ring.
     enum SplatSource: Equatable {
         case file(URL)
-        case remote(worldId: String, version: Int, url: URL)
+        case remote(worldId: String, version: Int, tier: String, url: URL)
     }
 
     let source: SplatSource
@@ -93,10 +93,10 @@ struct ExplorerView: View {
         case .file(let url):
             splatFileURL = url
             if case .preparing = phase { phase = .rendering(0) }
-        case .remote(let worldId, let version, let url):
+        case .remote(let worldId, let version, let tier, let url):
             do {
                 let local = try await SplatCache.shared.ensure(
-                    worldId: worldId, version: version, remoteURL: url
+                    worldId: worldId, version: version, tier: tier, remoteURL: url
                 ) { p in
                     Task { @MainActor in
                         if case .preparing = phase { phase = .preparing(p) }

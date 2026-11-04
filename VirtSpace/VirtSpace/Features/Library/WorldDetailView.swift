@@ -285,7 +285,8 @@ struct WorldDetailView: View {
     }
 
     private func openExplorer(_ world: World) async {
-        guard let urlStr = assets?.spz500kURL, let remoteURL = URL(string: urlStr) else {
+        guard let splat = WorldAssets.explorerSplat(assets: assets),
+              let remoteURL = URL(string: splat.url) else {
             toast = Toast(message: "This world has no 3D asset yet.", style: .error)
             return
         }
@@ -296,6 +297,7 @@ struct WorldDetailView: View {
             let local = try await SplatCache.shared.ensure(
                 worldId: world.id,
                 version: world.assetVersion ?? 1,
+                tier: splat.tier,
                 remoteURL: remoteURL
             ) { p in
                 Task { @MainActor in explorerProgress = p }
