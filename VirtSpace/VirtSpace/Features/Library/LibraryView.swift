@@ -241,7 +241,7 @@ struct WorldCard: View {
                 if world.status == .uploading, let up = uploadProgress {
                     HStack(spacing: 8) {
                         ProgressView(value: Double(up.uploaded), total: Double(max(up.total, 1)))
-                            .tint(world.status.tint)
+                            .tint(world.status.presentation(hasLocalUpload: true).tone.color)
                         Text("Uploading \(up.uploaded)/\(up.total)")
                             .font(.caption2.monospacedDigit())
                             .foregroundStyle(.secondary)
@@ -333,7 +333,7 @@ struct PipelineActivityView: View {
                 if let progress {
                     HStack(spacing: 8) {
                         ProgressView(value: Double(min(max(progress, 0), 100)), total: 100)
-                            .tint(status.tint)
+                            .tint(status.presentation().tone.color)
                         Text("\(progress)%")
                             .font(.caption2.monospacedDigit())
                             .foregroundStyle(.secondary)
@@ -364,22 +364,24 @@ struct StatusChip: View {
     let status: WorldStatus
 
     var body: some View {
+        let presentation = status.presentation()
+        let tint = presentation.tone.color
         HStack(spacing: 5) {
             if status.isActive {
                 ProgressView()
                     .controlSize(.mini)
-                    .tint(status.tint)
+                    .tint(tint)
             } else {
-                Image(systemName: status.systemImage)
+                Image(systemName: presentation.symbol)
                     .font(.caption2)
             }
-            Text(status.label)
+            Text(presentation.pill)
                 .font(.caption.weight(.medium))
         }
-        .foregroundStyle(status.tint)
+        .foregroundStyle(tint)
         .padding(.horizontal, 9)
         .padding(.vertical, 5)
-        .background(status.tint.opacity(0.14), in: Capsule())
+        .background(tint.opacity(0.14), in: Capsule())
     }
 }
 

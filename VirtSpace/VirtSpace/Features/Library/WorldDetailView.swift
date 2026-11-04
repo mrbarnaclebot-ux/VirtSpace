@@ -173,8 +173,8 @@ struct WorldDetailView: View {
             .font(.subheadline)
             .foregroundStyle(.secondary)
 
-            if case .failed(let raw) = world.status {
-                Label(raw.replacingOccurrences(of: "_", with: " "), systemImage: "exclamationmark.triangle")
+            if world.status.isFailed, let detail = world.status.presentation().detail {
+                Label(detail, systemImage: "exclamationmark.triangle")
                     .font(.footnote)
                     .foregroundStyle(.red)
             }
@@ -475,7 +475,7 @@ struct StatusTimeline: View {
 
     private func fillColor(for phase: Phase) -> Color {
         if phase.id == currentIndex {
-            return status.isFailed ? .red : status.tint
+            return status.isFailed ? .red : status.presentation().tone.color
         }
         return isDone(phase) ? Color.green.opacity(0.85) : Color(.tertiarySystemFill)
     }

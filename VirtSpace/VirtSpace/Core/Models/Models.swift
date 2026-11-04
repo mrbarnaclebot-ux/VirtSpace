@@ -8,7 +8,7 @@
 //  fields like `spz_500k_url` camel-case awkwardly).
 //
 
-import SwiftUI
+import Foundation
 
 // MARK: - WorldStatus
 
@@ -61,7 +61,7 @@ enum WorldStatus: Hashable, Codable {
         try container.encode(rawString)
     }
 
-    // MARK: Presentation
+    // MARK: Pipeline state
 
     /// True while a background job is running and the library should keep polling.
     var isActive: Bool {
@@ -74,45 +74,6 @@ enum WorldStatus: Hashable, Codable {
     var isFailed: Bool {
         if case .failed = self { return true }
         return false
-    }
-
-    var label: String {
-        switch self {
-        case .capturing: return "Capturing"
-        case .uploading: return "Uploading"
-        case .stitching: return "Stitching"
-        case .generatingDraft: return "Reconstructing"
-        case .draftReady: return "Draft ready"
-        case .generatingHq: return "Enhancing"
-        case .complete: return "Complete"
-        case .failed: return "Failed"
-        }
-    }
-
-    var systemImage: String {
-        switch self {
-        case .capturing: return "camera"
-        case .uploading: return "arrow.up.circle"
-        case .stitching: return "square.stack.3d.up"
-        case .generatingDraft: return "sparkles"
-        case .draftReady: return "checkmark.seal"
-        case .generatingHq: return "wand.and.stars"
-        case .complete: return "checkmark.seal.fill"
-        case .failed: return "exclamationmark.triangle.fill"
-        }
-    }
-
-    var tint: Color {
-        switch self {
-        case .capturing: return .gray
-        case .uploading: return .blue
-        case .stitching: return .teal
-        case .generatingDraft: return .indigo
-        case .draftReady: return .green
-        case .generatingHq: return .purple
-        case .complete: return .green
-        case .failed: return .red
-        }
     }
 }
 
