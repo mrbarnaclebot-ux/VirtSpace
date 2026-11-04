@@ -246,7 +246,9 @@ export function worldsRoutes(app: FastifyInstance, deps: RouteDeps): void {
     const rawKey = Array.isArray(keyHeader) ? keyHeader[0] : keyHeader;
     let clientRequestId: string | null = null;
     if (rawKey !== undefined) {
-      const key = z.string().uuid().safeParse(rawKey.trim());
+      // z.guid(), not z.uuid(): zod 4's uuid() enforces RFC 9562 version and
+      // variant bits, which zod 3 did not — keep accepting any 8-4-4-4-12 hex.
+      const key = z.guid().safeParse(rawKey.trim());
       if (!key.success) {
         return reply
           .code(400)

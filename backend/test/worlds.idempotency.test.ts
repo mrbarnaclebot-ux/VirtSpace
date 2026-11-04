@@ -251,6 +251,24 @@ describe('POST /v1/worlds with Idempotency-Key', () => {
     await app.close();
   });
 
+  it('accepts a GUID that is not RFC 9562 (zod 3 .uuid() contract kept on zod 4)', async () => {
+    const state = newState();
+    currentDb = makeDb(state);
+    const app = await buildApp(makeStorage());
+    const guid = '00000000-0000-0000-0000-000000000001'; // no version/variant bits
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/v1/worlds',
+      headers: { 'idempotency-key': guid },
+      payload: { frame_count: 1 },
+    });
+
+    expect(res.statusCode).toBe(201);
+    expect(state.inserts.find((i) => i['table'] === worlds)?.['clientRequestId']).toBe(guid);
+    await app.close();
+  });
+
   it('409s when the key maps to a soft-deleted world', async () => {
     const state = newState();
     state.byKey.set(KEY, fakeWorld({ clientRequestId: KEY, deletedAt: new Date() }));
