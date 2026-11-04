@@ -7,6 +7,7 @@ import {
   posesPresent,
   buildStitcherArgs,
   handleStitch,
+  processJob,
   runGeneration,
   stitcherExitCode,
   classifyStitcherFailure,
@@ -677,5 +678,50 @@ describe('handleStitch depth maps', () => {
 
     expect(seen.args).not.toContain('--depth-dir');
     expect(gets.some((k) => k.includes('depth_'))).toBe(false);
+  });
+});
+
+// --- purge removes depth maps with the frames (spec §5.2 item 4) -------------
+
+describe('purge deletes depth keys', () => {
+  function purgeDeps(deleted: string[]): WorkerDeps {
+    const caps = [{ id: 'cap-1', worldId: 'w-1', frameCount: 2, r2FramesPrefix: 'captures/cap-1' }];
+    const db = {
+      select: () => ({ from: () => ({ where: async () => caps }) }),
+      update: () => ({ set: () => ({ where: async () => undefined }) }),
+      execute: async () => undefined,
+    };
+    const storage = {
+      deleteObject: vi.fn(async (k: string) => { deleted.push(k); }),
+    } as unknown as StorageDriver;
+    return {
+      db: db as unknown as WorkerDeps['db'],
+      storage,
+      provider: {} as WorkerDeps['provider'],
+      config: stitchConfig,
+      push: (async () => undefined) as unknown as WorkerDeps['push'],
+    };
+  }
+  const captureKeys = [
+    'captures/cap-1/frame_0.heic',
+    'captures/cap-1/depth_0.png',
+    'captures/cap-1/frame_1.heic',
+    'captures/cap-1/depth_1.png',
+  ];
+
+  it('full purge', async () => {
+    const deleted: string[] = [];
+    await processJob(purgeDeps(deleted), { id: 'j', kind: 'purge', worldId: 'w-1', payload: null } as never);
+    expect(deleted).toEqual(expect.arrayContaining(captureKeys));
+    expect(deleted.some((k) => k.startsWith('worlds/w-1/'))).toBe(true);
+  });
+
+  it('framesOnly (reaper) purge', async () => {
+    const deleted: string[] = [];
+    await processJob(
+      purgeDeps(deleted),
+      { id: 'j', kind: 'purge', worldId: 'w-1', payload: { framesOnly: true } } as never,
+    );
+    expect(deleted).toEqual(captureKeys);
   });
 });

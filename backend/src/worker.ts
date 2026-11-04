@@ -27,7 +27,7 @@ import {
   type WorldModel,
 } from './provider/index.js';
 import { sendPush, type SendPush } from './push.js';
-import { stageDepthMaps } from './depth.js';
+import { depthKeyName, stageDepthMaps } from './depth.js';
 
 // Stage 2 worker loop (spec §4 steps 1–6, §7 state machine, §14 credit safety).
 // Entrypoint: `npm run worker`. Claims jobs of kinds [stitch, generate_draft,
@@ -1093,6 +1093,9 @@ async function handlePurge(deps: WorkerDeps, job: Job): Promise<void> {
     const prefix = cap.r2FramesPrefix ?? `captures/${cap.id}`;
     for (let i = 0; i < cap.frameCount; i++) {
       await storage.deleteObject(`${prefix}/frame_${i}.heic`).catch(() => undefined);
+      // Depth maps (spec §5.2) are per-key, not prefix-deleted, so name them
+      // explicitly. Deleting an absent key is a no-op on both drivers.
+      await storage.deleteObject(`${prefix}/${depthKeyName(i)}`).catch(() => undefined);
     }
   }
 
