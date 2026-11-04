@@ -93,7 +93,7 @@ struct CaptureUploaderTests {
         api.onCreateWorld = { _ in
             if first {
                 first = false
-                throw APIError.server(409, "world_deleted")
+                throw APIError.server(409, "idempotency_key_world_deleted")
             }
             return (Fixtures.world(), Fixtures.slots(count: 2))
         }
@@ -171,7 +171,7 @@ struct CaptureUploaderTests {
 
         let api = FakeUploadAPI()
         api.onRefreshUploads = { _ in throw Fixtures.worldGone }
-        api.onCreateWorld = { _ in throw APIError.quota }
+        api.onCreateWorld = { _ in throw APIError.scanQuota(resetAt: nil) }
         let uploader = makeUploader(fixture, api: api)
 
         let outcome = await uploader.resumePending(userInitiated: true)
@@ -247,7 +247,7 @@ struct CaptureUploaderTests {
         let fixture = StoreFixture()
         let session = try fixture.makeCompleteSession(frameCount: 2)
         let api = FakeUploadAPI()
-        api.onCreateWorld = { _ in throw APIError.quota }
+        api.onCreateWorld = { _ in throw APIError.scanQuota(resetAt: nil) }
         let clock = TestClock()
         let uploader = makeUploader(fixture, api: api, clock: clock)
 
@@ -323,7 +323,8 @@ struct CaptureUploaderTests {
         let outcome = await uploader.resumePending()
 
         if case .failed(let reason) = outcome {
-            #expect(reason.contains("stitcher unavailable"))
+            // The real error's user copy, not a generic "check your connection".
+            #expect(reason == APIError.server(503, "stitcher unavailable").errorDescription)
         } else {
             Issue.record("expected a failure with a reason, got \(outcome)")
         }

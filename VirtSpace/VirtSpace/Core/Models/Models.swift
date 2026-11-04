@@ -355,14 +355,17 @@ struct FramesDoneRequest: Encodable {
     let poses: [FramePose]?
 }
 
-/// `GET /v1/worlds` → `{ worlds: [...], has_more }`.
+/// `GET /v1/worlds` → `{ worlds: [...], has_more, next_offset }`.
 struct WorldsListResponse: Decodable {
     let worlds: [World]
     let hasMore: Bool?
+    /// Offset of the next page; nil on the last page.
+    let nextOffset: Int?
 
     enum CodingKeys: String, CodingKey {
         case worlds
         case hasMore = "has_more"
+        case nextOffset = "next_offset"
     }
 }
 
@@ -392,8 +395,10 @@ struct QuotaStatus: Decodable, Hashable {
     var isExhausted: Bool { scansRemaining <= 0 }
 }
 
-/// `POST /v1/worlds/:id/frames:done` → `{ world: {metadata}, job_id }`.
-struct FramesDoneResponse: Decodable {
+/// `{ world: {metadata}, job_id }`: the answer of `frames:done`, `:enhance`
+/// and `:retry`. `world` carries no assets; `jobId` nil = nothing new was
+/// enqueued (a replay or a concurrent request already did).
+struct WorldJobResponse: Decodable {
     let world: World
     let jobId: String?
 

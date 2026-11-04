@@ -105,7 +105,7 @@ enum Fixtures {
     }
 
     static var worldGone: APIError {
-        .server(404, "world_not_found")
+        .notFound
     }
 }
 

@@ -90,12 +90,12 @@ final class CaptureUploader {
     @discardableResult
     func upload(result: CaptureResult, progress: @escaping (Int) -> Void = { _ in }) async throws -> World {
         guard let session = await sessions.pending(result.sessionID) else {
-            throw APIError.server(0, "Capture session not found on disk")
+            throw APIError.localState("This scan is no longer on this phone.")
         }
         guard let world = try await withClaim(session.id, {
             try await attemptUpload(session: session, progress: progress)
         }) else {
-            throw APIError.server(0, "This capture is already uploading")
+            throw APIError.localState("This scan is already uploading.")
         }
         return world
     }
@@ -367,7 +367,7 @@ final class CaptureUploader {
         // the user's back. Every automatic path already skips parked sessions.
         if let current = await sessions.pending(session.id), current.manifest.isParked {
             AppLog.upload.fault("Refusing to mint a world for PARKED session \(session.id.uuidString, privacy: .public)")
-            throw APIError.server(0, "This upload is paused. Retry or discard it from the capture screen.")
+            throw APIError.localState("This scan couldn't upload. It's saved on this phone.")
         }
         let title = "Scan \(now().formatted(date: .abbreviated, time: .shortened))"
         AppLog.upload.log("Upload start: session \(session.id.uuidString, privacy: .public), \(frameCount) frames")
@@ -379,9 +379,9 @@ final class CaptureUploader {
             // brand-new key (before the request, as always) and retry once.
             AppLog.upload.fault("createWorld 409 for session \(session.id.uuidString, privacy: .public) — idempotency key is spent, minting under a fresh key")
             return try await mintWorld(session: session, title: title, frameCount: frameCount, depthFrames: depthFrames, renewKey: true)
-        } catch APIError.quota {
-            AppLog.upload.log("createWorld refused for quota (429) — keeping session \(session.id.uuidString, privacy: .public) pending, will retry when allowance frees up (no replacement world minted)")
-            throw APIError.quota
+        } catch let error as APIError where error.isLimit {
+            AppLog.upload.log("createWorld refused (\(String(describing: error), privacy: .public)) — keeping session \(session.id.uuidString, privacy: .public) pending, will retry when allowance frees up (no replacement world minted)")
+            throw error
         }
     }
 

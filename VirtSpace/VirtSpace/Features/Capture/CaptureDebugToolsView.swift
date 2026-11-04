@@ -99,7 +99,7 @@ struct CaptureDebugToolsView: View {
             // second billable world.
             let (world, uploads, _) = try await api.createWorld(title: "Test Scan", frameCount: 1, idempotencyKey: UUID())
             guard let slot = uploads.first else {
-                throw APIError.server(0, "Backend returned no upload slots")
+                throw APIError.localState("Backend returned no upload slots")
             }
             try await FrameUploader().upload(frame, to: slot)
             try await api.framesDone(worldId: world.id)

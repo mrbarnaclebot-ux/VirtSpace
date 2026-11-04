@@ -179,12 +179,14 @@ final class APIClient {
         return try decode(data)
     }
 
-    /// `GET /v1/worlds` → `{ worlds: [...], has_more }`; each list item carries
-    /// a thumbnail-only `assets` object.
-    func listWorlds() async throws -> [World] {
-        let data = try await send(request("GET", "v1/worlds"))
-        let resp: WorldsListResponse = try decode(data)
-        return resp.worlds
+    /// `GET /v1/worlds?offset=&limit=` → one page, newest first, with
+    /// `has_more` / `next_offset`. Each item carries a thumbnail-only `assets`
+    /// object. `limit` nil = the server default (20, max 100).
+    func listWorlds(offset: Int = 0, limit: Int? = nil) async throws -> WorldsListResponse {
+        var query = "offset=\(offset)"
+        if let limit { query += "&limit=\(limit)" }
+        let data = try await send(request("GET", "v1/worlds?\(query)"))
+        return try decode(data)
     }
 
     /// `GET /v1/me/quota` → the user's daily-scan allowance. Called before a
@@ -194,8 +196,21 @@ final class APIClient {
         return try decode(data)
     }
 
-    func enhance(worldId: String) async throws {
-        _ = try await send(request("POST", "v1/worlds/\(worldId):enhance"))
+    /// `POST /v1/worlds/{id}:enhance` → `{world, job_id}`. 409
+    /// `.notRetryable`, 429 `.creditBudget` / `.rateLimited`.
+    @discardableResult
+    func enhance(worldId: String) async throws -> WorldJobResponse {
+        try decode(try await send(request("POST", "v1/worlds/\(worldId):enhance")))
+    }
+
+    /// `POST /v1/worlds/{id}:retry` re-runs the phase a `failed_*` world
+    /// failed in. 200 `{world, job_id}`; `job_id == nil` means a retry is
+    /// already running (double tap, replay): success all the same. Errors:
+    /// `.notRetryable`, `.notFound`, `.scanQuota` (draft retry),
+    /// `.creditBudget`, `.rateLimited`. Not idempotent-keyed: never call it
+    /// in a loop; it is an explicit user action that can bill again.
+    func retry(worldId: String) async throws -> WorldJobResponse {
+        try decode(try await send(request("POST", "v1/worlds/\(worldId):retry")))
     }
 
     func deleteWorld(id: String) async throws {
@@ -212,7 +227,7 @@ final class APIClient {
     // MARK: - Request plumbing
 
     private func request(_ method: String, _ path: String, body: Data? = nil) -> URLRequest? {
-        // Build by string so path colons (":enhance", "frames:done") stay literal.
+        // Build by string so path colons (":enhance", ":retry", "frames:done") stay literal.
         guard let url = URL(string: baseURL + "/" + path) else { return nil }
         var req = URLRequest(url: url)
         req.httpMethod = method
@@ -245,16 +260,10 @@ final class APIClient {
         switch http.statusCode {
         case 200..<300:
             return data
-        case 401, 403:
-            AppLog.api.error("Unauthorized (\(http.statusCode)): \(tag, privacy: .public)")
-            throw APIError.unauthorized
-        case 402, 429:
-            AppLog.api.error("Quota (\(http.statusCode)): \(tag, privacy: .public)")
-            throw APIError.quota
         default:
-            let message = APIClient.errorMessage(from: data)
-            AppLog.api.error("Server error \(http.statusCode): \(tag, privacy: .public) — \(message ?? "no body", privacy: .public)")
-            throw APIError.server(http.statusCode, message)
+            let error = APIError.from(status: http.statusCode, data: data)
+            AppLog.api.error("HTTP \(http.statusCode): \(tag, privacy: .public) — \(String(describing: error), privacy: .public)")
+            throw error
         }
     }
 
@@ -267,16 +276,6 @@ final class APIClient {
     }
 
     // MARK: - Helpers
-
-    private static func errorMessage(from data: Data) -> String? {
-        guard !data.isEmpty else { return nil }
-        if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            for key in ["error", "message", "detail"] {
-                if let value = object[key] as? String { return value }
-            }
-        }
-        return String(data: data, encoding: .utf8)
-    }
 
     // ISO8601DateFormatter is thread-safe; nonisolated(unsafe) is sound here.
     private nonisolated(unsafe) static let isoWithFractional: ISO8601DateFormatter = {
@@ -292,7 +291,7 @@ final class APIClient {
     }()
 
     /// Lenient date decoding: ISO8601 (with/without fractional seconds) or epoch.
-    private nonisolated static func decodeDate(_ decoder: Decoder) throws -> Date {
+    nonisolated static func decodeDate(_ decoder: Decoder) throws -> Date {
         let container = try decoder.singleValueContainer()
         if let string = try? container.decode(String.self) {
             if let date = isoWithFractional.date(from: string) { return date }

@@ -169,7 +169,7 @@ struct LibraryView: View {
         isLoading = true
         defer { isLoading = false }
         do {
-            worlds = try await api.listWorlds()
+            worlds = try await api.listWorlds().worlds
             await refreshUploadProgress()
         } catch {
             if showErrors, !Task.isCancelled {
