@@ -46,14 +46,24 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
 struct VirtSpaceApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @Environment(\.scenePhase) private var scenePhase
-    @State private var apiClient = APIClient()
+    @State private var apiClient: APIClient
     @State private var toasts = ToastCenter()
+    @State private var worldStore: WorldStore
+    @State private var router = AppRouter()
+
+    init() {
+        let api = APIClient()
+        _apiClient = State(initialValue: api)
+        _worldStore = State(initialValue: WorldStore(api: api))
+    }
 
     var body: some Scene {
         WindowGroup {
             ContentView()
                 .environment(apiClient)
                 .environment(toasts)
+                .environment(worldStore)
+                .environment(router)
                 .onAppear { ToastWindow.install(toasts) }
         }
         // Completion kick (launch + every return to foreground): finish any
@@ -64,6 +74,7 @@ struct VirtSpaceApp: App {
         // Skipped entirely under XCTest: the hosted test bundle launches this
         // app, and this kick mints/completes REAL worlds (TestEnvironment).
         .onChange(of: scenePhase, initial: true) { _, phase in
+            worldStore.setSceneActive(phase == .active)
             if phase == .active, !TestEnvironment.isRunningUnderXCTest {
                 UploadManager.shared.kickStrandedRecovery(api: apiClient)
             }

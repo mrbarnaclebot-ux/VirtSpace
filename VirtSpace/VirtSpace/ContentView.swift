@@ -9,28 +9,24 @@
 import SwiftUI
 
 struct ContentView: View {
-    private enum Tab: Hashable {
-        case capture
-        case library
-    }
-
     @Environment(APIClient.self) private var api
     @Environment(ToastCenter.self) private var toasts
-    @State private var selectedTab: Tab = .capture
+    @Environment(AppRouter.self) private var router
 
     var body: some View {
-        TabView(selection: $selectedTab) {
-            CaptureView(api: api, toasts: toasts, switchToLibrary: { selectedTab = .library })
+        @Bindable var router = router
+        TabView(selection: $router.selectedTab) {
+            CaptureView(api: api, toasts: toasts, switchToLibrary: { router.selectedTab = .library })
                 .tabItem {
                     Label("Capture", systemImage: "viewfinder")
                 }
-                .tag(Tab.capture)
+                .tag(AppRouter.Tab.scan)
 
             LibraryView()
                 .tabItem {
                     Label("Library", systemImage: "square.grid.2x2")
                 }
-                .tag(Tab.library)
+                .tag(AppRouter.Tab.library)
         }
         .tint(.cyan)
         .preferredColorScheme(.dark)
@@ -38,7 +34,10 @@ struct ContentView: View {
 }
 
 #Preview {
+    let api = APIClient()
     ContentView()
-        .environment(APIClient())
+        .environment(api)
         .environment(ToastCenter())
+        .environment(WorldStore(api: api))
+        .environment(AppRouter())
 }
