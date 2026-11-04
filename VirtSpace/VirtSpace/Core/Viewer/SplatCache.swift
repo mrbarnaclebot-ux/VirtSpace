@@ -4,7 +4,7 @@
 //
 //  Download-and-cache manager for world SPZ splats (spec §8: "aggressive
 //  on-device caching keyed by world-id+version"). Files live under
-//  Application Support/splats/{worldId}_v{version}_{tier}.spz (tier = 500k or
+//  Caches/splats/{worldId}_v{version}_{tier}.spz (tier = 500k or
 //  full, so one tier's file is never served as the other). A missing file is
 //  streamed from its presigned R2 URL with progress, written to a temp file,
 //  then atomically moved into place. Total cache is held under a 1 GB budget by
@@ -26,14 +26,7 @@ actor SplatCache {
     // MARK: - Paths
 
     private var directory: URL {
-        get throws {
-            let base = try fm.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
-            let dir = base.appendingPathComponent("splats", isDirectory: true)
-            if !fm.fileExists(atPath: dir.path) {
-                try fm.createDirectory(at: dir, withIntermediateDirectories: true)
-            }
-            return dir
-        }
+        get throws { try ViewerCacheDirectory.url("splats", fm: fm) }
     }
 
     private func fileURL(worldId: String, version: Int, tier: String) throws -> URL {
@@ -158,6 +151,30 @@ actor SplatCache {
                 log.info("Evicted cached splat \(url.lastPathComponent, privacy: .public)")
             }
         }
+    }
+}
+
+/// Caches, not Application Support: re-downloadable assets must not be backed
+/// up to iCloud, and the OS may purge them under storage pressure (spec §10
+/// R31). The first access moves a directory left in Application Support by an
+/// older build across (same volume, so a rename), keeping its files and names.
+nonisolated enum ViewerCacheDirectory {
+    static func url(_ name: String, fm: FileManager) throws -> URL {
+        let caches = try fm.url(for: .cachesDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+        let dir = caches.appendingPathComponent(name, isDirectory: true)
+        let legacy = try fm.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+            .appendingPathComponent(name, isDirectory: true)
+        if fm.fileExists(atPath: legacy.path) {
+            if fm.fileExists(atPath: dir.path) {
+                try? fm.removeItem(at: legacy)
+            } else if (try? fm.moveItem(at: legacy, to: dir)) == nil {
+                try? fm.removeItem(at: legacy) // clean re-download instead
+            }
+        }
+        if !fm.fileExists(atPath: dir.path) {
+            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+        return dir
     }
 }
 

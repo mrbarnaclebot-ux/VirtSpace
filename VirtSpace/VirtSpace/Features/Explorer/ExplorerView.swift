@@ -373,6 +373,24 @@ private struct ExplorerWebView: UIViewRepresentable {
             }
         }
 
+        /// Content-process deaths seen by this web view. Retry builds a new
+        /// web view (and coordinator), so the count starts over there.
+        private var processTerminations = 0
+
+        /// iOS kills the WebGL content process under memory pressure or in the
+        /// background, leaving a permanently black viewer (spec §10 R31).
+        /// Reload once; a second death in the same view goes to the error
+        /// state, whose Retry rebuilds everything.
+        func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+            processTerminations += 1
+            AppLog.viewer.error("Viewer web content process terminated (\(self.processTerminations))")
+            if processTerminations == 1 {
+                webView.reload()
+            } else {
+                onError("The 3D viewer stopped unexpectedly.")
+            }
+        }
+
         func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
             onError(error.localizedDescription)
         }

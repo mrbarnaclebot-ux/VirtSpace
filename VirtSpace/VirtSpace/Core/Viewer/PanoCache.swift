@@ -4,7 +4,7 @@
 //
 //  Download-and-cache manager for stitched equirectangular panoramas (the
 //  2D 360° preview, spec §6.4). Mirrors SplatCache: files live under
-//  Application Support/panos/{worldId}_v{version}.jpg, keyed by world id +
+//  Caches/panos/{worldId}_v{version}.jpg, keyed by world id +
 //  asset_version so a new asset version re-downloads. A missing file is
 //  streamed from its presigned R2 URL and atomically moved into place. Total
 //  cache is held under a modest budget (panos are small) by LRU eviction.
@@ -25,14 +25,7 @@ actor PanoCache {
     // MARK: - Paths
 
     private var directory: URL {
-        get throws {
-            let base = try fm.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
-            let dir = base.appendingPathComponent("panos", isDirectory: true)
-            if !fm.fileExists(atPath: dir.path) {
-                try fm.createDirectory(at: dir, withIntermediateDirectories: true)
-            }
-            return dir
-        }
+        get throws { try ViewerCacheDirectory.url("panos", fm: fm) }
     }
 
     private func fileURL(worldId: String, version: Int) throws -> URL {
