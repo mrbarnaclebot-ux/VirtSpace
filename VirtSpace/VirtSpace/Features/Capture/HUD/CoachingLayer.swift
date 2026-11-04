@@ -119,7 +119,7 @@ struct CoachingLayer: View {
         if c.driftTier == 2 {
             banner = CoachingBanner(
                 kind: .driftHard,
-                text: "Stay on your spot — step back to where you started",
+                text: "Hold the phone at your chest and turn around it",
                 systemImage: "figure.walk.motion",
                 tint: .orange,
                 isSticky: true
@@ -131,7 +131,7 @@ struct CoachingLayer: View {
             if Date() >= softDriftCooldownUntil {
                 banner = CoachingBanner(
                     kind: .driftSoft,
-                    text: "Try to pivot in place",
+                    text: "Turn around the phone, not your body",
                     systemImage: "arrow.trianglehead.2.clockwise.rotate.90",
                     tint: .cyan,
                     isSticky: false

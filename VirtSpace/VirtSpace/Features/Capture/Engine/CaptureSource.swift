@@ -44,6 +44,8 @@ nonisolated struct CapturedStill: Sendable {
     /// compensation (spec §5.2). nil when the camera didn't report it.
     var iso: Float?
     var exposureDuration: Double?
+    /// Median depth (metres) of ARKit's raw feature points in view.
+    var featureDepthMedian: Float?
 }
 
 nonisolated enum CaptureSourceError: LocalizedError {

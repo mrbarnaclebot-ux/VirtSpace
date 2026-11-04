@@ -92,7 +92,10 @@ nonisolated final class CaptureEngine: @unchecked Sendable {
     private var previousTimestamp: TimeInterval?
     private var smoothedRate: Double = 0
     private var dwell = DwellTracker()
-    private var firstShotPosition: simd_float3?
+    /// Camera position of every captured shot: their centroid is the pivot
+    /// the drift coaching and the soft gate measure from (R37).
+    private var shotPositions: [simd_float3] = []
+    private var pivotGate = PivotGate()
     /// Transient (non-pose) warnings stay visible this long (engine queue).
     private var transientWarning: (text: String, until: TimeInterval)?
 
@@ -267,7 +270,8 @@ nonisolated final class CaptureEngine: @unchecked Sendable {
         previousTimestamp = nil
         smoothedRate = 0
         dwell.reset()
-        firstShotPosition = nil
+        shotPositions = []
+        pivotGate.reset()
         exposurePhase = .metering
         meter.reset()
         isShowingLowLight = false
@@ -358,7 +362,10 @@ nonisolated final class CaptureEngine: @unchecked Sendable {
         let distance = AlignmentMath.angularDistanceDegrees(forward, target)
         let deltas = AlignmentMath.signedDeltas(cameraForward: forward, targetDirection: target)
         let steady = AlignmentMath.isSteady(rotationRate: smoothedRate, exposureDuration: pose.exposureDuration)
-        let drift = firstShotPosition.map { AlignmentMath.translationDrift(from: $0, current: position) } ?? 0
+        let drift = AlignmentMath.driftFromCentroid(of: shotPositions, current: position)
+        let pivotOffset = AlignmentMath.centroid(shotPositions).map {
+            AlignmentMath.pivotOffset(from: $0, current: position, cameraForward: forward)
+        } ?? .zero
 
         // Thermal coaching now flows through the dedicated `thermalState`
         // publish + CoachingLayer banner (event-driven via NotificationCenter),
@@ -378,7 +385,8 @@ nonisolated final class CaptureEngine: @unchecked Sendable {
         var progress: Double = 0
         let aligned = AlignmentMath.isAligned(angularDistanceDegrees: distance)
         if !isTakingStill {
-            let canFire = steady && pose.trackingWarning == nil && exposurePhase == .locked
+            var canFire = steady && pose.trackingWarning == nil && exposurePhase == .locked
+            canFire = pivotGate.allows(drift: drift, onTarget: aligned && canFire, at: pose.timestamp) && canFire
             if dwell.update(aligned: aligned, steady: canFire, at: pose.timestamp) {
                 progress = 1
             } else {
@@ -414,6 +422,7 @@ nonisolated final class CaptureEngine: @unchecked Sendable {
                 $0.pitchDeltaDegrees = deltas.pitch
                 $0.isSteady = steady
                 $0.driftMeters = drift
+                $0.pivotOffset = pivotOffset
                 $0.warning = publishedWarning
                 $0.cameraTransform = transform
                 $0.cameraIntrinsics = intrinsics
@@ -505,14 +514,11 @@ nonisolated final class CaptureEngine: @unchecked Sendable {
             }
 
         case .saved(let index, let transform):
-            // First shot pins the pivot origin for parallax coaching (the
-            // exposure lock is the pipeline's half of the same rule).
-            if index == 0 {
-                firstShotPosition = AlignmentMath.position(of: transform)
-            }
+            shotPositions.append(AlignmentMath.position(of: transform))
 
             currentIndex += 1
             dwell.reset()
+            pivotGate.reset()
             let next = currentIndex
 
             if next >= targets.count {

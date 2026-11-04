@@ -78,8 +78,11 @@ final class CaptureHUDState {
     var yawDeltaDegrees: Double = 0
     var pitchDeltaDegrees: Double = 0
     var isSteady = false
-    /// Meters of translation from the first shot's position (parallax coaching).
+    /// Meters from the centroid of the shots so far (pivot coaching).
     var driftMeters: Float = 0
+    /// Camera offset from that centroid, camera-heading frame (x right,
+    /// y forward), metres — drives the pivot indicator.
+    var pivotOffset: SIMD2<Float> = .zero
     /// Whether AE/AWB locked before shot 0 (the HUD pill + coaching notice).
     var exposureLocked = false
     /// Tracking warning to surface, or nil.
@@ -133,17 +136,6 @@ final class CaptureHUDState {
 
     var isAligned: Bool { AlignmentMath.isAligned(angularDistanceDegrees: angularDistanceDegrees) }
 
-    /// Parallax coaching text (spec §9), or nil while the user stays put.
-    var driftWarning: String? {
-        if driftMeters > AlignmentMath.driftHardWarnMeters {
-            return "You've moved \(String(format: "%.1f", driftMeters)) m — go back to your spot"
-        }
-        if driftMeters > AlignmentMath.driftWarnMeters {
-            return "Stay on your spot — pivot, don't walk"
-        }
-        return nil
-    }
-
     // MARK: - Reset
 
     /// Clear everything session-scoped and enter `state`. Called by the engine
@@ -156,6 +148,7 @@ final class CaptureHUDState {
         pitchDeltaDegrees = 0
         isSteady = false
         driftMeters = 0
+        pivotOffset = .zero
         exposureLocked = false
         isTooDark = false
         warning = nil

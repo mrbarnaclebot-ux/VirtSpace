@@ -121,7 +121,8 @@ nonisolated final class ShotPipeline: @unchecked Sendable {
             intrinsics: still.intrinsics,
             exposureLocked: exposureLocked,
             iso: still.iso,
-            exposureDuration: still.exposureDuration
+            exposureDuration: still.exposureDuration,
+            featureDepthMedian: still.featureDepthMedian
         )
         do {
             try store.saveFrame(still.jpegData, pose: pose, in: session)

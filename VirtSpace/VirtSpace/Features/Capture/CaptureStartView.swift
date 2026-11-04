@@ -26,7 +26,7 @@ struct CaptureStartView: View {
                 Text("Guided 360° Capture")
                     .font(.title2.weight(.bold))
                     .foregroundStyle(.white)
-                Text("Stand on one spot and pivot in place. Follow the targets — VirtSpace turns your surroundings into a walkable 3D world.")
+                Text("Hold the phone at your chest and turn around it. Follow the targets — VirtSpace turns your surroundings into a walkable 3D world.")
                     .font(.subheadline)
                     .foregroundStyle(.white.opacity(0.65))
                     .multilineTextAlignment(.center)

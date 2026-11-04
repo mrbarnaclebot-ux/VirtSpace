@@ -298,6 +298,8 @@ struct FramePose: Codable, Hashable {
     var iso: Float?
     /// Seconds.
     var exposureDuration: Double?
+    /// Metres; median depth of ARKit raw feature points in view.
+    var featureDepthMedian: Float?
 }
 
 /// `POST /v1/worlds/:id/frames:done` body. `poses` is optional on the wire —

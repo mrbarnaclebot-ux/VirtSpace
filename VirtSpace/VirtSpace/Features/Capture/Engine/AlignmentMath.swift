@@ -6,7 +6,7 @@
 //  angular distance, steadiness from frame-to-frame rotation rate (ARKit
 //  exposes no gyro directly — we derive angular velocity from consecutive
 //  camera transforms), a dwell state machine (aligned + steady for 300 ms →
-//  auto-fire), and translation drift for parallax coaching.
+//  auto-fire), and translation drift from the shot centroid for pivot coaching.
 //
 
 import Foundation
@@ -28,11 +28,17 @@ nonisolated enum AlignmentMath {
     static let minSteadinessThresholdRadPerSec: Double = 0.04
     /// Aligned + steady must hold continuously this long before auto-fire.
     static let dwellSeconds: TimeInterval = 0.30
-    /// Parallax coaching (spec §9): soft warning past this many meters of
-    /// translation from the first shot's position…
-    static let driftWarnMeters: Float = 0.25
-    /// …hard warning past this. The user is walking, not pivoting.
-    static let driftHardWarnMeters: Float = 0.5
+    /// ponytail: soft-gate the dwell past this distance from the centroid of
+    /// the shots so far (R37). Start at 15 cm; the 2026-09-17 capture sat at
+    /// 21 cm median / 37 cm max, so tune from device data.
+    static let pivotGateMeters: Float = 0.15
+    /// ponytail: a gated shot still fires after being held on target this
+    /// long, so a soft gate can never strand someone who can't get closer.
+    static let pivotGateGraceSeconds: TimeInterval = 3
+    /// Pivot coaching: soft banner at the gate distance…
+    static let driftWarnMeters: Float = pivotGateMeters
+    /// …sticky banner past this.
+    static let driftHardWarnMeters: Float = 0.3
 
     // MARK: - Transform helpers
 
@@ -122,11 +128,60 @@ nonisolated enum AlignmentMath {
 
     // MARK: - Parallax drift
 
-    /// Meters of translation from the pivot origin (position at first shot).
-    /// Warn > `driftWarnMeters`, hard-warn > `driftHardWarnMeters` (spec §9:
-    /// parallax is the #1 stitch killer).
+    /// Meters of translation between two positions.
     static func translationDrift(from origin: simd_float3, current: simd_float3) -> Float {
         simd_length(current - origin)
+    }
+
+    /// Mean of the captured shot positions; nil before the first shot.
+    static func centroid(_ positions: [simd_float3]) -> simd_float3? {
+        guard !positions.isEmpty else { return nil }
+        return positions.reduce(.zero, +) / Float(positions.count)
+    }
+
+    /// Drift from the running centroid of shot positions, not from shot 0
+    /// (R37): with the phone held out, turning the body swings the camera on
+    /// the arm, so shot 0's position is one end of an orbit, not its centre.
+    /// 0 before the first shot.
+    static func driftFromCentroid(of positions: [simd_float3], current: simd_float3) -> Float {
+        centroid(positions).map { translationDrift(from: $0, current: current) } ?? 0
+    }
+
+    /// Horizontal offset of the camera from the centroid in the camera's own
+    /// heading frame: x = metres to the right, y = metres forward. Falls back
+    /// to world axes when looking straight up or down (yaw is undefined).
+    static func pivotOffset(from centroid: simd_float3, current: simd_float3, cameraForward: simd_float3) -> SIMD2<Float> {
+        let d = current - centroid
+        var forward = simd_float3(cameraForward.x, 0, cameraForward.z)
+        if simd_length(forward) < 0.1 { forward = simd_float3(0, 0, -1) }
+        forward = simd_normalize(forward)
+        let right = simd_float3(-forward.z, 0, forward.x)
+        return SIMD2(simd_dot(d, right), simd_dot(d, forward))
+    }
+}
+
+// MARK: - PivotGate
+
+/// Soft gate on the dwell while the camera is too far from the shot centroid:
+/// the hold is withheld, but only for `pivotGateGraceSeconds` of being on
+/// target, after which the shot fires anyway.
+nonisolated struct PivotGate {
+    private var heldSince: TimeInterval?
+
+    /// Whether the dwell may count this frame. `onTarget` = aligned and
+    /// otherwise ready to fire.
+    mutating func allows(drift: Float, onTarget: Bool, at timestamp: TimeInterval) -> Bool {
+        guard onTarget, drift > AlignmentMath.pivotGateMeters else {
+            heldSince = nil
+            return true
+        }
+        let since = heldSince ?? timestamp
+        heldSince = since
+        return timestamp - since >= AlignmentMath.pivotGateGraceSeconds
+    }
+
+    mutating func reset() {
+        heldSince = nil
     }
 }
 

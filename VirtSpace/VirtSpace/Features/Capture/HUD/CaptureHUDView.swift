@@ -273,10 +273,16 @@ struct CaptureHUDView: View {
                     .foregroundStyle(.green)
             }
 
-            ProgressSphereView(
-                capturedFlags: hud.capturedFlags,
-                currentIndex: hud.currentTarget?.index
-            )
+            HStack(spacing: 12) {
+                ProgressSphereView(
+                    capturedFlags: hud.capturedFlags,
+                    currentIndex: hud.currentTarget?.index
+                )
+                // The centroid exists only once a shot has landed.
+                if hud.capturedCount > 0 {
+                    PivotIndicatorView(offset: hud.pivotOffset)
+                }
+            }
             .padding(.horizontal, 14)
             .padding(.vertical, 9)
             .background(.ultraThinMaterial, in: Capsule())

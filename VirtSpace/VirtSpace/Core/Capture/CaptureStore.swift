@@ -38,6 +38,8 @@ nonisolated final class CaptureStore: @unchecked Sendable {
         let iso: Float?
         /// Seconds.
         let exposureDuration: Double?
+        /// Median depth (metres) of ARKit raw feature points in view.
+        let featureDepthMedian: Float?
 
         init(
             index: Int,
@@ -46,7 +48,8 @@ nonisolated final class CaptureStore: @unchecked Sendable {
             intrinsics: simd_float3x3,
             exposureLocked: Bool,
             iso: Float? = nil,
-            exposureDuration: Double? = nil
+            exposureDuration: Double? = nil,
+            featureDepthMedian: Float? = nil
         ) {
             self.index = index
             self.timestamp = timestamp
@@ -61,6 +64,7 @@ nonisolated final class CaptureStore: @unchecked Sendable {
             self.exposureLocked = exposureLocked
             self.iso = iso
             self.exposureDuration = exposureDuration
+            self.featureDepthMedian = featureDepthMedian
         }
 
         /// The frames:done wire shape. Nil fields are omitted, never sent as
@@ -73,7 +77,8 @@ nonisolated final class CaptureStore: @unchecked Sendable {
                 intrinsics: intrinsics,
                 exposureLocked: exposureLocked,
                 iso: iso,
-                exposureDuration: exposureDuration
+                exposureDuration: exposureDuration,
+                featureDepthMedian: featureDepthMedian
             )
         }
     }

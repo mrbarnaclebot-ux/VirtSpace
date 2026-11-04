@@ -128,11 +128,14 @@ nonisolated final class ARKitCaptureSource: NSObject, CaptureSource, ARSessionDe
             // internal chatter, not our failure. Don't chase them when debugging.
             session.captureHighResolutionFrame { [weak self] frame, _ in
                 guard let self else { return }
+                // The latest live frame, for what the high-res frame may not
+                // carry (feature points; depth) — the user is holding still.
+                let live = self.session.currentFrame
                 // Encode off the main thread: this callback lands on main and
                 // the Lanczos+JPEG work is expensive (deliverable 2c).
                 self.encodeQueue.async {
                     if let frame {
-                        completion(self.encode(frame))
+                        completion(self.encode(frame, live: live))
                     } else {
                         // High-res capture can transiently fail (e.g. one
                         // already in flight) — degrade to the live feed rather
@@ -160,14 +163,14 @@ nonisolated final class ARKitCaptureSource: NSObject, CaptureSource, ARSessionDe
         guard let frame = session.currentFrame else {
             return .failure(CaptureSourceError.noFrame)
         }
-        return encode(frame)
+        return encode(frame, live: nil)
     }
 
     /// CVPixelBuffer → JPEG (quality 0.9), capped at ~12 MP. Intrinsics are
     /// scaled alongside any downscale so poses.json stays consistent with the
     /// uploaded pixels. Pixels are uploaded in ARKit's native (landscape)
     /// orientation; the server stitcher orients via the pose transform.
-    private func encode(_ frame: ARFrame) -> Result<CapturedStill, Error> {
+    private func encode(_ frame: ARFrame, live: ARFrame?) -> Result<CapturedStill, Error> {
         var image = CIImage(cvPixelBuffer: frame.capturedImage)
         var intrinsics = frame.camera.intrinsics
 
@@ -211,8 +214,20 @@ nonisolated final class ARKitCaptureSource: NSObject, CaptureSource, ARSessionDe
             // ISO isn't on ARFrame; AE is locked by now, so the device's
             // current ISO is the one this frame was exposed at.
             iso: camera.device?.iso,
-            exposureDuration: frame.camera.exposureDuration
+            exposureDuration: frame.camera.exposureDuration,
+            featureDepthMedian: Self.featureDepthMedian(frame.rawFeaturePoints != nil ? frame : live)
         ))
+    }
+
+    /// Projects with the camera of the frame the points came from.
+    private static func featureDepthMedian(_ frame: ARFrame?) -> Float? {
+        guard let frame, let points = frame.rawFeaturePoints?.points else { return nil }
+        return FrameDepth.featureDepthMedian(
+            points: points,
+            cameraTransform: frame.camera.transform,
+            intrinsics: frame.camera.intrinsics,
+            imageSize: frame.camera.imageResolution
+        )
     }
 
     // MARK: - ARSessionDelegate (called on `delegateQueue`)
