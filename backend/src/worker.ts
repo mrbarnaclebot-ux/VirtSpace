@@ -1364,6 +1364,16 @@ async function main(): Promise<void> {
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  // Spec §10 R28: log and exit non-zero so Railway restarts a clean process.
+  // A job caught mid-flight is safe: its lease expires and it resumes (§10 R6).
+  process.on('unhandledRejection', (reason) => {
+    console.error('[worker] unhandledRejection, exiting:', reason);
+    process.exit(1);
+  });
+  process.on('uncaughtException', (err) => {
+    console.error('[worker] uncaughtException, exiting:', err);
+    process.exit(1);
+  });
   main().catch((err) => {
     console.error(err);
     process.exit(1);

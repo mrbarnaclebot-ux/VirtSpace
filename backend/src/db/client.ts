@@ -10,9 +10,35 @@ import * as schema from './schema.js';
 let pool: pg.Pool | undefined;
 let db: NodePgDatabase<typeof schema> | undefined;
 
+/**
+ * Pool options (spec §10 R28). All client-side, on purpose: DATABASE_URL is
+ * Neon's pgbouncer pooler in transaction mode. pg sends `statement_timeout` as
+ * a StartupMessage parameter, which stock pgbouncer refuses ("unsupported
+ * startup parameter") or at best ignores, and a session-level SET leaks across
+ * pooled backends (HANDOFF pooler incident). A server-side ceiling belongs on
+ * the role instead (ALTER ROLE ... SET statement_timeout), applied over the
+ * direct host.
+ */
+export const POOL_OPTIONS = {
+  // Neon cold start from scale-to-zero is a few seconds; 10 s is generous.
+  connectionTimeoutMillis: 10_000,
+  // Client-side read timeout: a half-open socket fails the query instead of
+  // hanging the worker forever. The longest legitimate query is a short
+  // advisory-lock wait in budget.ts, far under this.
+  query_timeout: 30_000,
+  // TCP keepalive so a silently dropped connection is noticed while idle.
+  keepAlive: true,
+} as const;
+
 export function getPool(): pg.Pool {
   if (!pool) {
-    pool = new pg.Pool({ connectionString: getConfig().DATABASE_URL });
+    pool = new pg.Pool({ connectionString: getConfig().DATABASE_URL, ...POOL_OPTIONS });
+    // An idle client dropped by the server (Neon suspend, pooler restart)
+    // emits 'error' on the pool; with no listener that kills the process. The
+    // pool already discards the broken client, so logging is all that's left.
+    pool.on('error', (err) => {
+      console.error(`[db] idle client error (discarded): ${String(err)}`);
+    });
   }
   return pool;
 }

@@ -139,6 +139,16 @@ async function main(): Promise<void> {
 
 // Run when executed directly (node/tsx src/server.ts), not when imported.
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  // Spec §10 R28: anything that escapes is a bug with unknown state behind it.
+  // Log it and exit non-zero so Railway restarts a clean process.
+  process.on('unhandledRejection', (reason) => {
+    console.error('[api] unhandledRejection, exiting:', reason);
+    process.exit(1);
+  });
+  process.on('uncaughtException', (err) => {
+    console.error('[api] uncaughtException, exiting:', err);
+    process.exit(1);
+  });
   main().catch((err) => {
     // eslint-disable-next-line no-console
     console.error(err);
