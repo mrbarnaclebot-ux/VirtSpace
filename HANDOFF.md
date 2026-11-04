@@ -1,97 +1,74 @@
-# VirtSpace — Session Handoff (2026-09-18)
+# VirtSpace — Session Handoff (2026-11-05)
 
-Read this first next session, then `CLAUDE.md` and `spec-doc.md` §10 (hardening ledger **R1–R19** is the authoritative status). Repo: `~/Developer/VirtSpace` (not iCloud). Tip of `origin/main` at time of writing: see `git log` (last session commit: this handoff).
+Read this first next session, then `CLAUDE.md` and `spec-doc.md` §10 (ledger **R1–R41** is the authoritative status) and §5.2 (capture v2 contract). Repo: `~/Developer/VirtSpace` (not iCloud). `AGENTS.md` is a generic template; where it disagrees, `CLAUDE.md` and `spec-doc.md` win.
 
 ## State in one paragraph
 
-Everything through **R18 is on `main` and deployed** to Railway (api `0b13dc16`, worker `76ddb6db`, 2026-09-18 00:37 IST). The owner's Mac/Xcode/iPhone are on **macOS/Xcode 27 / iOS 27**. The first real-device 28-shot capture worked end-to-end but exposed three bugs, all fixed: an iOS 27 crash at shot 28 (R16), mirrored panoramas (R17) and a dead "Enhance to HQ" button (R18). **None of the three fixes has been exercised by the owner on the phone yet** — that is the next step.
+Backend is on `main` and **deployed** (2026-11-04): the R20–R23 P1 fixes, the Railway IaC migration (R26 part) and **capture v2 backend** (stitcher v2 = R36 ghosting fix, 4096-wide stitch = R40, depth upload API = §5.2). iOS capture v2 (R34, R37, R38, R39, R31 relocalization, LiDAR depth) lives on branch **`feat/capture-v2`**, stacked on **`refactor/r19-r15-capture-split`** (R19 + R15). Both are unmerged: 80/80 unit tests pass on the iOS 27 simulator and a Debug device build exists, but **no device capture has been done with it yet**. That capture is the gate for merging.
 
 ## Owner's next steps (device)
 
-1. Run the current build on the iPhone, do a full 28-shot capture **in a lit room**. Expect: no crash at shot 28; upload overlay over the still-painted sphere; camera feed appears normally at capture start (session attach is now deferred by one main-actor hop — report any black flash). Also still to watch from R14: first-shot exposure lock (shot 0 was **unlocked** on the 09-17 capture — real issue, unfixed) and ring-completion haptics at shots 11/19/25.
-2. That capture will be the first **un-mirrored** world. Check text/signage reads correctly in the pano preview and the world.
-3. Tap **Enhance to HQ** on a `draft_ready` world (1500 credits ≈ $1.20; `DAILY_CREDIT_BUDGET=2000` ⇒ one per UTC day). Expect `generating_hq` → `complete`, `asset_version` 1→2, and the app refetching the splat. If it fails there is **no retry path** (see Open items).
-4. If the app crashes: `xcrun devicectl device info files --device <udid> --domain-type systemCrashLogs`, then `device copy from … --source <name>.ips`.
+1. Unlock + plug in the iPhone 17 Pro, then install the prebuilt capture-v2 Debug build (production backend):
+   `xcrun devicectl device install app --device 00008150-00060CD23E21401C /private/tmp/claude-501/dd-capture-v2-device/Build/Products/Debug-iphoneos/VirtSpace.app`
+   (`/private/tmp` may be wiped; if so, rebuild from the `capture-v2` worktree after copying the main checkout's `Secrets.swift` in, then restore the worktree's localhost copy.)
+2. One full capture in a lit room (one 150-credit draft). Check: AE/AWB locked before shot 0 (no brightness jumps), low-light card in a dark room, pivot indicator nudges past ~15 cm drift, column order (12 around, 6 up, 8 down), relocalization / "Restart scan" after an interruption, no crash at the last shot (R16), un-mirrored text (R17), no doubled objects in the pano.
+3. Optionally tap **Enhance to HQ** on a `draft_ready` world (1500 credits, budget 2000/UTC day) to verify R18 end to end.
+4. Crash logs: `xcrun devicectl device info files --device <udid> --domain-type systemCrashLogs`, then `device copy from … --source <name>.ips`.
 
-## What landed 2026-09-17 → 18 (after the R1–R14 batch below)
+After a clean capture: rebase `refactor/r19-r15-capture-split` then `feat/capture-v2` onto `main`, re-run the sim tests, fast-forward `main`, push, and remove both worktrees (`.claude/worktrees/r19-qa`, `.claude/worktrees/capture-v2`).
 
-| Ledger | What / where |
+## What landed 2026-11-04
+
+| Item | What |
 |---|---|
-| R16 | iOS 27 crash at shot 28 (`92fbdf4`, `7f9bb86`). `.finished` rebuilt the `ARSCNView` while the engine paused the `ARSession`; iOS 27 ARKit delivers the preview rotation angle synchronously under `-[ARSession setViewLayer:]`'s unfair lock → layout → SwiftUI re-entry → second `makeUIView` → recursive-lock abort. Fix: one camera-layer identity across ready→finished (`CaptureEngineState.isFinished`), and `CameraPreviewHost` attaches the session on a guarded main-actor hop, never inside make/update. Frames were already on disk; launch-time resume uploaded them. |
-| R17 | Stitcher produced **mirrored** panos on the pose path (`8ffa6b7`): ray-grid longitude ran toward +X; an inside-viewed right-handed +Y-up sphere needs −X. `ARKIT_TO_PROJ` was right; the pose-less fallback was accidentally right and stays bit-identical (`FLIP_RIGHT`). `stitcher.orientation.test.ts` fails on the old code. Verified on the real capture: text reads correctly, output == `fliplr(old)`. `PanoPreviewView`'s `scale(-1,1,1)` is the inside-sphere UV correction — leave it. **Every world generated before 2026-09-18 came from a mirrored pano.** |
-| R18 | "Enhance to HQ" never worked (`545efd1`, `f0881f2`): backend served `/:id/enhance`, spec + iOS use `{id}:enhance`. Working Fastify route is `'/v1/worlds/:id(^[^:]+)::enhance'` (a bare `:id::enhance` swallows the suffix into the param name); slash form kept as alias. Also: atomic `draft_ready→generating_hq` flip (double tap could have queued two 1500-credit jobs), own `enhance:<user>` rate-limit key, malformed world id → 404 not 500, HQ finalize bumps `asset_version` (was never incremented ⇒ clients would keep the cached draft splat). |
-| R19 | **Open.** `CaptureView` (627 lines) is a second god object — screen state machine + upload orchestration + quota policy + thermal/idle-timer + DEBUG test-scan tooling calling the API from the view. Plan: `CaptureScreenModel` (`@Observable`) + DEBUG-only tools view + layout-only view; do with R15 after the R16 device re-run. |
-| deploy | `3309fd5` base image → `node:24-trixie-slim`; `df1114d` `railway.json`; `1b3e21d` `.graphifyignore`; `e60b266` graphify rule in `CLAUDE.md`. |
+| Reviews | Three code reviews + two capture reviews → ledger rows **R20–R41** in `spec-doc.md` §10 |
+| R15, R19 | `PendingSessionStore` actor (manifest I/O off the main actor); `CaptureView` 627 → 177 lines via `CaptureScreenModel`, `CaptureStartView`, DEBUG-only `CaptureDebugToolsView`. Branch only. |
+| R20 | `frames:done` is a conditional flip in a transaction (only `uploading`/`failed_stitch` → `stitching`); replay returns the current world with `job_id: null`. Deployed. |
+| R21 | Fastify `trustProxy` as a hop-count function (`TRUST_PROXY_HOPS`; **production api = 2**, measured — with 1 the logged client is a CDN77 edge IP). Spoofed `X-Forwarded-For` verified ignored. Deployed. |
+| R22 | `failJob` returns the phase; a job going `dead` applies the failed world status. Deployed. |
+| R23 | Root workspace + root lockfile deleted; `backend/package-lock.json` is the only app lockfile. Run commands inside `backend/`. |
+| R26 (part) | `railway.json` (deprecated, cutoff 2026-12-01, never read) replaced by IaC `.railway/railway.ts`; see Deploy. |
+| Capture v2 backend | Stitcher split into `geom/poses/warp/depth/fill/bench.py`; translation-aware reprojection about the camera centroid with a depth proxy (LiDAR when sent, else 2 m), gain compensation, GraphCut seams, banded multi-band blend, nadir body mask, width 4096. Depth API: `"depth": true` + `depth_frames` on create/`uploads:refresh`, response `depth_uploads`; worker stages `depth_<i>.png` best-effort. 09-17 benchmark: overlap error 11.43 → 9.06, edge-doubling 0.076 → 0.048, 4.8 s. Deployed. |
+| Capture v2 iOS | AE/AWB lock before shot 0 (AF continuous), low-light card, centroid drift + `PivotIndicatorView` (15 cm soft gate after 3 s), column order 12/6/8, relocalization + restart after 10 s, iOS 26.0 shot-0 guard, per-frame LiDAR depth PNG uploaded best-effort. Branch only. |
 
-**Verified test state (2026-09-18):** backend `tsc` clean, vitest **310 passed / 11 skipped** with `STITCHER_TEST_PYTHON` pointing at a venv with the pinned numpy/opencv (the 11 skipped are the Postgres integration suites). iOS: generic-device build 0 warnings; unit tests **TEST SUCCEEDED** on the iOS 27 simulator (iPhone 18 Pro — there is no "iPhone 17" device in Xcode 27), 0 failures:
+**Verified test state (2026-11-04):** backend `tsc` clean, vitest **348 passed / 12 skipped** (skips = Postgres integration suites) with `STITCHER_TEST_PYTHON` set. iOS `feat/capture-v2`: **80/80** on a freshly erased iPhone 18 Pro simulator (iOS 27):
 `xcodebuild test -project VirtSpace/VirtSpace.xcodeproj -scheme VirtSpace -destination 'platform=iOS Simulator,name=iPhone 18 Pro'`
-
-## The 2026-09-17 device capture (world `2e3d5479`)
-
-28 frames, stitch + `generate_draft` first attempt, 150 credits, all assets in R2. Ring angles within ~2° of nominal (the Swift 6 `ShotPipeline` works on device). Exposure locked on 27/28. Up to **52 cm translation drift** → parallax ghosting on near objects (stitcher is rotation-only; coach the user to pivot the phone, not the body). Very dark room — a poor quality test. Its pano and world are mirrored (pre-R17).
-
-## Deploy (Railway) — how it actually works
-
-- Services are **not** GitHub-linked; pushing does not deploy. The repo dir is not `railway link`ed; deploy from the repo root with:
-  `railway up -p 1690518b-f063-41df-8839-19c0b00a33a1 -e production -s api --ci` (then `-s worker`). Deploy api first.
-- `ALLOW_DEV_AUTH=1` is set on api + worker (production still runs dev auth). Worker is `PROVIDER_MODE=live`, `DAILY_CREDIT_BUDGET=2000`.
-- **Base image must stay `node:24-trixie-slim`**: plain `node:24-slim` is bookworm/python 3.11 and the pinned numpy 2.5.x needs ≥3.12 (first-ever image build failed on this).
-- **Railway config is IaC since 2026-11-04:** `.railway/railway.ts` declares both services (a resource omitted there is DELETED on apply). Change it with `railway config plan` then `railway config apply`; the SDK lives in `.railway/` (`cd .railway && npm ci`). The repo dir is now `railway link`ed to production. `railway.json` was dead config (no service read it) and is gone.
-- **Migrations: the pre-deploy step does NOT run.** Railway CLI 5.57.7 silently ignores `deploy.preDeployCommand` edits and the committed `railway.json` had no visible effect. `0003`+`0004` were applied by hand: `cd backend && DATABASE_URL=… AUTH_MODE=dev DEV_AUTH_TOKEN=x npx tsx src/migrate.ts`. **Before the next migration-bearing deploy**, set the api service's Pre-deploy Command (`node dist/migrate.js`) in the Railway dashboard, or apply by hand *before* `railway up`.
-- Post-deploy checks: `/healthz`; authed `GET /v1/worlds`; worker log shows `started; kinds=…` and no `claim error`.
-- Optional env vars (all defaulted): `RATE_LIMIT_WINDOW_MS`, `RATE_LIMIT_MAX`, `RATE_LIMIT_IP_MAX`, `RATE_LIMIT_CREATE_MAX`, `AUTH_FAIL_MAX`, `SHUTDOWN_GRACE_MS`, `WORLDLABS_ASSET_MAX_BYTES`, `WORLDLABS_ASSET_HOSTS`, `TRUST_PROXY_HOPS` (default 1; **production api is set to 2**, measured 2026-11-04 — with 1 the logged client is a CDN77 edge IP) — see `backend/.env.example`.
-
-### Incident 2026-09-17 23:35 → 09-18 00:12 IST (orchestrator error, no data lost)
-
-`DATABASE_URL` is Neon's **pgbouncer pooler** (`…-pooler…`), shared by local `.env` and production. An ad-hoc inspection script ran `SET default_transaction_read_only = on` "for safety"; the session setting stuck to the shared pooled backend, so production writes failed (old worker logged 27 `claim error`s; nothing was queued, nothing lost). Fixed with `RESET default_transaction_read_only`. **Rules:** never issue session-level `SET` through the pooler — use `BEGIN READ ONLY … ROLLBACK` or the direct (non-`-pooler`) host; `migrate.ts`'s session-scoped advisory lock is likewise only reliable over the direct host. Production is the owner's data: read-only inspection of DB/R2 was done at the owner's request; agents still never touch it.
 
 ## Open items
 
-- **Device verification of R16 / R17 / R18** (above) — nothing here has been seen working on the phone.
-- **R18 follow-ups:** no retry path after `failed_generating_hq` (`canEnhance` requires `draft_ready`; iOS shows the raw status string "failed generating hq"); default `DAILY_CREDIT_BUDGET` (500) cannot fit one HQ run (prod is 2000); the 429 copy conflates scan quota and credit budget; the conditional flip and `22P02`→404 were tested against fakes, not real Postgres; first real HQ run unverified end-to-end.
-- **R15:** upload flows inherit `@MainActor` from `UploadManager` ⇒ `CaptureStore` manifest I/O is synchronous main-thread disk I/O during uploads. Do with **R19** and device testing.
-- **First-shot exposure lock** (shot 0 unlocked) and **capture drift coaching** (52 cm) — both observed on device, neither addressed.
-- Cosmetic: `PanoPreviewView` opens facing lon ≈ 180° (behind the first shot).
-- **Mirrored legacy worlds:** regenerate any that matter (150 credits each) — owner's call.
-- **R1 live verification:** `findWorldByDisplayName` (`GET /marble/v1/worlds?page_size=100`) is a best-guess API shape; wrong guess ⇒ parked job, never a double bill. Verify once (a list call costs nothing).
-- **Postgres integration suites** are written but skipped (need `TEST_DATABASE_URL` — use a Neon branch, never the production DB): quota race, `heartbeatJob`.
-- **R5 simulator guard** has still never been seen firing.
-- `frames:done` / `uploads:refresh` routes hand their handlers a spurious extra param (behaviour correct, params untidy).
-- Deferred on purpose: vitest/zod/TypeScript majors; `worlds.spz_full_url` dead column (iOS also decodes-but-never-reads `spz_100k_url`, `spz_full_url`, `collider_glb_url`); iOS frames are JPEG bytes under `.heic` keys.
-- Pre-existing spec §10 items (World Labs deletion API, training-data ToS, marble-1.1 latency, …) unchanged.
+- **Device capture with `feat/capture-v2`** (above), then merge both iOS branches. R16/R17/R18 also still unseen on the phone.
+- **Stitcher residuals:** faint doubling on objects ≲0.5 m without LiDAR (overlap-based depth estimate deferred); a hard seam where content changed between shots (e.g. a playing monitor).
+- **Follow-ups:** split `CaptureEngine.swift` (620 lines: exposure/relocalization out); `MIGRATE_DATABASE_URL` on the direct Neon host, then `preDeploy: "node dist/migrate.js"` on api in `railway.ts`.
+- **Backlog (not started):** R24 real auth before sharing the app (P1); R25 background uploads (P1); rest of R26 (CI, deploy from a clean commit); R27 status-flip + enqueue atomicity; R28 pg pool error/timeouts, structured logs; R29 redirect SSRF; R30 `npm audit` (zod high); rest of R31 (WebGL process termination, caches in Application Support); R32 terms + consent screen, `fixture.spz` in Release, privacy manifest; R33 `STORAGE_DRIVER` default, PID 1, image size, pg `sslmode` warning; R35 modernisation (Spark 2.4, three r187, `worker.ts` 1328 lines, …).
+- **Older carry-overs:** R18 no retry after `failed_generating_hq` + raw status copy; mirrored pre-2026-09-18 worlds (regenerate = owner's call); R1 `findWorldByDisplayName` API shape unverified; Postgres integration suites need `TEST_DATABASE_URL` on a Neon branch; R5 sim guard never seen firing; `PanoPreviewView` opens facing lon ≈ 180°.
+- The owner's uncommitted Xcode 27 project-setting changes (`project.pbxproj`, `VirtSpace.xcscheme`) are deliberately left uncommitted.
+
+## Deploy (Railway) — how it actually works
+
+- Not GitHub-linked; pushing does not deploy. The repo **is** `railway link`ed to production. From the repo root: `railway up -p 1690518b-f063-41df-8839-19c0b00a33a1 -e production -s api --ci`, then `-s worker`. `railway up` ships the working tree, so deploy from a clean `main`.
+- **Config is IaC:** `.railway/railway.ts` declares both services; **a resource omitted there is deleted on apply**. Change with `railway config plan` then `railway config apply`; the SDK lives in `.railway/` (`cd .railway && npm ci`). Variables are unmanaged (secrets never in the file). api has healthcheck `/healthz`.
+- **Migrations do not run on deploy.** Apply by hand *before* `railway up`, over the direct (non-`-pooler`) host: `cd backend && DATABASE_URL=… AUTH_MODE=dev DEV_AUTH_TOKEN=x npx tsx src/migrate.ts`.
+- `ALLOW_DEV_AUTH=1` on api + worker (production still runs dev auth). Worker: `PROVIDER_MODE=live`, `DAILY_CREDIT_BUDGET=2000`. Base image must stay `node:24-trixie-slim` (numpy needs Python ≥3.12).
+- Post-deploy checks: `/healthz`; worker log shows `started; kinds=stitch,generate_draft,generate_hq,purge` and no `claim error`. The pg `sslmode` security warning in worker logs is known (R33).
+- Optional env vars (all defaulted) are listed in `backend/.env.example`.
+
+## Standing rules learned the hard way
+
+- **Pooler incident (2026-09-17):** `DATABASE_URL` is Neon's pgbouncer pooler, shared by local `.env` and production. A session `SET default_transaction_read_only = on` stuck to the pooled backend and broke production writes. Never issue session-level `SET` through the pooler; use `BEGIN READ ONLY … ROLLBACK` or the direct host. `migrate.ts`'s advisory lock is only reliable over the direct host.
+- Production is the owner's data. Read-only DB/R2 inspection only at the owner's request; agents never touch it, never launch the sim against prod, never call `worlds:generate`.
+- The 09-17 benchmark capture (frames in the session scratchpad, outputs in `/private/tmp/claude-501/stitch-bench/`) is personal: never commit it or send it anywhere. Export script pattern: direct host + `BEGIN READ ONLY`.
 
 ## Knowledge graph (graphify)
 
-`graphify-out/` (gitignored) was rebuilt in the new repo location: ~1,970 nodes / ~4,270 edges / 87 communities, including nodes for R1–R19, the deploy and the pooler incident. A **post-commit/post-checkout hook** rebuilds the code graph on every commit (per clone: `graphify hook install`). The hook ignores docs — run `/graphify . --update` at the end of any session that changed spec/handoff/README/`CLAUDE.md` (one ~100k-token extraction agent). `.graphifyignore` keeps the vendored three.js/Spark bundles, `video-example.mp4` and `virtspace-logs.txt` out. Health caveat from the full build: 82 dangling-endpoint edges, 25 self-loops, 380 collapsed duplicate edges; tree-sitter reports a syntax error in `CaptureView.swift` (~line 333) so that file is only partly extracted, though it compiles. `faster-whisper` + `tree-sitter-sql` live in the pipx `graphifyy` venv.
-
-## Earlier this session: full review + R1–R14 (all landed, all deployed)
-
-Two Opus reviewers (iOS, backend), orchestrator-verified; findings in `spec-doc.md` §10; §14 credit-safety claim corrected.
-
-| Ledger | What landed |
-|---|---|
-| R1 | `pending:<jobId>` intent marker before `worlds:generate`; reconcile by unique `display_name`; generate-call failure is non-retryable; marker + reservation unwound when a *pre*-generate step fails (compensating `-amount` `credit_events` row) |
-| R2 | Boot refuses `AUTH_MODE=dev` under `NODE_ENV=production` unless `ALLOW_DEV_AUTH=1`; timing-safe token compare |
-| R3 | Deleted users get `403 account_deleted`; purge nulls `captures.poses_json` |
-| R4 | `Idempotency-Key` on `POST /v1/worlds` (migration `0003`, `worlds.client_request_id`); iOS sends session UUID, persists a fresh key *before* minting a replacement world; retries backoff (1m/5m/30m/2h) and **park after 5** with Retry/Discard UI; quota/offline failures don't count |
-| R5 | `Secrets.swift.example` defaults to localhost; DEBUG **simulator** builds `fatalError` on the production host unless `VIRTSPACE_ALLOW_PROD=1`; device builds unaffected; app starts inert + pinned to localhost under XCTest |
-| R6 | `heartbeatJob` refreshes `locked_at` (poll tick + stitch progress); lost lease aborts without finalizing; finalize idempotent |
-| R7 | Optional signed `content-length` per frame; worker always HEADs a frame and refuses >12 MB |
-| R8 | Stitcher reprojects in row bands: peak RSS **4.5 GB → ~400 MB** at 8192 wide, byte-identical output; distinct exit codes (input vs internal); OOM/timeout non-retryable after 2 attempts; magic-byte format sniffing |
-| R9 | Quota check-and-increment is one atomic statement |
-| R10 | `dist/migrate.js` pre-deploy migrator (advisory-locked), drizzle folder in the image; SIGTERM drain; generic error handler + `safeParse`; `@fastify/rate-limit`; asset-download host allowlist + byte cap, API key only sent to the API host; UTC budget window; `captures(world_id, created_at)` index (migration `0004`); non-root Docker user |
-| R11 | jose 6, `node:24-trixie-slim` (see Deploy), fastify/drizzle-kit/pg/aws-sdk bumps, numpy 2.5.3 + opencv 4.14 (needed for cp313 wheels on the Node 24 image). `npm audit --omit=dev` = 0 |
-| R12 | Ring haptics derived from `TargetLayout`; per-session upload claims + 10-min resource timeout; `URLSession` download tasks; SPZ mapped once; WKWebView navigation allowlist; resume errors no longer swallowed |
-| R13 | `VirtSpaceTests` Swift Testing target + shared scheme |
-| R14 | `CaptureEngine` split (`HUDPublishThrottle`, `ThermalGovernor`, `ShotPipeline`, `CaptureHUDState`; 704→479 lines); **Swift 6 language mode**, 0 warnings; deployment target unified at 26.0; fixed a racy `lazy var` background `URLSession` (real crash) |
+`graphify-out/` (gitignored) is the project map; query it first. The post-commit/post-checkout hook rebuilds the code graph (per clone: `graphify hook install`). The hook ignores docs: run `/graphify . --update` at the end of any session that changed spec/handoff/README/`CLAUDE.md`. `.graphifyignore` keeps vendored three.js/Spark bundles, `video-example.mp4` and `virtspace-logs.txt` out.
 
 ## Environment
 
-- Repo moved out of iCloud on 2026-09-17 (`~/Documents` is a file-provider domain; caused NUL-byte reads, 30–670 s git commands, corrupted `node_modules`). Fresh clone at `~/Developer/VirtSpace` with the gitignored local files copied and byte-verified (`.env`, `Secrets.swift`, `.claude/settings.local.json`, `xcuserdata`, `tools/spike/state.json`, `tools/spike/world.spz`). The old iCloud folder is gone; GitHub Desktop has been repointed.
-- Installed deps live in the **repo-root** `node_modules` (`backend/node_modules` is partial); no `psql`, no Docker on this Mac. A stitcher venv has to be created per session (`python3 -m venv … && pip install -r backend/stitcher/requirements.txt`) and passed as `STITCHER_TEST_PYTHON`.
-- iOS 27.0 simulator runtime is installed (the iOS 26.x ones are gone). Disk: ~21 GB free at last check — low disk caused the earlier runtime purge, keep an eye on it.
-- MCP servers that failed to connect this session: `magic`, `MCP_DOCKER`, `plugin:github` (use the `gh` CLI).
+- macOS/Xcode 27, iPhone 17 Pro (iPhone18,1) on iOS 27.0.1. iOS 27.0 simulator runtime installed; use "iPhone 18 Pro" (no "iPhone 17" device in Xcode 27). Dead simulators were deleted 2026-11-04; disk is tight (~13 GB free), and low disk has purged runtimes before.
+- Node deps live in `backend/node_modules`. Stitcher tests need a venv (`python3 -m venv … && pip install -r backend/stitcher/requirements.txt`) passed as `STITCHER_TEST_PYTHON`; last one was `/private/tmp/claude-501/stitch-venv`.
+- iOS worktrees compile only after copying the gitignored `Secrets.swift` in; keep worktree copies on localhost (`apiBaseURL = "http://localhost:3000"`).
+- MCP servers that failed to connect: `magic`, `MCP_DOCKER`, `plugin:github` (use the `gh` CLI).
 
-## Working agreements (unchanged, from CLAUDE.md)
+## Working agreements (from CLAUDE.md)
 
-Fable orchestrates/reviews/QA/commits; all implementation goes to Opus subagents (atomic commits, orchestrator re-runs tests before pushing). Agents never touch production, never launch the sim against prod, never call `worlds:generate`. Note: worktree isolation does not work for iOS builds — `Secrets.swift` is gitignored, so a worktree won't compile.
+Fable orchestrates, reviews, QAs, commits and deploys; all implementation goes to Opus subagents. The orchestrator re-runs tests before every commit and push. Deploys and destructive actions need the owner's explicit go-ahead.
