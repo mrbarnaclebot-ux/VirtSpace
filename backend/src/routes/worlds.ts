@@ -120,6 +120,21 @@ const poseSchema = z
     transform: z.array(z.number()).length(16), // 4x4 row-major.
     intrinsics: z.array(z.number()).length(9), // 3x3 camera intrinsics.
     exposureLocked: z.boolean(),
+    // Capture v2 optional fields (spec §5.2 item 1). Typed so a wrong type or a
+    // nonsensical value is a clear 400 here rather than a confused stitcher
+    // later; bounds are generous physical limits, not tuning. Absent = omit the
+    // key (a JSON null is rejected like any other wrong type).
+    iso: z.number().nonnegative().max(100_000).optional(),
+    exposureDuration: z.number().nonnegative().max(60).optional(), // seconds
+    featureDepthMedian: z.number().nonnegative().max(1000).optional(), // metres
+    // Present iff depth_<index>.png was uploaded; the worker keys off it.
+    depth: z
+      .object({
+        width: z.number().int().min(1).max(4096),
+        height: z.number().int().min(1).max(4096),
+      })
+      .passthrough()
+      .optional(),
   })
   .passthrough();
 

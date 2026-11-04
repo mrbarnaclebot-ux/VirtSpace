@@ -198,6 +198,52 @@ describe('POST /v1/worlds/:id/frames:done', () => {
     await app.close();
   });
 
+  it('capture v2 pose fields → stored verbatim alongside unknown extras', async () => {
+    const state = freshState();
+    const app = await makeApp(state);
+    const pose = {
+      ...validPose,
+      iso: 320,
+      exposureDuration: 0.008,
+      featureDepthMedian: 2.4,
+      depth: { width: 256, height: 192 },
+      futureField: 'kept',
+    };
+    const res = await app.inject({
+      method: 'POST',
+      url: '/v1/worlds/w-1/frames:done',
+      payload: { poses: [pose, validPose] },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const captureUpdate = state.updates.find((u) => u.table === captures);
+    expect(captureUpdate!.patch['posesJson']).toEqual([pose, validPose]);
+    await app.close();
+  });
+
+  it.each([
+    ['iso as a string', { iso: '320' }],
+    ['negative exposureDuration', { exposureDuration: -1 }],
+    ['null featureDepthMedian', { featureDepthMedian: null }],
+    ['depth missing height', { depth: { width: 256 } }],
+    ['fractional depth width', { depth: { width: 256.5, height: 192 } }],
+    ['depth as a boolean', { depth: true }],
+  ])('malformed v2 field (%s) → 400, no state change', async (_name, extra) => {
+    const state = freshState();
+    const app = await makeApp(state);
+    const res = await app.inject({
+      method: 'POST',
+      url: '/v1/worlds/w-1/frames:done',
+      payload: { poses: [{ ...validPose, ...extra }] },
+    });
+
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toBe('invalid_body');
+    expect(state.updates).toHaveLength(0);
+    expect(state.inserts).toHaveLength(0);
+    await app.close();
+  });
+
   it('empty poses array → 200, no capture write', async () => {
     const state = freshState();
     const app = await makeApp(state);
