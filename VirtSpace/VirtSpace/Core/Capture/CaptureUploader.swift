@@ -260,15 +260,7 @@ final class CaptureUploader {
         let manifest = session.manifest
         AppLog.upload.log("Stranded session \(session.id.uuidString, privacy: .public): \(manifest.uploadedFrameIndices.count)/\(manifest.frames.count) frames already uploaded, world \(worldId, privacy: .public) — going straight to frames:done")
         do {
-            let poses = manifest.frames.map {
-                FramePose(
-                    index: $0.index,
-                    timestamp: $0.timestamp,
-                    transform: $0.transform,
-                    intrinsics: $0.intrinsics,
-                    exposureLocked: $0.exposureLocked
-                )
-            }
+            let poses = manifest.frames.map(\.wire)
             AppLog.upload.log("uploads complete, calling frames:done for \(worldId, privacy: .public)")
             try await api.framesDone(worldId: worldId, poses: poses)
             AppLog.upload.log("frames:done ok for \(worldId, privacy: .public) with \(poses.count) poses (stranded recovery)")
@@ -469,15 +461,7 @@ final class CaptureUploader {
 
         // Include the captured poses so the backend gets pose-assisted stitching
         // data (spec §5). The field is optional on the contract.
-        let poses = session.manifest.frames.map {
-            FramePose(
-                index: $0.index,
-                timestamp: $0.timestamp,
-                transform: $0.transform,
-                intrinsics: $0.intrinsics,
-                exposureLocked: $0.exposureLocked
-            )
-        }
+        let poses = session.manifest.frames.map(\.wire)
         AppLog.upload.log("uploads complete, calling frames:done for \(world.id, privacy: .public)")
         do {
             try await api.framesDone(worldId: world.id, poses: poses)

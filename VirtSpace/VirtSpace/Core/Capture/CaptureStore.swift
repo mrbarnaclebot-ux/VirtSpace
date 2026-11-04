@@ -31,10 +31,23 @@ nonisolated final class CaptureStore: @unchecked Sendable {
         let transform: [Float]
         /// Camera intrinsics, 9 floats, column-major (matches the JPEG pixels).
         let intrinsics: [Float]
-        /// Whether AE/AWB/AF were locked when this frame was taken.
+        /// Whether AE/AWB were locked when this frame was taken.
         let exposureLocked: Bool
+        /// Capture v2 (spec §5.2), optional so older manifests still decode:
+        /// the exposure this frame was taken at, for gain compensation.
+        let iso: Float?
+        /// Seconds.
+        let exposureDuration: Double?
 
-        init(index: Int, timestamp: TimeInterval, transform: simd_float4x4, intrinsics: simd_float3x3, exposureLocked: Bool) {
+        init(
+            index: Int,
+            timestamp: TimeInterval,
+            transform: simd_float4x4,
+            intrinsics: simd_float3x3,
+            exposureLocked: Bool,
+            iso: Float? = nil,
+            exposureDuration: Double? = nil
+        ) {
             self.index = index
             self.timestamp = timestamp
             self.transform = (0..<4).flatMap { column -> [Float] in
@@ -46,6 +59,22 @@ nonisolated final class CaptureStore: @unchecked Sendable {
                 return [c.x, c.y, c.z]
             }
             self.exposureLocked = exposureLocked
+            self.iso = iso
+            self.exposureDuration = exposureDuration
+        }
+
+        /// The frames:done wire shape. Nil fields are omitted, never sent as
+        /// JSON null (the backend 400s a null).
+        var wire: VirtSpace.FramePose {
+            VirtSpace.FramePose(
+                index: index,
+                timestamp: timestamp,
+                transform: transform,
+                intrinsics: intrinsics,
+                exposureLocked: exposureLocked,
+                iso: iso,
+                exposureDuration: exposureDuration
+            )
         }
     }
 

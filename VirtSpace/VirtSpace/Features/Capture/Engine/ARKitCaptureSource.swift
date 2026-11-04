@@ -11,10 +11,9 @@
 //  Stills use ARKit-native `captureHighResolutionFrame` (spec §3.1 corrected
 //  row: a parallel AVCaptureSession is impossible — ARKit owns the camera).
 //  If the device offers no high-res-capable video format we fall back to the
-//  live feed's `capturedImage`. After the first shot the engine calls
-//  `lockCameraSettings()`, which locks AE/AWB/AF on ARKit's own capture
-//  device via `configurableCaptureDeviceForPrimaryCamera` (spec §9:
-//  exposure/WB seams are the biggest stitch killer we control).
+//  live feed's `capturedImage`. Before shot 0 the engine locks AE/AWB to the
+//  exposure metered during the tracking preroll (ARKitCameraControl); focus
+//  stays on continuous AF.
 //
 
 import ARKit
@@ -44,6 +43,7 @@ nonisolated final class ARKitCaptureSource: NSObject, CaptureSource, ARSessionDe
     private static let jpegQuality = 0.9
 
     private let session = ARSession()
+    private let camera = ARKitCameraControl()
     private let ciContext = CIContext()
     private var supportsHighResCapture = false
     private var isRunning = false
@@ -146,47 +146,12 @@ nonisolated final class ARKitCaptureSource: NSObject, CaptureSource, ARSessionDe
         }
     }
 
-    func lockCameraSettings() -> Bool {
-        guard let device = ARWorldTrackingConfiguration.configurableCaptureDeviceForPrimaryCamera else {
-            return false
-        }
-        // Benign device-log noise: locking AE/AWB/AF here also triggers the
-        // `FigCaptureSourceRemote err=-17281` / CoreMedia `-12710` bursts seen
-        // at capture time. The lock takes effect regardless — expected, non-fatal.
-        do {
-            try device.lockForConfiguration()
-            defer { device.unlockForConfiguration() }
-
-            var lockedExposure = false
-            if device.isExposureModeSupported(.custom) {
-                // Freeze AE at its *current* values.
-                let format = device.activeFormat
-                let duration = clamp(device.exposureDuration,
-                                     min: format.minExposureDuration,
-                                     max: format.maxExposureDuration)
-                let iso = max(format.minISO, min(format.maxISO, device.iso))
-                device.setExposureModeCustom(duration: duration, iso: iso, completionHandler: nil)
-                lockedExposure = true
-            } else if device.isExposureModeSupported(.locked) {
-                device.exposureMode = .locked
-                lockedExposure = true
-            }
-            if device.isWhiteBalanceModeSupported(.locked) {
-                device.whiteBalanceMode = .locked
-            }
-            if device.isFocusModeSupported(.locked) {
-                device.focusMode = .locked
-            }
-            return lockedExposure
-        } catch {
-            return false
-        }
+    func exposureSample() -> ExposureSample? {
+        camera.sample()
     }
 
-    private func clamp(_ value: CMTime, min minTime: CMTime, max maxTime: CMTime) -> CMTime {
-        if CMTimeCompare(value, minTime) < 0 { return minTime }
-        if CMTimeCompare(value, maxTime) > 0 { return maxTime }
-        return value
+    func lockExposure(iso: Float, duration: Double, onApplied: @escaping @Sendable () -> Void) -> Bool {
+        camera.lock(iso: iso, duration: duration, onApplied: onApplied)
     }
 
     // MARK: - Frame encoding
@@ -242,7 +207,11 @@ nonisolated final class ARKitCaptureSource: NSObject, CaptureSource, ARSessionDe
             jpegData: data,
             timestamp: frame.timestamp,
             transform: frame.camera.transform,
-            intrinsics: intrinsics
+            intrinsics: intrinsics,
+            // ISO isn't on ARFrame; AE is locked by now, so the device's
+            // current ISO is the one this frame was exposed at.
+            iso: camera.device?.iso,
+            exposureDuration: frame.camera.exposureDuration
         ))
     }
 
@@ -254,7 +223,8 @@ nonisolated final class ARKitCaptureSource: NSObject, CaptureSource, ARSessionDe
             transform: frame.camera.transform,
             intrinsics: frame.camera.intrinsics,
             imageResolution: frame.camera.imageResolution,
-            trackingWarning: Self.warning(for: frame.camera.trackingState)
+            trackingWarning: Self.warning(for: frame.camera.trackingState),
+            exposureDuration: frame.camera.exposureDuration
         ))
     }
 

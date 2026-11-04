@@ -80,7 +80,7 @@ final class CaptureHUDState {
     var isSteady = false
     /// Meters of translation from the first shot's position (parallax coaching).
     var driftMeters: Float = 0
-    /// Whether AE/AWB/AF locked successfully after the first shot.
+    /// Whether AE/AWB locked before shot 0 (the HUD pill + coaching notice).
     var exposureLocked = false
     /// Tracking warning to surface, or nil.
     var warning: String?

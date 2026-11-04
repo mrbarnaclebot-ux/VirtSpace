@@ -111,3 +111,40 @@ struct TargetProjectionTests {
     }
 }
 
+
+@Suite("Exposure meter")
+struct ExposureMeterTests {
+    private func sample(iso: Float, duration: Double = 1.0 / 60) -> ExposureSample {
+        ExposureSample(iso: iso, duration: duration, minISO: 32, maxISO: 3_000,
+                       minDuration: 1.0 / 10_000, maxDuration: 1.0 / 3)
+    }
+
+    @Test("Locks to the window's median exposure at the current shutter")
+    func lockTargetIsMedian() throws {
+        var meter = ExposureMeter()
+        // A bright window glimpsed once must not drag the lock down.
+        for iso: Float in [400, 420, 50, 410, 400] { meter.add(sample(iso: iso)) }
+        let target = try #require(meter.lockTarget)
+        #expect(abs(target.duration - 1.0 / 60) < 1e-9)
+        #expect(abs(target.iso - 400) < 0.5)
+    }
+
+    @Test("ISO is clamped to the format and an empty meter has no target")
+    func clampsAndEmpty() throws {
+        var meter = ExposureMeter()
+        #expect(meter.lockTarget == nil)
+        meter.add(sample(iso: 3_000, duration: 1.0 / 60))
+        meter.add(sample(iso: 3_000, duration: 1.0 / 60))
+        // Latest shutter is shorter than the window's: the needed ISO exceeds max.
+        meter.add(sample(iso: 3_000, duration: 1.0 / 240))
+        let target = try #require(meter.lockTarget)
+        #expect(target.iso == 3_000)
+    }
+
+    @Test("The window keeps only the most recent samples")
+    func rollingWindow() {
+        var meter = ExposureMeter()
+        for _ in 0..<(ExposureMeter.windowSize + 10) { meter.add(sample(iso: 100)) }
+        #expect(meter.samples.count == ExposureMeter.windowSize)
+    }
+}

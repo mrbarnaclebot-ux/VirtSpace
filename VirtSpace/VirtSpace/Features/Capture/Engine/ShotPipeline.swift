@@ -4,8 +4,8 @@
 //
 //  Everything that happens between "the dwell fired" and "the engine can move
 //  to the next target" (spec §10 R14), extracted from CaptureEngine: take the
-//  still, persist it crash-safely, kick off the paint thumbnail, lock AE/AWB/AF
-//  after the first shot, and fire the haptics.
+//  still, persist it crash-safely, kick off the paint thumbnail, and fire the
+//  haptics. The exposure lock happens before shot 0, in the engine.
 //
 //  The pipeline owns no state-machine state — no target index, no dwell, no
 //  running flag. It does the I/O and reports a `ShotOutcome` back to the engine
@@ -48,21 +48,15 @@ nonisolated final class ShotPipeline: @unchecked Sendable {
     /// Background queue for downscaling paint thumbnails — never the main actor.
     private let thumbnailQueue = DispatchQueue(label: "com.virtspace.capture-thumbnails", qos: .utility)
 
-    /// Whether AE/AWB/AF locked successfully after the first shot. Engine queue;
+    /// Whether AE/AWB locked before shot 0. Set by the engine (engine queue);
     /// stamped into every frame's persisted pose.
-    private(set) var exposureLocked = false
+    var exposureLocked = false
 
     // MARK: - Hooks (set once by the engine)
 
     /// Whether the capture is still live. Checked on the engine queue the
     /// instant the still comes back, before anything is written to disk.
     var isCapturing: () -> Bool = { true }
-    /// Lock AE/AWB/AF at their current values; returns whether the lock took.
-    /// Called on the engine queue after the first shot (spec §9: exposure/WB
-    /// seams are the biggest stitch killer we control).
-    var lockCameraSettings: () -> Bool = { false }
-    /// The exposure lock's result, for the HUD. Engine queue.
-    var onExposureLock: (Bool) -> Void = { _ in }
     /// A finished paint thumbnail. **Called on `thumbnailQueue`**, not the
     /// engine queue — the engine hops to the main actor from here.
     var onPaintedShot: (PaintedShot) -> Void = { _ in }
@@ -125,7 +119,9 @@ nonisolated final class ShotPipeline: @unchecked Sendable {
             timestamp: still.timestamp,
             transform: still.transform,
             intrinsics: still.intrinsics,
-            exposureLocked: exposureLocked
+            exposureLocked: exposureLocked,
+            iso: still.iso,
+            exposureDuration: still.exposureDuration
         )
         do {
             try store.saveFrame(still.jpegData, pose: pose, in: session)
@@ -138,12 +134,6 @@ nonisolated final class ShotPipeline: @unchecked Sendable {
         AppLog.capture.log("Shot \(index + 1)/\(totalTargets) saved")
 
         paint(still, index: index)
-
-        // First shot: lock AE/AWB/AF so the remaining frames match.
-        if index == 0 {
-            exposureLocked = lockCameraSettings()
-            onExposureLock(exposureLocked)
-        }
 
         Self.shotHaptic()
         // Ring-completion celebrations, derived from TargetLayout's ring sizes

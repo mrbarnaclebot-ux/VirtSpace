@@ -96,6 +96,16 @@ nonisolated final class CaptureEngine: @unchecked Sendable {
     /// Transient (non-pose) warnings stay visible this long (engine queue).
     private var transientWarning: (text: String, until: TimeInterval)?
 
+    /// Exposure lock lifecycle (spec §10 R34/R38): AE is metered while
+    /// tracking initialises and locked once target 0 is up, and the dwell
+    /// stays gated until the lock has been applied — so shot 0 is captured,
+    /// and stamped, locked like every other frame.
+    private enum ExposurePhase { case metering, locking, locked }
+    private var exposurePhase = ExposurePhase.metering
+    private var meter = ExposureMeter()
+    /// A lock whose "applied" callback never comes must not wedge the dwell.
+    private static let exposureApplyTimeout: TimeInterval = 0.5
+
     /// Takes, persists and post-processes one still per fired dwell, and
     /// reports the outcome back here (see ShotPipeline).
     private let shots: ShotPipeline
@@ -122,10 +132,6 @@ nonisolated final class CaptureEngine: @unchecked Sendable {
         // Wire the shot pipeline to this engine's session. `onPaintedShot`
         // lands on the pipeline's thumbnail queue; the rest is engine queue.
         shots.isCapturing = { [weak self] in self?.running ?? false }
-        shots.lockCameraSettings = { [weak self] in self?.source?.lockCameraSettings() ?? false }
-        shots.onExposureLock = { [weak self] locked in
-            self?.publish { $0.exposureLocked = locked }
-        }
         shots.onPaintedShot = { [weak self] shot in
             self?.publish { hud in
                 if !hud.paintedShots.contains(where: { $0.index == shot.index }) {
@@ -258,6 +264,8 @@ nonisolated final class CaptureEngine: @unchecked Sendable {
         smoothedRate = 0
         dwell.reset()
         firstShotPosition = nil
+        exposurePhase = .metering
+        meter.reset()
         shots.reset()
         transientWarning = nil
         thermal.reset()
@@ -283,6 +291,12 @@ nonisolated final class CaptureEngine: @unchecked Sendable {
 
     private func handlePose(_ pose: CapturePose) {
         guard running else { return }
+
+        // Meter during the tracking preroll: ARKit's continuous AE is already
+        // following the user's look-around, before any target exists.
+        if exposurePhase == .metering, let sample = source?.exposureSample() {
+            meter.add(sample)
+        }
 
         // Establish the heading basis from the first *well-tracked* frame:
         // yaw of the camera forward becomes "straight ahead" for the layout.
@@ -312,6 +326,10 @@ nonisolated final class CaptureEngine: @unchecked Sendable {
         previousTransform = pose.transform
         previousTimestamp = pose.timestamp
 
+        if exposurePhase == .metering {
+            lockExposure()
+        }
+
         guard worldTargets.indices.contains(currentIndex) else { return }
         let target = worldTargets[currentIndex]
         let distance = AlignmentMath.angularDistanceDegrees(forward, target)
@@ -337,7 +355,8 @@ nonisolated final class CaptureEngine: @unchecked Sendable {
         var progress: Double = 0
         let aligned = AlignmentMath.isAligned(angularDistanceDegrees: distance)
         if !isTakingStill {
-            if dwell.update(aligned: aligned, steady: steady && pose.trackingWarning == nil, at: pose.timestamp) {
+            let canFire = steady && pose.trackingWarning == nil && exposurePhase == .locked
+            if dwell.update(aligned: aligned, steady: canFire, at: pose.timestamp) {
                 progress = 1
             } else {
                 progress = dwell.progress(at: pose.timestamp)
@@ -383,6 +402,38 @@ nonisolated final class CaptureEngine: @unchecked Sendable {
         if progress >= 1 {
             takeStill()
         }
+    }
+
+    // MARK: - Engine queue: exposure lock
+
+    /// Lock AE/AWB to the preroll's median exposure. Called once target 0 is
+    /// up; the dwell is gated until `finishExposureLock`.
+    private func lockExposure() {
+        guard let source, let target = meter.lockTarget else {
+            finishExposureLock(false)
+            return
+        }
+        exposurePhase = .locking
+        let sessionID = session?.id
+        let applied: @Sendable () -> Void = { [weak self] in
+            guard let self else { return }
+            self.queue.async {
+                guard self.running, self.session?.id == sessionID, self.exposurePhase == .locking else { return }
+                self.finishExposureLock(true)
+            }
+        }
+        guard source.lockExposure(iso: target.iso, duration: target.duration, onApplied: applied) else {
+            finishExposureLock(false)
+            return
+        }
+        queue.asyncAfter(deadline: .now() + Self.exposureApplyTimeout, execute: applied)
+    }
+
+    private func finishExposureLock(_ locked: Bool) {
+        exposurePhase = .locked
+        shots.exposureLocked = locked
+        AppLog.engine.log("Exposure lock before shot 0: \(locked ? "locked" : "unavailable", privacy: .public)")
+        publish { $0.exposureLocked = locked }
     }
 
     /// Rotation mapping the heading frame (-Z forward) into world space, from

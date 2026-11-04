@@ -28,6 +28,9 @@ nonisolated struct CapturePose: Sendable {
     var imageResolution: CGSize
     /// Non-nil while tracking is degraded ("Slow down", "Too dark…").
     var trackingWarning: String?
+    /// This frame's shutter time, seconds: longer exposures blur at a lower
+    /// rotation rate, so the steadiness gate scales with it.
+    var exposureDuration: Double
 }
 
 /// One captured still: encoded JPEG plus the pose metadata the server
@@ -37,6 +40,10 @@ nonisolated struct CapturedStill: Sendable {
     var timestamp: TimeInterval
     var transform: simd_float4x4
     var intrinsics: simd_float3x3
+    /// The exposure the still was taken at, for the stitcher's gain
+    /// compensation (spec §5.2). nil when the camera didn't report it.
+    var iso: Float?
+    var exposureDuration: Double?
 }
 
 nonisolated enum CaptureSourceError: LocalizedError {
@@ -74,10 +81,17 @@ nonisolated protocol CaptureSource: AnyObject, Sendable {
     /// Take one still. Completion may arrive on any queue.
     func captureStill(_ completion: @escaping @Sendable (Result<CapturedStill, Error>) -> Void)
 
-    /// Lock AE/AWB/AF at their current values (called after the first shot —
-    /// spec §9: exposure/WB seams). Returns whether the lock actually took.
-    @discardableResult
-    func lockCameraSettings() -> Bool
+    /// The camera's current auto-exposure reading, for metering during the
+    /// tracking preroll. nil when the camera isn't configurable.
+    func exposureSample() -> ExposureSample?
+
+    /// Lock AE at (iso, duration) and AWB at its current gains, before shot 0
+    /// (spec §10 R34/R38: exposure/WB seams are the biggest stitch killer we
+    /// control). Focus is deliberately left on continuous AF: per-frame
+    /// intrinsics already record focus breathing, and a focus locked at
+    /// target 0's distance blurs every farther wall. Returns whether the lock
+    /// took; `onApplied` (any queue) fires once frames carry the new exposure.
+    func lockExposure(iso: Float, duration: Double, onApplied: @escaping @Sendable () -> Void) -> Bool
 }
 
 #if targetEnvironment(simulator)
@@ -167,7 +181,8 @@ nonisolated final class SimulatedCaptureSource: CaptureSource, @unchecked Sendab
             transform: currentTransform(),
             intrinsics: Self.fakeIntrinsics,
             imageResolution: Self.fakeResolution,
-            trackingWarning: nil
+            trackingWarning: nil,
+            exposureDuration: 1.0 / 60
         )
         onPose?(pose)
     }
@@ -201,11 +216,22 @@ nonisolated final class SimulatedCaptureSource: CaptureSource, @unchecked Sendab
             jpegData: data,
             timestamp: CACurrentMediaTime(),
             transform: currentTransform(),
-            intrinsics: Self.fakeIntrinsics
+            intrinsics: Self.fakeIntrinsics,
+            iso: 100,
+            exposureDuration: 1.0 / 60
         )))
     }
 
-    func lockCameraSettings() -> Bool { true }
+    /// A bright, well-exposed room: the sim never trips the low-light warning.
+    func exposureSample() -> ExposureSample? {
+        ExposureSample(iso: 100, duration: 1.0 / 60, minISO: 32, maxISO: 2_000,
+                       minDuration: 1.0 / 10_000, maxDuration: 1.0 / 3)
+    }
+
+    func lockExposure(iso: Float, duration: Double, onApplied: @escaping @Sendable () -> Void) -> Bool {
+        onApplied()
+        return true
+    }
 
     // MARK: Fake camera math
 

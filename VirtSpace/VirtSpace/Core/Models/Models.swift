@@ -290,8 +290,14 @@ struct FramePose: Codable, Hashable {
     let transform: [Float]
     /// Camera intrinsics, 9 floats, column-major (matches the JPEG pixels).
     let intrinsics: [Float]
-    /// Whether AE/AWB/AF were locked when this frame was taken.
+    /// Whether AE/AWB were locked when this frame was taken.
     let exposureLocked: Bool
+    /// Capture v2 (spec §5.2). Synthesized Codable encodes optionals with
+    /// encodeIfPresent, so a nil field is absent from the JSON, never null —
+    /// a null 400s the whole frames:done.
+    var iso: Float?
+    /// Seconds.
+    var exposureDuration: Double?
 }
 
 /// `POST /v1/worlds/:id/frames:done` body. `poses` is optional on the wire —
