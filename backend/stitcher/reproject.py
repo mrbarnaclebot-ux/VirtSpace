@@ -79,7 +79,17 @@ from depth import (  # noqa: E402
     proxy_field,
     read_depth_png,
 )
-from warp import Cam, center_weight, pano_rays, project, sample, sample_field  # noqa: E402
+from gains import apply_gain, estimate_gains, exposure_prior  # noqa: E402
+from warp import (  # noqa: E402
+    Cam,
+    center_weight,
+    pano_rays,
+    project,
+    render_layers,
+    sample,
+    sample_field,
+    shrink,
+)
 
 
 # Winning fallback parameters (spike Phase 0.5 gate).
@@ -87,10 +97,14 @@ DEFAULT_HFOV = 52.0
 DEFAULT_YAW_DIR = 1
 DEFAULT_PITCH_SIGN = -1
 
-# Source px/deg kept per pano px/deg by prefilter(): a little over 1 so the
+# Source px/deg kept per pano px/deg by warp.shrink(): a little over 1 so the
 # bilinear remap still has sub-pixel detail to interpolate, well under the ~4x
 # at which it starts to alias.
 PREFILTER_OVERSAMPLE = 1.3
+
+# Pano width the gain and seam analysis runs at: overlap statistics and seam
+# placement need structure, not pixels, and the cost grows with width^2.
+ANALYSIS_WIDTH = 1024
 
 # Fixed proxy distance (m) from the pano centre when a frame has neither a
 # depth map nor a featureDepthMedian. On the 2026-09-17 bedroom capture the
@@ -275,24 +289,6 @@ def load_frame(frames_dir, i):
     return None
 
 
-def prefilter(img, focal_px, pano_width):
-    """INTER_AREA-shrink a frame to PREFILTER_OVERSAMPLE x the pano's angular
-    density before remap.
-
-    A 12 MP iPhone frame carries ~49 px/deg at its centre; a 4096 pano holds
-    ~11. Bilinear remap from the full frame point-samples it and aliases fine
-    texture into moire/sparkle, and Marble rebuilds that noise as geometry.
-    Area-averaging first is the anti-alias filter (and makes remap cheaper).
-    Never upsamples.
-    """
-    s = PREFILTER_OVERSAMPLE * (pano_width / (2.0 * math.pi)) / focal_px
-    if s >= 1.0:
-        return img
-    hf, wf = img.shape[:2]
-    size = (max(2, round(wf * s)), max(2, round(hf * s)))
-    return cv2.resize(img, size, interpolation=cv2.INTER_AREA)
-
-
 def upright(img):
     """Rotate an ARKit-native landscape frame 90 deg clockwise to portrait."""
     return cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
@@ -344,9 +340,9 @@ def load_frames(frames_dir, indices, pose_by_index, angles, hfov_deg, width):
             continue
         img = upright(raw)
         del raw
-        cam, _, _ = frame_camera(i, img.shape, pose_by_index, angles, hfov_deg)
-        img = prefilter(img, max(cam.fx, cam.fy), width)
-        frames[i] = (img,) + frame_camera(i, img.shape, pose_by_index, angles, hfov_deg)
+        cam, is_pole, label = frame_camera(i, img.shape, pose_by_index, angles, hfov_deg)
+        img, cam = shrink(img, cam, width, PREFILTER_OVERSAMPLE)
+        frames[i] = (img, cam, is_pole, label)
     return frames
 
 
@@ -372,6 +368,16 @@ def scene_depth(frames, pose_by_index, depth_dir, center, proxy_m):
         log(f"depth: {len(points)} depth maps")
     proxy = proxy_field(cams, depths, center, FIELD_WIDTH, FIELD_WIDTH // 2, proxy_m)
     return inverse_depth_field(points, proxy, center)
+
+
+def frame_gains(frames, pose_by_index, center, invd, wa):
+    """(n_frames, 3) exposure gains, solved over overlaps at analysis scale."""
+    lay = render_layers([f[:2] for f in frames.values()], center, invd, wa)
+    prior = exposure_prior([pose_by_index[i] for i in frames]) if pose_by_index else None
+    gains = estimate_gains([x[0] for x in lay], [x[1] for x in lay], prior)
+    log("gains " + " ".join(f"{i}:{g.mean():.2f}" for i, g in zip(frames, gains))
+        + (" (iso prior)" if prior is not None else ""))
+    return gains
 
 
 def build(width, frames_dir, poses, yaw_dir, pitch_sign, hfov_deg, power=2.0,
@@ -414,6 +420,7 @@ def build(width, frames_dir, poses, yaw_dir, pitch_sign, hfov_deg, power=2.0,
     center = np.mean([f[1].o for f in frames.values()], axis=0)
     invd = scene_depth(frames, pose_by_index, depth_dir, center, proxy_m)
     log(f"center {np.round(center, 3).tolist()} proxy {proxy_m} m")
+    gains = frame_gains(frames, pose_by_index, center, invd, min(w, ANALYSIS_WIDTH))
 
     pano = np.zeros((h, w, 3), np.uint8)
     cover = np.zeros((h, w), np.uint8)
@@ -431,7 +438,7 @@ def build(width, frames_dir, poses, yaw_dir, pitch_sign, hfov_deg, power=2.0,
         accum = np.zeros((r1 - r0, w, 3), np.float32)
         wsum = np.zeros((r1 - r0, w), np.float32)
 
-        for i, (img, cam, is_pole, _) in frames.items():
+        for k, (i, (img, cam, is_pole, _)) in enumerate(frames.items()):
             # Per-frame reprojection spans PROGRESS 5..70 across ALL bands
             # (blend/inpaint/write take the rest — see main()).
             progress(5 + 65 * step / steps)
@@ -444,7 +451,7 @@ def build(width, frames_dir, poses, yaw_dir, pitch_sign, hfov_deg, power=2.0,
             weight = (center_weight(cam, px, py) ** power) * inb
             if is_pole:  # pole frames dominate their caps to avoid smeared bleed.
                 weight *= POLE_BOOST
-            accum += sample(img, px, py).astype(np.float32) * weight[:, :, None]
+            accum += apply_gain(sample(img, px, py), gains[k]) * weight[:, :, None]
             wsum += weight
             del px, py, inb, weight
 

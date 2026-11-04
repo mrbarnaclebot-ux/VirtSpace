@@ -105,3 +105,37 @@ def sample_field(field, rows, cols, w, h):
     my = ((np.asarray(rows) + 0.5) * (fh / h) - 0.5).astype(np.float32)
     mx, my = np.meshgrid(mx, my)
     return cv2.remap(field, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+
+
+def shrink(img, cam, pano_width, oversample):
+    """INTER_AREA-shrink a frame to `oversample` x the pano's angular density
+    (pixels per radian at the frame centre vs pano_width / 2pi), returning the
+    image and its rescaled Cam. Never upsamples.
+
+    Bilinear remap from a much denser frame point-samples it and aliases fine
+    texture into moire/sparkle; area-averaging first is the anti-alias filter.
+    """
+    s = oversample * (pano_width / (2.0 * math.pi)) / max(cam.fx, cam.fy)
+    if s >= 1.0:
+        return img, cam
+    size = (max(2, round(cam.w * s)), max(2, round(cam.h * s)))
+    img = cv2.resize(img, size, interpolation=cv2.INTER_AREA)
+    sx, sy = size[0] / cam.w, size[1] / cam.h
+    return img, cam._replace(fx=cam.fx * sx, fy=cam.fy * sy, w=size[0], h=size[1])
+
+
+def render_layers(frames, center, invd, w, oversample=1.0):
+    """Whole-canvas reprojection of every (img, cam) at a SMALL pano width w:
+    [(uint8 BGR, bool mask, float32 centre weight)]. The analysis view that
+    gains and seams are computed on; frames are shrunk to w's density first so
+    the analysis image is not aliased either."""
+    h = w // 2
+    rows, cols = np.arange(h), np.arange(w)
+    dx, dy, dz = pano_rays(rows, cols, w, h)
+    invd = sample_field(invd, rows, cols, w, h)
+    out = []
+    for img, cam in frames:
+        img, cam = shrink(img, cam, w, oversample)
+        px, py, inb = project(cam, center, dx, dy, dz, invd)
+        out.append((sample(img, px, py), inb, center_weight(cam, px, py).astype(np.float32)))
+    return out

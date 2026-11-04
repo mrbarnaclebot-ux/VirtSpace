@@ -189,3 +189,39 @@ print(json.dumps({'code': p.returncode, 'warned': 'depth ignored (undecodable)' 
     expect(r.shape).toEqual([128, 256, 3]);
   });
 });
+
+describe.skipIf(!available)('stitcher v2: gain compensation', () => {
+  it('recovers a known 0.7x exposure difference from the overlap alone', () => {
+    const r = run(`${SCENE}
+fd, dd = os.path.join(TMP, 'f'), os.path.join(TMP, 'd')
+poses = write_capture(fd, dd, gains=(1.0, 0.7))
+by_i = {p['index']: p for p in poses}
+frames = R.load_frames(fd, list(by_i), by_i, None, 52.0, 1024)
+center = np.mean([f[1].o for f in frames.values()], axis=0)
+invd = R.scene_depth(frames, by_i, dd, center, 2.0)
+g = R.frame_gains(frames, by_i, center, invd, 512)
+print(json.dumps({'ratio': float(g[1].mean() / g[0].mean()),
+                  'geo_mean': float(math.sqrt(g[0].mean() * g[1].mean()))}))
+`);
+    expect(r.ratio as number).toBeGreaterThan((1 / 0.7) * 0.97);
+    expect(r.ratio as number).toBeLessThan((1 / 0.7) * 1.03);
+    // The weak prior anchors the overall level: gains split around 1.
+    expect(Math.abs((r.geo_mean as number) - 1)).toBeLessThan(0.05);
+  });
+
+  it('turns iso * exposureDuration into a gamma-encoded prior, all-or-nothing', () => {
+    const r = run(`
+import gains as G
+full = G.exposure_prior([{'iso': 100, 'exposureDuration': 0.02}, {'iso': 200, 'exposureDuration': 0.02},
+                         {'iso': 100, 'exposureDuration': 0.01}])
+part = G.exposure_prior([{'iso': 100, 'exposureDuration': 0.02}, {}])
+print(json.dumps({'full': np.exp(full).tolist(), 'part': part}))
+`);
+    const full = r.full as number[];
+    // Median exposure is 0.002 * 1000; 2x exposure needs 2^(-1/2.2) in JPEG values.
+    expect(full[0]).toBeCloseTo(1, 6);
+    expect(full[1]).toBeCloseTo(Math.pow(2, -1 / 2.2), 6);
+    expect(full[2]).toBeCloseTo(Math.pow(2, 1 / 2.2), 6);
+    expect(r.part).toBeNull();
+  });
+});

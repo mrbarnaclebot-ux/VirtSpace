@@ -11,7 +11,7 @@
                scores high; a clean seam-cut pano matches one frame everywhere.
 
 Both reproject the frames with the stitcher's own code at --width, so pass the
-same --proxy-depth / --depth-dir the pano was built with (inf = rotation-only,
+same --proxy-depth / --depth-dir / --gains the pano was built with (inf = rotation-only,
 the pre-v2 model). The nadir cap (lat < -70 deg) is excluded from `doubling`
 because it is inpainted by design.
 
@@ -27,6 +27,7 @@ import cv2
 import numpy as np
 
 import reproject as R
+from gains import apply_gain
 from warp import pano_rays, project, sample, sample_field
 
 NCC_WIN = 15  # local window (px at --width) for the gradient NCC
@@ -40,16 +41,18 @@ def layers(args):
     w, h = args.width, args.width // 2
     frames = R.load_frames(args.frames_dir, list(by_i), by_i, None, R.DEFAULT_HFOV, w)
     center = np.mean([f[1].o for f in frames.values()], axis=0)
-    invd = R.scene_depth(frames, by_i, args.depth_dir, center, args.proxy_depth)
+    invd_field = R.scene_depth(frames, by_i, args.depth_dir, center, args.proxy_depth)
     rows, cols = np.arange(h), np.arange(w)
     dx, dy, dz = pano_rays(rows, cols, w, h)
-    invd = sample_field(invd, rows, cols, w, h)
+    invd = sample_field(invd_field, rows, cols, w, h)
+    gains = (R.frame_gains(frames, by_i, center, invd_field, min(w, R.ANALYSIS_WIDTH))
+             if args.gains else np.ones((len(frames), 3), np.float32))
     out = []
-    for img, cam, _, _ in frames.values():
+    for (img, cam, _, _), g in zip(frames.values(), gains):
         px, py, inb = project(cam, center, dx, dy, dz, invd)
-        out.append((sample(img, px, py), inb))
-    return [(cv2.cvtColor(im.astype(np.uint8), cv2.COLOR_BGR2GRAY).astype(np.float32), m)
-            for im, m in out]
+        im = apply_gain(sample(img, px, py), g).astype(np.uint8)
+        out.append((cv2.cvtColor(im, cv2.COLOR_BGR2GRAY).astype(np.float32), inb))
+    return out
 
 
 def overlap_err(lay):
@@ -100,6 +103,7 @@ def main():
     ap.add_argument("--poses", required=True)
     ap.add_argument("--depth-dir", default=None)
     ap.add_argument("--proxy-depth", type=float, default=R.DEFAULT_PROXY_DEPTH_M)
+    ap.add_argument("--gains", action="store_true", help="apply the stitcher's gains first")
     ap.add_argument("--width", type=int, default=2048)
     args = ap.parse_args()
     R.log = R.progress = lambda *a, **k: None
