@@ -14,7 +14,8 @@
 //  This is the coordinator, not the whole capture: the shot I/O lives in
 //  ShotPipeline, thermal mitigation in ThermalGovernor, the HUD publish
 //  coalescing in HUDPublishThrottle, and every property the UI renders in
-//  CaptureHUDState.
+//  CaptureHUDState. The engine itself is split by responsibility across
+//  CaptureEngine+Pose (per frame), +Exposure, +Relocalization and +Shots.
 //
 //  Threading: pose callbacks and all internal mutation happen on a private
 //  serial queue; the observable HUD state SwiftUI reads is only ever mutated
@@ -26,38 +27,11 @@ import Foundation
 import OSLog
 import simd
 
-// MARK: - State
-
-enum CaptureEngineState: Equatable {
-    case idle
-    case starting
-    case ready(targetIndex: Int)
-    case capturing(targetIndex: Int)
-    case advancing
-    case finished(CaptureResult)
-    case failed(String)
-
-    /// Payload-free `.finished` test, for view code that has to branch on the
-    /// state without binding the result (`if case` doesn't compose inside a
-    /// ViewBuilder condition).
-    var isFinished: Bool {
-        if case .finished = self { return true }
-        return false
-    }
-}
-
-/// A completed full-sphere capture (28 frames), persisted on disk and ready to upload.
-struct CaptureResult: Equatable {
-    let sessionID: UUID
-    let directory: URL
-    let frameCount: Int
-}
-
-// MARK: - Engine
-
 /// Confined to `queue` (the engine queue): every mutable member below the
 /// `hud` reference is read and written only there. `hud` is a @MainActor class
-/// (itself Sendable) and is only ever touched through `publish`.
+/// (itself Sendable) and is only ever touched through `publish`. Engine state
+/// is internal rather than private only so the CaptureEngine+*.swift
+/// extensions can reach it; nothing outside those files touches it.
 nonisolated final class CaptureEngine: @unchecked Sendable {
     /// Everything the capture UI renders. Main-actor-isolated and written ONLY
     /// through `publish`; the views observe it directly.
@@ -65,20 +39,20 @@ nonisolated final class CaptureEngine: @unchecked Sendable {
 
     /// The capture pattern. Immutable, so both the engine queue and the main
     /// actor read the same array without coordination.
-    private var targets: [CaptureTarget] { hud.targets }
+    var targets: [CaptureTarget] { hud.targets }
 
     // MARK: Engine-queue state (never touched from the main queue)
 
-    private let queue: DispatchQueue
-    private var source: CaptureSource?
+    let queue: DispatchQueue
+    var source: CaptureSource?
     private let store: CaptureStore
-    private var session: CaptureStore.Session?
+    var session: CaptureStore.Session?
 
     /// Target directions rotated into ARKit world space (set once the heading
     /// basis is established from the first tracked frame).
-    private var worldTargets: [simd_float3] = []
-    private var currentIndex = 0
-    private var running = false
+    var worldTargets: [simd_float3] = []
+    var currentIndex = 0
+    var running = false
     /// Fired (on the engine queue) with the backend world id when a session
     /// that already minted a world is permanently discarded (abandon flow).
     /// The owner (CaptureScreenModel) uses it for a best-effort server-side
@@ -87,40 +61,37 @@ nonisolated final class CaptureEngine: @unchecked Sendable {
     private let onSessionDiscarded: @Sendable (String) -> Void
     /// True from dwell-fire until the next target is ready — gates the dwell
     /// machine while a still is in flight.
-    private var isTakingStill = false
-    private var previousTransform: simd_float4x4?
-    private var previousTimestamp: TimeInterval?
-    private var smoothedRate: Double = 0
-    private var dwell = DwellTracker()
+    var isTakingStill = false
+    var previousTransform: simd_float4x4?
+    var previousTimestamp: TimeInterval?
+    var smoothedRate: Double = 0
+    var dwell = DwellTracker()
     /// Camera position of every captured shot: their centroid is the pivot
     /// the drift coaching and the soft gate measure from (R37).
-    private var shotPositions: [simd_float3] = []
-    private var pivotGate = PivotGate()
+    var shotPositions: [simd_float3] = []
+    var pivotGate = PivotGate()
     /// When the current relocalization began; past the timeout the HUD offers
     /// "Restart scan" (R31/R39).
-    private var relocalizingSince: TimeInterval?
-    private var isOfferingRestart = false
-    private static let relocalizationTimeout: TimeInterval = 10
+    var relocalizingSince: TimeInterval?
+    var isOfferingRestart = false
     /// Transient (non-pose) warnings stay visible this long (engine queue).
-    private var transientWarning: (text: String, until: TimeInterval)?
+    var transientWarning: (text: String, until: TimeInterval)?
 
     /// Exposure lock lifecycle (spec §10 R34/R38): AE is metered while
     /// tracking initialises and locked once target 0 is up, and the dwell
     /// stays gated until the lock has been applied — so shot 0 is captured,
     /// and stamped, locked like every other frame.
-    private enum ExposurePhase { case metering, locking, locked }
-    private var exposurePhase = ExposurePhase.metering
-    private var meter = ExposureMeter()
+    enum ExposurePhase { case metering, locking, locked }
+    var exposurePhase = ExposurePhase.metering
+    var meter = ExposureMeter()
     /// Low-light preflight: the lock waits while AE is pinned near its ceiling
     /// (turning the lights on clears it) unless the user chose to continue.
-    private var isShowingLowLight = false
-    private var lowLightAcknowledged = false
-    /// A lock whose "applied" callback never comes must not wedge the dwell.
-    private static let exposureApplyTimeout: TimeInterval = 0.5
+    var isShowingLowLight = false
+    var lowLightAcknowledged = false
 
     /// Takes, persists and post-processes one still per fired dwell, and
     /// reports the outcome back here (see ShotPipeline).
-    private let shots: ShotPipeline
+    let shots: ShotPipeline
 
     /// Thermal mitigation: owns the thermal observer, the cool-down pause and
     /// the pure state→policy mapping (see ThermalGovernor).
@@ -128,7 +99,7 @@ nonisolated final class CaptureEngine: @unchecked Sendable {
 
     /// Coalesces the HUD publish to ~30 Hz and to meaningful changes only
     /// (Stage B3 deliverable 2b) — see HUDPublishThrottle.
-    private var throttle = HUDPublishThrottle()
+    var throttle = HUDPublishThrottle()
 
     init(
         store: CaptureStore = CaptureStore(),
@@ -205,22 +176,7 @@ nonisolated final class CaptureEngine: @unchecked Sendable {
         }
     }
 
-    /// Discard the scan and start a fresh one — offered when ARKit can't
-    /// relocalize after an interruption. Goes through `.idle` exactly like
-    /// cancel-then-Start, so the camera layer's lifecycle is the one the
-    /// cancel path already has (R16).
-    func restart() {
-        queue.async { [weak self] in
-            guard let self else { return }
-            self.discardOnQueue()
-            self.publish { hud in
-                hud.applyReset(state: .idle)
-                self.start()
-            }
-        }
-    }
-
-    private func discardOnQueue() {
+    func discardOnQueue() {
         running = false
         source?.stop()
         source = nil
@@ -308,7 +264,7 @@ nonisolated final class CaptureEngine: @unchecked Sendable {
         throttle.reset()
     }
 
-    private func fail(_ message: String) {
+    func fail(_ message: String) {
         running = false
         source?.stop()
         source = nil
@@ -316,288 +272,11 @@ nonisolated final class CaptureEngine: @unchecked Sendable {
         publish { $0.state = .failed(message) }
     }
 
-    /// The user chose to scan despite the low-light warning.
-    func continueInLowLight() {
-        queue.async { [weak self] in self?.lowLightAcknowledged = true }
-    }
-
     // MARK: - Thermal mitigation (Stage B3 deliverable 2e)
 
     /// User-driven resume from a thermal-critical pause (see resume UI).
     func resumeFromThermal() {
         queue.async { [weak self] in self?.thermal.resumeFromPause() }
-    }
-
-    // MARK: - Engine queue: per-frame
-
-    private func handlePose(_ pose: CapturePose) {
-        guard running else { return }
-
-        // Meter during the tracking preroll: ARKit's continuous AE is already
-        // following the user's look-around, before any target exists.
-        if exposurePhase == .metering, let sample = source?.exposureSample() {
-            meter.add(sample)
-        }
-
-        // Establish the heading basis from the first *well-tracked* frame:
-        // yaw of the camera forward becomes "straight ahead" for the layout.
-        if worldTargets.isEmpty {
-            guard pose.trackingWarning == nil else {
-                publish { $0.warning = pose.trackingWarning }
-                return
-            }
-            let basis = Self.headingBasis(fromCameraForward: AlignmentMath.forward(of: pose.transform))
-            worldTargets = targets.map { simd_normalize(basis * $0.direction) }
-            let directions = worldTargets
-            publish {
-                $0.targetDirections = directions
-                $0.state = .ready(targetIndex: 0)
-            }
-        }
-
-        let forward = AlignmentMath.forward(of: pose.transform)
-        let position = AlignmentMath.position(of: pose.transform)
-
-        // Steadiness from consecutive transforms (ARKit exposes no gyro
-        // directly); light low-pass so single noisy frames don't flicker it.
-        if let prev = previousTransform, let prevTime = previousTimestamp {
-            let rate = AlignmentMath.rotationRate(from: prev, to: pose.transform, dt: pose.timestamp - prevTime)
-            smoothedRate = 0.7 * smoothedRate + 0.3 * rate
-        }
-        previousTransform = pose.transform
-        previousTimestamp = pose.timestamp
-
-        trackRelocalization(pose)
-
-        if exposurePhase == .metering {
-            if meter.isTooDark, !lowLightAcknowledged {
-                if !isShowingLowLight {
-                    isShowingLowLight = true
-                    AppLog.engine.log("Low light before shot 0: holding the exposure lock")
-                    publish { $0.isTooDark = true }
-                }
-            } else {
-                if isShowingLowLight {
-                    isShowingLowLight = false
-                    publish { $0.isTooDark = false }
-                }
-                lockExposure()
-            }
-        }
-
-        guard worldTargets.indices.contains(currentIndex) else { return }
-        let target = worldTargets[currentIndex]
-        let distance = AlignmentMath.angularDistanceDegrees(forward, target)
-        let deltas = AlignmentMath.signedDeltas(cameraForward: forward, targetDirection: target)
-        let steady = AlignmentMath.isSteady(rotationRate: smoothedRate, exposureDuration: pose.exposureDuration)
-        let drift = AlignmentMath.driftFromCentroid(of: shotPositions, current: position)
-        let pivotOffset = AlignmentMath.centroid(shotPositions).map {
-            AlignmentMath.pivotOffset(from: $0, current: position, cameraForward: forward)
-        } ?? .zero
-
-        // Thermal coaching now flows through the dedicated `thermalState`
-        // publish + CoachingLayer banner (event-driven via NotificationCenter),
-        // so we no longer poll ProcessInfo per frame here.
-        var warningText = pose.trackingWarning
-        // Transient warnings (e.g. a failed shot) hold for a few seconds
-        // instead of being wiped by the very next pose frame.
-        if warningText == nil, let transient = transientWarning {
-            if pose.timestamp < transient.until {
-                warningText = transient.text
-            } else {
-                transientWarning = nil
-            }
-        }
-
-        // Auto-fire: aligned + steady, continuously, with trustworthy tracking.
-        var progress: Double = 0
-        let aligned = AlignmentMath.isAligned(angularDistanceDegrees: distance)
-        if !isTakingStill {
-            var canFire = steady && pose.trackingWarning == nil && exposurePhase == .locked
-            canFire = pivotGate.allows(drift: drift, onTarget: aligned && canFire, at: pose.timestamp) && canFire
-            if dwell.update(aligned: aligned, steady: canFire, at: pose.timestamp) {
-                progress = 1
-            } else {
-                progress = dwell.progress(at: pose.timestamp)
-            }
-        }
-
-        // Coalesce the HUD publish to ~30 Hz and only when something the HUD
-        // actually renders has moved (Stage B3 deliverable 2b) — the policy
-        // itself lives in HUDPublishThrottle so it can be unit-tested.
-        let sample = HUDPublishThrottle.Sample(
-            timestamp: pose.timestamp,
-            angleDegrees: distance,
-            isSteady: steady,
-            targetIndex: currentIndex,
-            dwellProgress: progress,
-            warning: warningText,
-            rotationRate: smoothedRate
-        )
-
-        if throttle.shouldPublish(sample) {
-            // Bind the two locals that are `var` above to immutable copies:
-            // the publish closure runs later, on the main queue, and must
-            // capture this frame's values rather than the variables.
-            let publishedWarning = warningText
-            let publishedProgress = progress
-            let transform = pose.transform
-            let intrinsics = pose.intrinsics
-            let resolution = pose.imageResolution
-            publish {
-                $0.angularDistanceDegrees = distance
-                $0.yawDeltaDegrees = deltas.yaw
-                $0.pitchDeltaDegrees = deltas.pitch
-                $0.isSteady = steady
-                $0.driftMeters = drift
-                $0.pivotOffset = pivotOffset
-                $0.warning = publishedWarning
-                $0.cameraTransform = transform
-                $0.cameraIntrinsics = intrinsics
-                $0.imageResolution = resolution
-                $0.dwellProgress = publishedProgress
-            }
-        }
-
-        if progress >= 1 {
-            takeStill()
-        }
-    }
-
-    /// Offer "Restart scan" once relocalization has run past the timeout;
-    /// withdraw it the moment tracking recovers.
-    private func trackRelocalization(_ pose: CapturePose) {
-        guard pose.isRelocalizing else {
-            relocalizingSince = nil
-            if isOfferingRestart {
-                isOfferingRestart = false
-                publish { $0.isOfferingRestart = false }
-            }
-            return
-        }
-        let since = relocalizingSince ?? pose.timestamp
-        relocalizingSince = since
-        if !isOfferingRestart, pose.timestamp - since >= Self.relocalizationTimeout {
-            isOfferingRestart = true
-            AppLog.engine.error("Relocalization still failing after \(Self.relocalizationTimeout, privacy: .public) s, offering restart")
-            publish { $0.isOfferingRestart = true }
-        }
-    }
-
-    // MARK: - Engine queue: exposure lock
-
-    /// Lock AE/AWB to the preroll's median exposure. Called once target 0 is
-    /// up; the dwell is gated until `finishExposureLock`.
-    private func lockExposure() {
-        guard let source, let target = meter.lockTarget else {
-            finishExposureLock(false)
-            return
-        }
-        exposurePhase = .locking
-        let sessionID = session?.id
-        let applied: @Sendable () -> Void = { [weak self] in
-            guard let self else { return }
-            self.queue.async {
-                guard self.running, self.session?.id == sessionID, self.exposurePhase == .locking else { return }
-                self.finishExposureLock(true)
-            }
-        }
-        guard source.lockExposure(iso: target.iso, duration: target.duration, onApplied: applied) else {
-            finishExposureLock(false)
-            return
-        }
-        queue.asyncAfter(deadline: .now() + Self.exposureApplyTimeout, execute: applied)
-    }
-
-    private func finishExposureLock(_ locked: Bool) {
-        exposurePhase = .locked
-        shots.exposureLocked = locked
-        AppLog.engine.log("Exposure lock before shot 0: \(locked ? "locked" : "unavailable", privacy: .public)")
-        publish { $0.exposureLocked = locked }
-    }
-
-    /// Rotation mapping the heading frame (-Z forward) into world space, from
-    /// the camera forward's horizontal projection. Falls back to world -Z if
-    /// the user starts pointing straight up/down.
-    private static func headingBasis(fromCameraForward forward: simd_float3) -> simd_float3x3 {
-        var horizontal = simd_float3(forward.x, 0, forward.z)
-        if simd_length(horizontal) < 0.05 {
-            horizontal = simd_float3(0, 0, -1)
-        }
-        let f = simd_normalize(horizontal)
-        let up = simd_float3(0, 1, 0)
-        let right = simd_normalize(simd_cross(f, up))
-        // Columns: heading-frame X (right), Y (up), Z (backward = -forward).
-        return simd_float3x3(right, up, -f)
-    }
-
-    // MARK: - Engine queue: shots
-
-    private func takeStill() {
-        guard let source, let session else { return }
-        isTakingStill = true
-        let index = currentIndex
-        publish { $0.state = .capturing(targetIndex: index) }
-
-        shots.take(index: index, from: source, into: session, totalTargets: targets.count) { [weak self] outcome in
-            self?.handleShot(outcome, session: session)
-        }
-    }
-
-    /// Engine queue: fold one shot's outcome back into the walk-around.
-    private func handleShot(_ outcome: ShotOutcome, session: CaptureStore.Session) {
-        switch outcome {
-        case .saveFailed(_, let message):
-            fail(message)
-
-        case .failed(let index, let message):
-            // One missed shot shouldn't kill a 28-shot walk-around: surface it
-            // and let the dwell re-fire on the same target.
-            isTakingStill = false
-            dwell.reset()
-            transientWarning = (message, (previousTimestamp ?? 0) + 3.0)
-            publish {
-                $0.warning = message
-                $0.state = .ready(targetIndex: index)
-            }
-
-        case .saved(let index, let transform):
-            shotPositions.append(AlignmentMath.position(of: transform))
-
-            currentIndex += 1
-            dwell.reset()
-            pivotGate.reset()
-            let next = currentIndex
-
-            if next >= targets.count {
-                running = false
-                source?.stop()
-                source = nil
-                AppLog.capture.log("Capture complete: \(self.targets.count) frames, session \(session.id.uuidString, privacy: .public)")
-                let result = CaptureResult(
-                    sessionID: session.id,
-                    directory: session.directory,
-                    frameCount: targets.count
-                )
-                publish {
-                    $0.capturedFlags[index] = true
-                    $0.state = .finished(result)
-                }
-                ShotPipeline.celebrationHaptic()
-            } else {
-                publish {
-                    $0.capturedFlags[index] = true
-                    $0.state = .advancing
-                }
-                // Brief beat on .advancing so the UI can acknowledge the shot,
-                // then open the next target. Dwell stays gated until then.
-                queue.asyncAfter(deadline: .now() + 0.25) { [weak self] in
-                    guard let self, self.running else { return }
-                    self.isTakingStill = false
-                    self.publish { $0.state = .ready(targetIndex: next) }
-                }
-            }
-        }
     }
 
     // MARK: - Publishing
@@ -611,7 +290,7 @@ nonisolated final class CaptureEngine: @unchecked Sendable {
     /// (a `.capturing` must never land after the `.ready` that follows it), and
     /// only the queue guarantees that. `assumeIsolated` is therefore a fact,
     /// not a wish — the block is already running on the main queue.
-    private func publish(_ mutation: @escaping @MainActor (CaptureHUDState) -> Void) {
+    func publish(_ mutation: @escaping @MainActor (CaptureHUDState) -> Void) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             MainActor.assumeIsolated { mutation(self.hud) }
