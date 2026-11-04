@@ -207,6 +207,31 @@ describe('POST /v1/worlds with Idempotency-Key', () => {
     await app.close();
   });
 
+  it('a depth replay returns the same depth_uploads keys as the original', async () => {
+    const state = newState();
+    currentDb = makeDb(state);
+    const app = await buildApp(makeStorage());
+    const req = {
+      method: 'POST' as const,
+      url: '/v1/worlds',
+      headers: { 'idempotency-key': KEY },
+      payload: { frame_count: 2, depth: true },
+    };
+
+    const first = await app.inject(req);
+    const second = await app.inject(req);
+
+    expect(first.statusCode).toBe(201);
+    expect(second.statusCode).toBe(200);
+    const keys = (r: typeof first) =>
+      r.json().depth_uploads.map((u: { key: string }) => u.key);
+    expect(keys(first)).toHaveLength(2);
+    expect(keys(second)).toEqual(keys(first));
+    expect(keys(first)[0]).toMatch(/\/depth_0\.png$/);
+    expect(state.quotaCharges).toBe(1);
+    await app.close();
+  });
+
   it('rejects a non-UUID key with 400 invalid_idempotency_key (before any charge)', async () => {
     const state = newState();
     currentDb = makeDb(state);

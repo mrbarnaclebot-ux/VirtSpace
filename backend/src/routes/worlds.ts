@@ -5,7 +5,8 @@ import { getDb } from '../db/client.js';
 import { captures, worlds, type World } from '../db/schema.js';
 import { enqueue } from '../queue.js';
 import { chargeScanQuota, releaseScanQuota } from '../quota.js';
-import { MAX_FRAME_BYTES, type StorageDriver } from '../storage/index.js';
+import { MAX_DEPTH_BYTES, MAX_FRAME_BYTES, type StorageDriver } from '../storage/index.js';
+import { depthKeyName } from '../depth.js';
 import type { RouteDeps } from './deps.js';
 
 const DOWNLOAD_TTL_SECONDS = 3600;
@@ -58,19 +59,49 @@ const frameSizeSchema = z.object({
   bytes: z.number().int().positive().max(MAX_FRAME_BYTES),
 });
 
+/** Same declaration for the optional depth maps (spec §5.2), 1 MB ceiling. */
+const depthSizeSchema = frameSizeSchema.extend({
+  bytes: z.number().int().positive().max(MAX_DEPTH_BYTES),
+});
+
+/**
+ * Optional depth opt-in shared by create and uploads:refresh (spec §5.2 item 3).
+ * `depth: true` adds `depth_uploads` to the response; `depth_frames` declares
+ * exact depth-map sizes so they get a signed Content-Length like frames (R7).
+ */
+const depthFields = {
+  depth: z.boolean().optional(),
+  depth_frames: z.array(depthSizeSchema).max(64).optional(),
+};
+
 const createBody = z.object({
   title: z.string().max(200).optional(),
   lat: z.number().min(-90).max(90).optional(),
   lng: z.number().min(-180).max(180).optional(),
   frame_count: z.number().int().min(1).max(64),
   frames: z.array(frameSizeSchema).max(64).optional(),
+  ...depthFields,
 });
 
 /** Same optional declaration on the resume path. Body may be absent entirely. */
 export const refreshUploadsBody = z
-  .object({ frames: z.array(frameSizeSchema).max(64).optional() })
+  .object({ frames: z.array(frameSizeSchema).max(64).optional(), ...depthFields })
   .optional()
   .nullable();
+
+/**
+ * What a create/refresh/replay should presign besides the frames. `null` =
+ * depth not requested, so the response stays byte-identical to the pre-depth
+ * contract (no `depth_uploads` key at all).
+ */
+type DepthRequest = Map<number, number> | null;
+
+function depthRequest(body?: {
+  depth?: boolean;
+  depth_frames?: { index: number; bytes: number }[];
+}): DepthRequest {
+  return body?.depth ? frameSizeMap(body.depth_frames) : null;
+}
 
 /** index → exact byte size, from an optional `frames` declaration. */
 export function frameSizeMap(
@@ -190,6 +221,7 @@ export function worldsRoutes(app: FastifyInstance, deps: RouteDeps): void {
     }
     const body = parsed.data;
     const sizes = frameSizeMap(body.frames);
+    const depth = depthRequest(body);
     const db = getDb();
 
     // Idempotency-Key (spec §10 R4): the client's capture-session UUID. A retry
@@ -209,7 +241,7 @@ export function worldsRoutes(app: FastifyInstance, deps: RouteDeps): void {
 
       const existing = await findWorldByClientRequestId(db, userId, clientRequestId);
       if (existing) {
-        return replayCreate(reply, db, storage, existing, sizes);
+        return replayCreate(reply, db, storage, existing, sizes, depth);
       }
     }
 
@@ -248,7 +280,7 @@ export function worldsRoutes(app: FastifyInstance, deps: RouteDeps): void {
       await releaseScanQuota(db, userId);
       const winner = await findWorldByClientRequestId(db, userId, clientRequestId);
       if (!winner) throw err; // not our constraint after all — surface it.
-      return replayCreate(reply, db, storage, winner, sizes);
+      return replayCreate(reply, db, storage, winner, sizes, depth);
     }
 
     // Create the capture row and its frame-key prefix.
@@ -270,6 +302,7 @@ export function worldsRoutes(app: FastifyInstance, deps: RouteDeps): void {
       world: serializeWorld(world),
       capture_id: capture!.id,
       uploads,
+      ...(await presignDepthUploads(storage, prefix, body.frame_count, depth)),
     });
   });
 
@@ -317,6 +350,12 @@ export function worldsRoutes(app: FastifyInstance, deps: RouteDeps): void {
         world: serializeWorld(world),
         capture_id: capture.id,
         uploads,
+        ...(await presignDepthUploads(
+          storage,
+          capture.r2FramesPrefix,
+          capture.frameCount,
+          depthRequest(parsedBody.data ?? undefined),
+        )),
       });
     },
   );
@@ -543,6 +582,24 @@ export function worldsRoutes(app: FastifyInstance, deps: RouteDeps): void {
   });
 }
 
+interface UploadKind {
+  name: (i: number) => string;
+  contentType: string;
+  maxBytes: number;
+}
+
+const FRAME_UPLOAD: UploadKind = {
+  name: (i) => `frame_${i}.heic`,
+  contentType: 'image/heic',
+  maxBytes: MAX_FRAME_BYTES,
+};
+
+const DEPTH_UPLOAD: UploadKind = {
+  name: depthKeyName,
+  contentType: 'image/png',
+  maxBytes: MAX_DEPTH_BYTES,
+};
+
 /**
  * Presign one PUT upload URL per frame under `prefix`. Shared by world create
  * and uploads:refresh so both mint byte-identical keys (`frame_<i>.heic`),
@@ -554,21 +611,36 @@ async function presignFrameUploads(
   prefix: string,
   frameCount: number,
   sizes: Map<number, number> = new Map(),
+  kind: UploadKind = FRAME_UPLOAD,
 ): Promise<
   Array<{ index: number; key: string } & Awaited<ReturnType<StorageDriver['presignUpload']>>>
 > {
   return Promise.all(
     Array.from({ length: frameCount }, async (_v, i) => {
-      const key = `${prefix}/frame_${i}.heic`;
+      const key = `${prefix}/${kind.name(i)}`;
       const presigned = await storage.presignUpload(
         key,
-        'image/heic',
-        MAX_FRAME_BYTES,
+        kind.contentType,
+        kind.maxBytes,
         sizes.get(i),
       );
       return { index: i, key, ...presigned };
     }),
   );
+}
+
+/** `{ depth_uploads }` when depth was requested, else `{}` so spreading it into a
+ * response adds nothing. */
+async function presignDepthUploads(
+  storage: StorageDriver,
+  prefix: string,
+  frameCount: number,
+  depth: DepthRequest,
+): Promise<{ depth_uploads?: Awaited<ReturnType<typeof presignFrameUploads>> }> {
+  if (!depth) return {};
+  return {
+    depth_uploads: await presignFrameUploads(storage, prefix, frameCount, depth, DEPTH_UPLOAD),
+  };
 }
 
 /**
@@ -642,6 +714,7 @@ async function replayCreate(
   storage: StorageDriver,
   world: World,
   sizes: Map<number, number>,
+  depth: DepthRequest,
 ) {
   if (world.deletedAt) {
     return reply.code(409).send({
@@ -673,6 +746,14 @@ async function replayCreate(
     world: serializeWorld(world),
     capture_id: capture.id,
     uploads,
+    // The depth opt-in is not persisted (no schema change for v2), so the
+    // replay honours the retried body — the client resends the same request.
+    ...(await presignDepthUploads(
+      storage,
+      capture.r2FramesPrefix,
+      capture.frameCount,
+      depth,
+    )),
     idempotent_replay: true,
   });
 }
