@@ -171,6 +171,16 @@ Marble also accepts **`multi-image` prompts** (e.g. 4 views at azimuth 0°/90°/
 
 ---
 
+### 5.2 Capture v2 contract (2026-11-04, ledger R36–R41)
+
+Target devices are **Pro iPhones** (LiDAR). Depth is optional on the wire so non-LiDAR devices and older clients keep working, but the quality bar is set with depth. Baseline evidence: the 2026-09-17 capture (28 frames) drifted 52 cm from shot 0 but only 21 cm median / 37 cm max from the centroid of shot positions, over a 43 cm height range, with cameras biased outward-facing (orbit signature): most "drift" is the phone swinging on the arm, not walking. 97 s capture.
+
+1. **`FramePose` (frames:done `poses[]`, stored verbatim in `captures.poses_json`)** — existing fields unchanged (`index`, `timestamp`, `transform` column-major camera-to-world, `intrinsics` column-major for the uploaded JPEG pixels, `exposureLocked`). New optional camelCase fields: `iso` (Float), `exposureDuration` (Double, seconds), `featureDepthMedian` (Float, metres, median depth of ARKit `rawFeaturePoints` in view — non-LiDAR fallback), `depth` (`{ "width": Int, "height": Int }`, present iff a depth file was uploaded for this frame). The backend schema is `.passthrough()`, so no route change is needed for these.
+2. **Depth file per frame:** R2 key `<capture prefix>/depth_<i>.png`, `image/png`, **16-bit grayscale PNG, millimetres, 0 = invalid** (the device zeroes `ARConfidenceLevel.low`). Same orientation and field of view as that frame's uploaded JPEG; its intrinsics are the frame intrinsics scaled by `depth.width / jpegWidth` (x) and `depth.height / jpegHeight` (y). Hard cap 1 MB.
+3. **API:** `POST /v1/worlds` and `POST /v1/worlds/{id}/uploads:refresh` accept optional `"depth": true`; the response then adds `depth_uploads` with exactly the shape of `uploads` (keys `depth_<i>.png`). Absent → identical behaviour to today.
+4. **Worker:** for each pose with `depth`, read `depth_<i>.png` (≤ 1 MB; missing or invalid → stitch that frame without depth and log, never fail the job), stage it beside the frames, pass `--depth-dir` to the stitcher. Purge removes depth keys with the frames. Stitch width default **4096** (R40).
+5. **Stitcher (`reproject.py`):** optional `--depth-dir`; reads the new pose fields. Pipeline: per-frame `INTER_AREA` prefilter → translation-aware reprojection about the centroid camera position (per-pixel depth from the depth map when present; else `featureDepthMedian`; else a fixed proxy distance) → exposure/gain compensation (from `iso`·`exposureDuration` when present, refined over overlaps) → graph-cut seam selection → multi-band blend → nadir mask (user's body) and inpaint. R17 orientation tests must keep passing.
+
 ## 6. UI/UX redesign — where we beat the reference
 
 The reference UX is functional but generic. Our differentiation:
