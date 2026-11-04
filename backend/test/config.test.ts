@@ -22,7 +22,7 @@ describe('loadConfig', () => {
     expect(cfg.AUTH_MODE).toBe('dev');
     expect(cfg.STORAGE_DRIVER).toBe('local');
     expect(cfg.PROVIDER_MODE).toBe('mock');
-    expect(cfg.DAILY_CREDIT_BUDGET).toBe(500);
+    expect(cfg.DAILY_CREDIT_BUDGET).toBe(2000); // fits one HQ (§10 R18)
     expect(cfg.DAILY_SCAN_QUOTA).toBe(10);
     expect(cfg.LOCAL_STORAGE_DIR).toBe('./data');
     expect(cfg.PUBLIC_BASE_URL).toBe('http://localhost:8080');

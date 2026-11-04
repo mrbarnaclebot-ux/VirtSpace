@@ -89,7 +89,7 @@ test/                vitest: config, storage, auth, quota/backoff
   the daily scan quota with a single conditional `UPDATE … RETURNING`
   (`chargeScanQuota`) — the check and the increment are one statement, so
   concurrent creates cannot both pass at the limit (spec §10 R9); a refusal is
-  `429 {"error":"daily_scan_quota_exceeded","retry_at":…}`. Optional
+  `429 {"error":"scan_quota_exceeded","message":…,"retry_at":…}`. Optional
   `frames: [{ index, bytes }]` declares each frame's exact size (see
   [Upload size caps](#upload-size-caps-spec-10-r7)).
 - `POST /v1/worlds/:id/frames:done` — verify ownership, set `status=stitching`,
@@ -126,6 +126,13 @@ test/                vitest: config, storage, auth, quota/backoff
     router hands to `GET /v1/worlds/:id` as a garbage id) answers
     `404 world_not_found` — Postgres' `22P02` on the uuid cast is caught in
     `findOwnedWorld` instead of escaping as a `500`.
+  - Refuses up front with `429 credit_budget_exceeded` when one HQ cannot fit
+    today's `DAILY_CREDIT_BUDGET` (advisory `budgetFits`; the worker's
+    `reserveCredits` stays the guard).
+- `POST /v1/worlds/{id}:retry` — re-run a failed phase (`failed_stitch`,
+  `failed_generating_draft`, `failed_generating_hq`) in one conditional
+  transaction; route string `'/v1/worlds/:id(^[^:]+)::retry'`, own `retry:<user>`
+  rate-limit key. Full contract in spec §7.1.
 - `DELETE /v1/worlds/:id` — soft delete + enqueue `purge`.
 - `POST /v1/devices` — upsert an APNs token.
 - `DELETE /v1/account` — soft-delete the user's worlds (+ enqueue purges), delete
@@ -274,6 +281,7 @@ limiter picks a key — Fastify runs every `onRequest` hook before any
 | General (anonymous) | `ip:<addr>` | 600 / min | `RATE_LIMIT_IP_MAX` |
 | `POST /v1/worlds` | `create:<user>` | 12 / min | `RATE_LIMIT_CREATE_MAX` |
 | `POST /v1/worlds/{id}:enhance` (+ slash alias) | `enhance:<user>` | 12 / min | `RATE_LIMIT_CREATE_MAX` |
+| `POST /v1/worlds/{id}:retry` | `retry:<user>` | 12 / min | `RATE_LIMIT_CREATE_MAX` |
 | Failed authentications | `<ip>` | 20 / min | `AUTH_FAIL_MAX` |
 
 Window: `RATE_LIMIT_WINDOW_MS` (default `60000`).

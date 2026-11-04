@@ -69,6 +69,8 @@ function makeDb(writes: Write[]) {
         },
       }),
       transaction: async <T>(fn: (tx: unknown) => Promise<T>): Promise<T> => fn(build(true)),
+      // budgetFits' SUM (enhance's advisory credit check): nothing spent.
+      execute: async () => ({ rows: [{ total: 0 }] }),
     };
     return handle;
   };

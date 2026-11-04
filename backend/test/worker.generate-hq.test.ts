@@ -11,19 +11,20 @@ import type { WorldGenProvider } from '../src/provider/index.js';
 // writes onto the world row, and what the enhance flow depends on the client
 // seeing afterwards.
 
-// DAILY_CREDIT_BUDGET is set to the PRODUCTION value here on purpose. The
-// default (500) is smaller than one marble-1.1 generation (1500), so on a
-// default-configured deployment every enhance dies in reserveCredits before it
-// reaches the provider — see the budget-exceeded test below.
+// DAILY_CREDIT_BUDGET is set to the PRODUCTION value (now also the default).
+// A budget below one marble-1.1 generation (1500) makes every enhance die in
+// reserveCredits before it reaches the provider — see the budget-exceeded test.
 const config = loadConfig({
   DATABASE_URL: 'postgres://u:p@localhost:5432/db',
   DEV_AUTH_TOKEN: 't',
   DAILY_CREDIT_BUDGET: '2000',
 } as NodeJS.ProcessEnv);
 
-const defaultBudgetConfig = loadConfig({
+// The pre-R18 default, smaller than one HQ.
+const tooSmallBudgetConfig = loadConfig({
   DATABASE_URL: 'postgres://u:p@localhost:5432/db',
   DEV_AUTH_TOKEN: 't',
+  DAILY_CREDIT_BUDGET: '500',
 } as NodeJS.ProcessEnv);
 
 function fakeWorld(overrides: Partial<World> = {}): World {
@@ -163,13 +164,12 @@ describe('generate_hq finalize', () => {
 
   it('a budget that cannot fit marble-1.1 fails the job before the provider is called', async () => {
     const sink: Sink = { updates: [], pushes: [] };
-    const deps = makeDeps(makeDb(fakeWorld(), sink), sink, defaultBudgetConfig);
+    const deps = makeDeps(makeDb(fakeWorld(), sink), sink, tooSmallBudgetConfig);
 
-    // DAILY_CREDIT_BUDGET defaults to 500 and one HQ generation costs 1500, so
-    // an unconfigured deployment refuses EVERY enhance here. BudgetExceededError
-    // is non-retryable: handleJobError parks the job dead and flips the world to
-    // `failed_generating_hq`. Worth a test because the failure is silent from the
-    // API's point of view — the enhance call itself returned 200.
+    // A 500 budget (the old default) cannot fit one 1500-credit HQ generation.
+    // BudgetExceededError is non-retryable: handleJobError parks the job dead
+    // and flips the world to `failed_generating_hq`. The API's advisory
+    // budgetFits check usually refuses first; this is the authoritative guard.
     await expect(processJob(deps, hqJob)).rejects.toThrow(/daily credit budget exceeded/);
     expect(deps.provider.generateWorld).not.toHaveBeenCalled();
     expect(sink.updates.some((u) => u.patch['status'] === 'complete')).toBe(false);

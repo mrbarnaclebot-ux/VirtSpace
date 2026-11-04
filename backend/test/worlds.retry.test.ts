@@ -45,6 +45,7 @@ interface DbState {
   inserts: { table: unknown; vals: Record<string, unknown> }[];
   quotaCharges: number;
   quotaAllowed: boolean;
+  creditsSpentToday: number;
 }
 
 /**
@@ -97,8 +98,11 @@ function makeFakeDb(state: DbState) {
         },
       }),
     }),
-    // chargeScanQuota's single statement.
-    execute: async () => {
+    // budgetFits' SUM over credit_events, or chargeScanQuota's single statement.
+    execute: async (q: SQL) => {
+      if (dialect.sqlToQuery(q).sql.includes('credit_events')) {
+        return { rows: [{ total: state.creditsSpentToday }] };
+      }
       state.quotaCharges += 1;
       const reset = new Date('2026-07-13T10:00:00Z');
       return {
@@ -109,19 +113,19 @@ function makeFakeDb(state: DbState) {
   return db;
 }
 
-async function makeApp(state: DbState) {
+async function makeApp(state: DbState, cfg = config) {
   currentDb = makeFakeDb(state);
   const app = Fastify();
   app.addHook('preHandler', async (req) => {
     (req as { userId?: string }).userId = 'user-1';
   });
-  worldsRoutes(app, { config, storage: {} as StorageDriver });
+  worldsRoutes(app, { config: cfg, storage: {} as StorageDriver });
   await app.ready();
   return app;
 }
 
 function freshState(world: World | undefined, quotaAllowed = true): DbState {
-  return { world, inserts: [], quotaCharges: 0, quotaAllowed };
+  return { world, inserts: [], quotaCharges: 0, quotaAllowed, creditsSpentToday: 0 };
 }
 
 describe('POST /v1/worlds/{id}:retry', () => {
@@ -223,12 +227,37 @@ describe('POST /v1/worlds/{id}:retry', () => {
     const res = await app.inject({ method: 'POST', url: URL });
 
     expect(res.statusCode).toBe(429);
-    expect(res.json().error).toBe('daily_scan_quota_exceeded');
+    expect(res.json().error).toBe('scan_quota_exceeded');
     expect(res.json().retry_at).toBe('2026-07-13T10:00:00.000Z');
     expect(state.world!.status).toBe('failed_generating_draft');
     expect(state.inserts).toHaveLength(0);
     await app.close();
   });
+
+  it.each([
+    ['failed_generating_draft', 1900], // 1900 + 150 > 2000
+    ['failed_generating_hq', 600], // 600 + 1500 > 2000
+  ] as const)(
+    '%s over the daily credit budget → 429 credit_budget_exceeded, no flip, no scan charged',
+    async (status, spent) => {
+      const live = loadConfig({
+        DATABASE_URL: 'postgres://u:p@localhost:5432/db',
+        DEV_AUTH_TOKEN: 't',
+        PROVIDER_MODE: 'live',
+        DAILY_CREDIT_BUDGET: '2000',
+      } as NodeJS.ProcessEnv);
+      const state = { ...freshState(fakeWorld(status)), creditsSpentToday: spent };
+      const app = await makeApp(state, live);
+      const res = await app.inject({ method: 'POST', url: URL });
+
+      expect(res.statusCode).toBe(429);
+      expect(res.json().error).toBe('credit_budget_exceeded');
+      expect(state.world!.status).toBe(status);
+      expect(state.inserts).toHaveLength(0);
+      expect(state.quotaCharges).toBe(0);
+      await app.close();
+    },
+  );
 
   it("someone else's (or a deleted) world → 404, nothing written", async () => {
     const state = freshState(undefined);

@@ -5,6 +5,8 @@ import { getDb } from '../db/client.js';
 import { captures, worlds, type JobKind, type World } from '../db/schema.js';
 import { enqueue } from '../queue.js';
 import { chargeScanQuota, releaseScanQuota, type QuotaChargeResult } from '../quota.js';
+import { budgetFits } from '../budget.js';
+import type { WorldModel } from '../provider/types.js';
 import { MAX_DEPTH_BYTES, MAX_FRAME_BYTES, type StorageDriver } from '../storage/index.js';
 import { depthKeyName } from '../depth.js';
 import type { RouteDeps } from './deps.js';
@@ -47,7 +49,7 @@ const RETRY_PATH = '/v1/worlds/:id(^[^:]+)::retry';
  */
 const RETRY_PLANS: Record<
   string,
-  { to: string; kind: JobKind; ready: (w: World) => boolean }
+  { to: string; kind: JobKind; model?: WorldModel; ready: (w: World) => boolean }
 > = {
   // Same transition frames:done already allows from failed_stitch.
   failed_stitch: { to: 'stitching', kind: 'stitch', ready: () => true },
@@ -55,12 +57,14 @@ const RETRY_PLANS: Record<
   failed_generating_draft: {
     to: 'generating_draft',
     kind: 'generate_draft',
+    model: 'marble-1.0-draft',
     ready: (w) => w.panoUrl !== null,
   },
   // Enhance requires draft_ready, i.e. a finished draft world (and its pano).
   failed_generating_hq: {
     to: 'generating_hq',
     kind: 'generate_hq',
+    model: 'marble-1.1',
     ready: (w) => w.panoUrl !== null && w.draftWorldId !== null,
   },
 };
@@ -75,11 +79,26 @@ class ScanQuotaRefused extends Error {
   }
 }
 
-/** The 429 for a refused scan-quota charge (create and draft retry). */
+/**
+ * The two cost refusals are both 429 but distinct codes (spec §7.1 error codes):
+ * the per-user scan quota (create, draft retry) and the deployment-wide daily
+ * credit budget (enhance, generation retries). `message` is short display copy.
+ */
 function sendScanQuotaExceeded(reply: FastifyReply, charge: QuotaChargeResult) {
   return reply.code(429).send({
-    error: 'daily_scan_quota_exceeded',
+    error: 'scan_quota_exceeded',
+    message: 'Daily scan limit reached.',
     retry_at: charge.resetAt,
+  });
+}
+
+function sendCreditBudgetExceeded(reply: FastifyReply) {
+  const now = new Date();
+  return reply.code(429).send({
+    error: 'credit_budget_exceeded',
+    message: "Today's generation budget is used up.",
+    // The budget day is the UTC day (budget.ts).
+    retry_at: new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1)),
   });
 }
 
@@ -586,6 +605,9 @@ export function worldsRoutes(app: FastifyInstance, deps: RouteDeps): void {
         .code(409)
         .send({ error: 'not_enhanceable', status: world.status });
     }
+    // Refuse up front when one HQ cannot fit today's budget, instead of flipping
+    // to generating_hq and having the worker fail it (advisory; see budgetFits).
+    if (!(await budgetFits(db, config, 'marble-1.1'))) return sendCreditBudgetExceeded(reply);
 
     // The status flip IS the admission control, so it must be the same statement
     // as the check (same pattern as chargeScanQuota / finalizeStitch). The old
@@ -649,8 +671,9 @@ export function worldsRoutes(app: FastifyInstance, deps: RouteDeps): void {
   // for; it is bounded the same way the original action was: a draft retry
   // charges one scan against the daily scan quota (like the create that paid for
   // the first draft), and every generation reserves credits against
-  // DAILY_CREDIT_BUDGET in the worker exactly as the original job did. A stitch
-  // retry charges nothing, like frames:done from failed_stitch.
+  // DAILY_CREDIT_BUDGET in the worker exactly as the original job did (plus the
+  // same advisory up-front budget check enhance makes). A stitch retry charges
+  // nothing, like frames:done from failed_stitch.
   //
   // Own rate-limit key, same bucket size as create / enhance (cost bucket).
   app.post<{ Params: { id: string } }>(
@@ -677,6 +700,10 @@ export function worldsRoutes(app: FastifyInstance, deps: RouteDeps): void {
       const plan = RETRY_PLANS[world.status];
       if (!plan || !plan.ready(world)) {
         return reply.code(409).send({ error: 'not_retryable', status: world.status });
+      }
+      // Same advisory budget check as enhance, for both generation retries.
+      if (plan.model && !(await budgetFits(db, config, plan.model))) {
+        return sendCreditBudgetExceeded(reply);
       }
 
       let flipped: { world: World; jobId: string } | null;

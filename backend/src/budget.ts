@@ -1,6 +1,8 @@
 import { sql } from 'drizzle-orm';
+import type { Config } from './config.js';
 import type { Db } from './db/client.js';
 import { creditEvents } from './db/schema.js';
+import { creditsForModel, type WorldModel } from './provider/types.js';
 
 // Daily credit budget guard (spec §14). A world:generate call spends real money;
 // we cap total credits spent per calendar day (DAILY_CREDIT_BUDGET). A single
@@ -55,24 +57,7 @@ export async function reserveCredits(
   await db.transaction(async (tx) => {
     // Serialize budget checks across workers for the duration of this txn.
     await tx.execute(sql`SELECT pg_advisory_xact_lock(${BUDGET_LOCK_KEY})`);
-
-    // The day window is pinned to UTC. `date_trunc('day', now())` follows the
-    // session's TimeZone, so the budget would reset at whatever local midnight
-    // the connection happened to inherit — and two connections with different
-    // TimeZone settings would disagree about which day a charge belongs to.
-    //
-    // `AT TIME ZONE 'UTC'` twice is deliberate, not redundant: the first
-    // converts timestamptz -> naive UTC wall time so date_trunc cuts on the UTC
-    // day, the second converts that naive midnight back to a timestamptz. Drop
-    // the second and Postgres would re-interpret midnight in the SESSION zone,
-    // reintroducing exactly the bug this fixes.
-    const res = await tx.execute<{ total: string | number | null }>(sql`
-      SELECT COALESCE(SUM(amount), 0) AS total
-      FROM credit_events
-      WHERE created_at >= (date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')
-    `);
-    const rows = (res as unknown as { rows: { total: string | number | null }[] }).rows;
-    const spentToday = Number(rows[0]?.total ?? 0);
+    const spentToday = await creditsSpentToday(tx);
 
     if (wouldExceedBudget(spentToday, amount, budget)) {
       throw new BudgetExceededError(amount, spentToday, budget);
@@ -83,6 +68,43 @@ export async function reserveCredits(
       worldId: worldId ?? null,
     });
   });
+}
+
+/** Sum of today's (UTC) credit_events — reservations minus releases. */
+export async function creditsSpentToday(db: Pick<Db, 'execute'>): Promise<number> {
+  // The day window is pinned to UTC. `date_trunc('day', now())` follows the
+  // session's TimeZone, so the budget would reset at whatever local midnight
+  // the connection happened to inherit — and two connections with different
+  // TimeZone settings would disagree about which day a charge belongs to.
+  //
+  // `AT TIME ZONE 'UTC'` twice is deliberate, not redundant: the first
+  // converts timestamptz -> naive UTC wall time so date_trunc cuts on the UTC
+  // day, the second converts that naive midnight back to a timestamptz. Drop
+  // the second and Postgres would re-interpret midnight in the SESSION zone,
+  // reintroducing exactly the bug this fixes.
+  const res = await db.execute<{ total: string | number | null }>(sql`
+    SELECT COALESCE(SUM(amount), 0) AS total
+    FROM credit_events
+    WHERE created_at >= (date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')
+  `);
+  const rows = (res as unknown as { rows: { total: string | number | null }[] }).rows;
+  return Number(rows[0]?.total ?? 0);
+}
+
+/**
+ * Advisory API-side check (spec §10 R18): would one `model` generation still fit
+ * today's budget? Lets enhance / :retry answer `429 credit_budget_exceeded` up
+ * front instead of flipping the world and having the worker fail it a moment
+ * later. NOT the guard — it takes no lock and reserves nothing; reserveCredits
+ * in the worker stays authoritative. Mock mode costs 0, like MockProvider.
+ */
+export async function budgetFits(
+  db: Pick<Db, 'execute'>,
+  config: Pick<Config, 'PROVIDER_MODE' | 'DAILY_CREDIT_BUDGET'>,
+  model: WorldModel,
+): Promise<boolean> {
+  const cost = config.PROVIDER_MODE === 'mock' ? 0 : creditsForModel(model);
+  return !wouldExceedBudget(await creditsSpentToday(db), cost, config.DAILY_CREDIT_BUDGET);
 }
 
 /**

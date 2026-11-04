@@ -76,6 +76,8 @@ interface DbState {
   inserts: { table: unknown; vals: Record<string, unknown> }[];
   /** Thrown by the world SELECT — models a Postgres 22P02 on a non-uuid id. */
   selectError?: unknown;
+  /** What budgetFits reads as today's spend. */
+  creditsSpentToday?: number;
 }
 
 /**
@@ -126,18 +128,20 @@ function makeFakeDb(state: DbState) {
         },
       }),
     }),
+    // budgetFits' SUM over today's credit_events.
+    execute: async () => ({ rows: [{ total: state.creditsSpentToday ?? 0 }] }),
   };
   return db;
 }
 
-async function makeApp(state: DbState) {
+async function makeApp(state: DbState, cfg = config) {
   currentDb = makeFakeDb(state);
   const app = Fastify();
   // Stand-in for the auth preHandler: attach the owner's user id.
   app.addHook('preHandler', async (req) => {
     (req as { userId?: string }).userId = 'user-1';
   });
-  worldsRoutes(app, { config, storage });
+  worldsRoutes(app, { config: cfg, storage });
   await app.ready();
   return app;
 }
@@ -222,6 +226,30 @@ describe('POST /v1/worlds/{id}:enhance', () => {
       error: 'not_enhanceable',
       status: 'generating_draft',
     });
+    expect(state.updates).toHaveLength(0);
+    expect(state.inserts).toHaveLength(0);
+    await app.close();
+  });
+
+  it('an HQ that cannot fit today\'s credit budget → 429 credit_budget_exceeded, no flip', async () => {
+    const live = loadConfig({
+      DATABASE_URL: 'postgres://u:p@localhost:5432/db',
+      DEV_AUTH_TOKEN: 't',
+      PROVIDER_MODE: 'live',
+      DAILY_CREDIT_BUDGET: '2000',
+    } as NodeJS.ProcessEnv);
+    const state: DbState = { ...freshState(), creditsSpentToday: 600 }; // 600 + 1500 > 2000
+    const app = await makeApp(state, live);
+    const res = await app.inject({ method: 'POST', url: COLON_URL });
+
+    expect(res.statusCode).toBe(429);
+    expect(res.json()).toMatchObject({
+      error: 'credit_budget_exceeded',
+      message: expect.any(String),
+      retry_at: expect.any(String),
+    });
+    // Distinct from the per-user scan quota code.
+    expect(res.json().error).not.toBe('scan_quota_exceeded');
     expect(state.updates).toHaveLength(0);
     expect(state.inserts).toHaveLength(0);
     await app.close();

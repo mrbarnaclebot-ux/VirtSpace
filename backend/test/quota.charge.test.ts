@@ -180,7 +180,8 @@ describe('POST /v1/worlds quota enforcement', () => {
 
     expect(res.statusCode).toBe(429);
     expect(res.json()).toEqual({
-      error: 'daily_scan_quota_exceeded',
+      error: 'scan_quota_exceeded',
+      message: 'Daily scan limit reached.',
       retry_at: resetAt.toISOString(),
     });
     await app.close();

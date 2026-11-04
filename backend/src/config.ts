@@ -50,7 +50,10 @@ const baseSchema = z.object({
   // Byte ceiling per downloaded asset, enforced while streaming (default 200 MB).
   WORLDLABS_ASSET_MAX_BYTES: numberFromEnv(200 * 1024 * 1024),
 
-  DAILY_CREDIT_BUDGET: numberFromEnv(500),
+  // 2000 = one marble-1.1 HQ (1500) plus a few 150-credit drafts. The old 500
+  // could not fit a single HQ, so an unconfigured deployment refused every
+  // enhance (spec §10 R18). Matches production.
+  DAILY_CREDIT_BUDGET: numberFromEnv(2000),
   DAILY_SCAN_QUOTA: numberFromEnv(10),
 
   // Worker loop poll interval (ms) between empty claim attempts (Stage 2).
