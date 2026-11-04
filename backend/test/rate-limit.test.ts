@@ -238,3 +238,72 @@ describe('rateLimitKey', () => {
     expect(rateLimitKey({ ip: '1.2.3.4' } as FastifyRequest)).toBe('ip:1.2.3.4');
   });
 });
+
+describe('client IP behind the edge proxy (TRUST_PROXY_HOPS)', () => {
+  // Regression: without trustProxy every request behind Railway's edge had the
+  // proxy's req.ip, so all clients shared ONE auth-fail and per-IP bucket. Built
+  // through the real buildServer so the production Fastify options are tested.
+  const PROXY = '10.0.0.1';
+  const via = (client: string) => ({
+    remoteAddress: PROXY,
+    headers: { 'x-forwarded-for': client, authorization: 'Bearer wrong' },
+  });
+
+  async function makeServer(env: Record<string, string> = {}) {
+    const { buildServer } = await import('../src/server.js');
+    return buildServer(
+      loadConfig({ ...baseEnv, AUTH_FAIL_MAX: '2', RATE_LIMIT_IP_MAX: '2', ...env } as NodeJS.ProcessEnv),
+    );
+  }
+
+  it('gives each forwarded client its own auth-fail bucket', async () => {
+    const app = await makeServer();
+    const a = via('203.0.113.1');
+    expect((await app.inject({ url: '/v1/worlds', ...a })).statusCode).toBe(401);
+    expect((await app.inject({ url: '/v1/worlds', ...a })).statusCode).toBe(401);
+    expect((await app.inject({ url: '/v1/worlds', ...a })).statusCode).toBe(429);
+
+    // Same proxy, different client: not locked out by client A's failures.
+    const b = via('203.0.113.2');
+    expect((await app.inject({ url: '/v1/worlds', ...b })).statusCode).toBe(401);
+    await app.close();
+  });
+
+  it('gives each forwarded client its own per-IP rate-limit bucket', async () => {
+    const app = await makeServer();
+    const a = { remoteAddress: PROXY, headers: { 'x-forwarded-for': '203.0.113.1' } };
+    expect((await app.inject({ url: '/healthz', ...a })).statusCode).toBe(200);
+    expect((await app.inject({ url: '/healthz', ...a })).statusCode).toBe(200);
+    expect((await app.inject({ url: '/healthz', ...a })).statusCode).toBe(429);
+
+    const b = { remoteAddress: PROXY, headers: { 'x-forwarded-for': '203.0.113.2' } };
+    expect((await app.inject({ url: '/healthz', ...b })).statusCode).toBe(200);
+    await app.close();
+  });
+
+  it('trusts only the configured hop, so a client cannot pick its own bucket', async () => {
+    const app = await makeServer();
+    app.get('/ip', async (req) => ({ ip: req.ip }));
+    // The leftmost entry is whatever the client sent; the edge appends the real one.
+    const res = await app.inject({
+      url: '/ip',
+      remoteAddress: PROXY,
+      headers: { 'x-forwarded-for': '6.6.6.6, 203.0.113.1' },
+    });
+    expect(res.json().ip).toBe('203.0.113.1');
+    await app.close();
+  });
+
+  it('TRUST_PROXY_HOPS=0 falls back to the socket address', async () => {
+    expect(loadConfig({ ...baseEnv } as NodeJS.ProcessEnv).TRUST_PROXY_HOPS).toBe(1);
+    const app = await makeServer({ TRUST_PROXY_HOPS: '0' });
+    app.get('/ip', async (req) => ({ ip: req.ip }));
+    const res = await app.inject({
+      url: '/ip',
+      remoteAddress: PROXY,
+      headers: { 'x-forwarded-for': '203.0.113.1' },
+    });
+    expect(res.json().ip).toBe(PROXY);
+    await app.close();
+  });
+});

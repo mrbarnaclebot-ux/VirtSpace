@@ -8,9 +8,20 @@ import { registerRoutes } from './routes/index.js';
 // Build a fully-wired Fastify instance. Does NOT connect to Postgres — the DB
 // pool is created lazily on first query (see db/client.ts), so boot and
 // /healthz work without a live database (task requirement 10).
-export async function buildServer(): Promise<FastifyInstance> {
-  const config = getConfig();
-  const app = Fastify({ logger: true });
+export async function buildServer(config = getConfig()): Promise<FastifyInstance> {
+  // Without trustProxy, behind Railway's edge every req.ip is the proxy's
+  // address: all clients shared one rate-limit/auth-fail bucket, so 20 bad
+  // tokens from anyone locked everyone out.
+  //
+  // A function, not the number: Fastify >= 5.12 makes a numeric trustProxy
+  // fail closed (trusts nothing), because a hop count cannot tell the edge from
+  // a direct client. That is safe here only because the container is reachable
+  // solely through Railway's edge. proxy-addr calls this with i = 0 for the
+  // socket peer, then 1.. walking X-Forwarded-For right to left.
+  // ponytail: hop count assumed 1 (Railway edge); confirm once against
+  // production req.ips. Upgrade path: trust the edge's CIDR (a string) instead.
+  const hops = config.TRUST_PROXY_HOPS;
+  const app = Fastify({ logger: true, trustProxy: (_addr: string, i: number) => i < hops });
   installErrorHandler(app);
   const storage = createStorage(config);
   await registerRoutes(app, { config, storage });

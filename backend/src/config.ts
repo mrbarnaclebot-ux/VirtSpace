@@ -66,6 +66,11 @@ const baseSchema = z.object({
   RATE_LIMIT_CREATE_MAX: numberFromEnv(12),
   // FAILED authentications per IP per window before that IP is refused outright.
   AUTH_FAIL_MAX: numberFromEnv(20),
+  // Reverse-proxy hops in front of the API (Railway's edge = 1). req.ip — the
+  // key for the per-IP buckets above — is taken that many hops from the right
+  // of X-Forwarded-For. A hop count, not `true`: trusting the whole header lets
+  // a client pick its own IP by prepending to it. 0 = no proxy (use the socket).
+  TRUST_PROXY_HOPS: numberFromEnv(1),
 
   // Graceful shutdown budget (spec §10 R10). The API uses it as a hard ceiling
   // on draining in-flight HTTP requests; the worker as the deadline it gives the
