@@ -20,6 +20,8 @@ struct ProgressSphereView: View {
     /// Index of the target being aimed at (highlighted facet), if any.
     let currentIndex: Int?
 
+    private var capturedCount: Int { capturedFlags.lazy.filter { $0 }.count }
+
     var body: some View {
         HStack(spacing: 10) {
             Canvas { context, size in
@@ -27,9 +29,11 @@ struct ProgressSphereView: View {
             }
             .frame(width: 58, height: 58)
 
-            Text("\(capturedFlags.lazy.filter { $0 }.count)/\(capturedFlags.count)")
+            Text("\(capturedCount) of \(capturedFlags.count)")
                 .font(.footnote.weight(.semibold).monospacedDigit())
                 .foregroundStyle(.white.opacity(0.85))
+                .contentTransition(.numericText())
+                .animation(Theme.Motion.quick, value: capturedCount)
         }
     }
 
