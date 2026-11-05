@@ -50,6 +50,7 @@ struct VirtSpaceApp: App {
     @State private var toasts = ToastCenter()
     @State private var worldStore: WorldStore
     @State private var router = AppRouter()
+    @State private var onboarding = OnboardingStore()
 
     init() {
         let api = APIClient()
@@ -64,7 +65,17 @@ struct VirtSpaceApp: App {
                 .environment(toasts)
                 .environment(worldStore)
                 .environment(router)
+                .environment(onboarding)
                 .onAppear { ToastWindow.install(toasts) }
+                // Uploads are refused until the current terms are accepted
+                // (UploadManager's consent guard). When the terms version was
+                // bumped with a scan still waiting on disk, agreeing restarts
+                // it right away instead of at the next launch.
+                .onChange(of: onboarding.hasCurrentConsent) { _, hasConsent in
+                    if hasConsent, !TestEnvironment.isRunningUnderXCTest {
+                        UploadManager.shared.kickResume(api: apiClient)
+                    }
+                }
         }
         // Completion kick (launch + every return to foreground): finish any
         // pending session whose manifest shows createdWorldId + all frames
