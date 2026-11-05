@@ -22,6 +22,10 @@
 //  flows still never double-upload the same session, but a stuck session can
 //  no longer block a different one, or a retry.
 //
+//  Consent (spec-doc R32, ui-spec 5): every kick that sends data refuses to
+//  start without current terms consent. The onboarding cover already blocks
+//  the Scan tab; this guard is the backstop for launch and resume kicks.
+//
 
 import Foundation
 import OSLog
@@ -30,7 +34,22 @@ import OSLog
 final class UploadManager {
     static let shared = UploadManager()
 
-    private init() {}
+    private let hasConsent: @MainActor () -> Bool
+
+    /// The app uses `shared`; tests build their own with a fake consent check.
+    init(hasConsent: @escaping @MainActor () -> Bool = { OnboardingStore.hasCurrentConsent() }) {
+        self.hasConsent = hasConsent
+    }
+
+    /// Copy for an upload refused by the consent guard.
+    static let consentMissingMessage = "Agree to the terms of use to upload your scan."
+
+    /// True (and logged) when `flow` must not run: no current consent.
+    private func consentMissing(_ flow: String) -> Bool {
+        guard !hasConsent() else { return false }
+        AppLog.upload.notice("UploadManager: \(flow, privacy: .public) refused, terms not accepted")
+        return true
+    }
 
     // MARK: - Kicks (safe to call from any view; never cancelled by views)
 
@@ -42,7 +61,10 @@ final class UploadManager {
         api: APIClient,
         progress: @escaping (Int) -> Void = { _ in }
     ) -> Task<Result<World, Error>, Never> {
-        enqueue {
+        if consentMissing("upload") {
+            return Task { .failure(APIError.localState(Self.consentMissingMessage)) }
+        }
+        return enqueue {
             AppLog.upload.log("UploadManager: upload flow started for session \(result.sessionID.uuidString, privacy: .public)")
             do {
                 let world = try await CaptureUploader(api: api).upload(result: result, progress: progress)
@@ -68,7 +90,10 @@ final class UploadManager {
         userInitiated: Bool = false,
         progress: @escaping (Int) -> Void = { _ in }
     ) -> Task<ResumeOutcome, Never> {
-        enqueue {
+        if consentMissing("resume") {
+            return Task { .deferred(reason: "the terms of use are not accepted yet") }
+        }
+        return enqueue {
             AppLog.upload.log("UploadManager: resume flow started (userInitiated: \(userInitiated))")
             let uploader = CaptureUploader(api: api)
             // Cheap idempotent recovery for the exact stranded state first.
@@ -102,7 +127,8 @@ final class UploadManager {
     /// frame PUT and frames:done.
     @discardableResult
     func kickStrandedRecovery(api: APIClient) -> Task<Int, Never> {
-        enqueue {
+        if consentMissing("stranded recovery") { return Task { 0 } }
+        return enqueue {
             await CaptureUploader(api: api).completeStrandedSessions()
         }
     }
