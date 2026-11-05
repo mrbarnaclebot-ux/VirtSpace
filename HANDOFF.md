@@ -4,7 +4,57 @@ Read this first next session, then `CLAUDE.md` and `spec-doc.md` §10 (ledger **
 
 ## State in one paragraph
 
-Everything is on `main` (`1bb34ff`+) and the backend is **deployed** (api + worker, 2026-11-05). Migrations now run automatically before each api deploy (`preDeploy: node dist/migrate.js` over `MIGRATE_DATABASE_URL`, the direct Neon host). The full UI redesign (WP1-WP5 from `docs/design/ui-spec.md`) is merged and a Debug build of `main` with production Secrets is installed on the owner's iPhone 17 Pro; nothing in the redesign has been walked through on the device yet. Login (R24) is deliberately deferred until the main features work as intended.
+Everything is on `main` (`2f3ddf2`+) and the backend is **deployed** (api + worker, 2026-11-05). Migrations now run automatically before each api deploy (`preDeploy: node dist/migrate.js` over `MIGRATE_DATABASE_URL`, the direct Neon host). The full UI redesign (WP1-WP5 from `docs/design/ui-spec.md`) is merged and a Debug build of `main` with production Secrets is installed on the owner's iPhone 17 Pro; nothing in the redesign has been walked through on the device yet. Login (R24) is deliberately deferred until the main features work as intended.
+
+## Resume here: capture direction (paused 2026-11-05, owner will continue)
+
+**Product goal (owner):** brokers and agents scan a room, then a whole house or floor, and buyers or renters walk it in 3D on a future web listings page. **Room first:** a clean 3D room you can walk around. Multi-room comes after.
+
+**Finding:**
+- World Labs Marble *generates* from one pano: invented outside the spot, one viewpoint, not faithful enough for listings.
+- Faithful tours need **reconstruction** from a walk-through capture (frames plus ARKit poses, plus depth).
+- The renderer does not fix this.
+- Full write-up with sources: `docs/research/reconstruction-vs-generation.md` (builds on `docs/research/live-mapping.md`).
+
+**PlayCanvas** (MIT engine, SuperSplat, supersplat-viewer, splat-transform):
+- Display only; no reconstruction.
+- Candidate for the web listings viewer later: walk mode, hotspots, collision, streamed SOG LOD.
+- Keep Spark in the app; first trial Spark's own LoD/paging (about 1 day).
+
+**SpAItial (Echo-3)** is the leading capture provider:
+- **Keys:** the owner's API key and webhook secret are in local `.env` as `spAItial_api_key` / `spAItial_api_secret`. The format is `key = value` with spaces, so parse accordingly. They are not on Railway yet.
+- **What our key has:** `echo-2` and `echo-hq` only. Both are generative from a single image or pano.
+- **Capture API:**
+  - flow: `POST /v1/captures` → `upload-urls` → `complete` → `process`;
+  - inputs: an iOS frame bundle (`images/Image_NNNNNN.jpg` plus `cameras/camera_trajectory.json`, `camera_intrinsics.json`, `orientation.json`, up to 5,000 frames) or an unposed video (5-600 s);
+  - price: 300 credits/min, 900 minimum (about $9 for a room);
+  - outputs: SPZ/SOG/PLY plus collision mesh plus floorplan.
+- **Blocked:** it is **not enabled** for our key (`process-quote` says "Contact support"). The bundle JSON schemas are not public.
+- **Spend so far:** 0 credits. Only free GET calls were made; the OpenAPI spec is at `https://api.spaitial.ai/v1/openapi.json`.
+
+**Proposed plan (awaiting owner answers):**
+1. **Owner:** scan one room for 3+ minutes in SpAItial's own iPhone app (about $9-16 of credits; the free 800 doesn't cover the 900 minimum) and judge the walk-around quality.
+2. **Owner:** email SpAItial support to enable Echo-3 for the API, and ask for:
+   - the price;
+   - the bundle schemas;
+   - the frame rate and resolution;
+   - whether LiDAR depth is accepted;
+   - data terms for private homes.
+
+   The orchestrator offered to draft this email.
+3. **Agents**, in mock mode with no credits:
+   - **iOS:** a "Room scan" capture mode: walk the room edge for about 3 minutes, keyframes plus ARKit poses plus intrinsics, with coverage guidance.
+   - **Backend:** an `echo-3` capture provider behind `WorldGenProvider`. Quote first, persist `capture_id`/request id before `process`, use Idempotency-Keys, never retry blind, and verify webhooks with HMAC.
+   - **Viewer:** load the SPZ. Its RDF y-down orientation takes the same flip as Marble. Use the `mesh-simplified` export as the walk collider.
+4. **Fallbacks:** Varjo Teleport API (about $16 a house), or a self-hosted gsplat/Brush on a GPU. Both are Apache-2.0; avoid the INRIA license. The same room-scan bundle feeds either.
+5. Whole house later: one longer capture per floor.
+
+**Open questions to the owner:**
+- Do the SpAItial-app room test first?
+- Draft the support email?
+- Start Room scan in mock mode now, or wait for the test?
+- Accept that Marble becomes "staging only", never the listing tour?
+- What per-house price can a broker carry: about $16 (Teleport) or $30-60 (Echo-3)?
 
 ## Owner's next steps (device)
 
@@ -22,7 +72,8 @@ Everything is on `main` (`1bb34ff`+) and the backend is **deployed** (api + work
 | Backend state + retry: R27 atomic flip+enqueue + claim attempts cap, `POST /v1/worlds/{id}:retry` (R42), distinct 429 codes (`scan_quota_exceeded`, `credit_budget_exceeded`), budget default 2000 | **yes** |
 | iOS robustness: R25 background uploads, R31 WebGL reload + Caches, R32 privacy manifest + fixture.spz out of Release, CaptureEngine split | on phone |
 | UI redesign WP1-WP5 (172 iOS tests): Theme tokens, ToastCenter, typed APIError, WorldStore + AppRouter, Library/Detail, onboarding + versioned consent gate, scan flow, viewers, Settings | on phone |
-| Docs: `docs/design/ui-spec.md`, `docs/research/live-mapping.md` | - |
+| Docs: `docs/design/ui-spec.md`, `docs/research/live-mapping.md`, `docs/research/reconstruction-vs-generation.md` | - |
+| Full-res splats made opt-in (Settings > 3D viewer > Maximum detail, off by default): full-res made movement choppy on the iPhone 17 Pro | on phone |
 
 **Pending owner decisions:** (1) whether a draft `:retry` charges a scan (currently yes); (2) viewer walk-radius limit; (3) the ~550-credit multi-station experiment (live-mapping research, option A); (4) raw-frame retention: keep until delete (current, stated in the terms) vs purge after N days (spec §13 promised purge-after-stitch, never implemented); (5) review the draft terms text in `Features/Onboarding/TermsView.swift` (`TermsOfUseView`); "only you can see your spaces" becomes true only with R24.
 
