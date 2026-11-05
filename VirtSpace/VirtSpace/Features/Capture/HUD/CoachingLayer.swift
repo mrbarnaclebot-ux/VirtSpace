@@ -4,9 +4,12 @@
 //
 //  Top-center coaching banners (spec §6.1: parallax coaching + graceful
 //  degraded-tracking handling). One banner at a time, priority-ordered:
-//    tracking degraded > drift hard-warn > drift soft-warn > exposure notice.
-//  Sticky banners (tracking, hard drift) stay while the condition holds;
-//  soft banners auto-dismiss and cool down; the exposure notice shows once.
+//    tracking > thermal > drift hard-warn > first-scan tip > drift soft-warn
+//    > exposure notice.
+//  Sticky banners (tracking, thermal, hard drift, the first-scan tip) stay
+//  while the condition holds; soft banners auto-dismiss and cool down; the
+//  exposure notice shows once. Hard drift plays a warning haptic once per
+//  episode (ui-spec 2.5).
 //
 
 import SwiftUI
@@ -18,6 +21,8 @@ struct CoachingBanner: Equatable, Identifiable {
         case driftHard
         case driftSoft
         case exposure
+        /// A first-scan coaching tip (FirstScanCoach times it out).
+        case coach
     }
 
     let kind: Kind
@@ -31,7 +36,10 @@ struct CoachingBanner: Equatable, Identifiable {
 
 struct CoachingLayer: View {
     let hud: CaptureHUDState
+    /// Banner text of the current first-scan tip, if any.
+    var coachTip: String?
 
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var banner: CoachingBanner?
     @State private var softDriftCooldownUntil = Date.distantPast
     @State private var exposureNoticeConsumed = false
@@ -45,6 +53,7 @@ struct CoachingLayer: View {
         let thermalWarming: Bool
         let driftTier: Int // 0 none, 1 soft, 2 hard
         let wantsExposureNotice: Bool
+        let coachTip: String?
     }
 
     private var conditions: Conditions {
@@ -53,7 +62,8 @@ struct CoachingLayer: View {
             thermalWarming: ThermalGovernor.showsWarmingBanner(for: hud.thermalState),
             driftTier: hud.driftMeters > AlignmentMath.driftHardWarnMeters ? 2
                 : (hud.driftMeters > AlignmentMath.driftWarnMeters ? 1 : 0),
-            wantsExposureNotice: hud.capturedCount > 0 && !hud.exposureLocked
+            wantsExposureNotice: hud.capturedCount > 0 && !hud.exposureLocked,
+            coachTip: coachTip
         )
     }
 
@@ -71,10 +81,9 @@ struct CoachingLayer: View {
                 }
                 .padding(.horizontal, 16)
                 .padding(.vertical, 11)
-                .background(.ultraThinMaterial, in: Capsule())
-                .overlay(Capsule().strokeBorder(banner.tint.opacity(0.45), lineWidth: 1))
+                .glassEffect(.regular, in: .capsule)
                 .padding(.horizontal, 24)
-                .transition(.move(edge: .top).combined(with: .opacity))
+                .transition(reduceMotion ? .opacity : .move(edge: .top).combined(with: .opacity))
                 .task(id: banner.id) {
                     guard !banner.isSticky else { return }
                     try? await Task.sleep(for: .seconds(3.2))
@@ -87,7 +96,10 @@ struct CoachingLayer: View {
                 }
             }
         }
-        .animation(.spring(response: 0.38, dampingFraction: 0.82), value: banner)
+        .animation(Theme.Motion.standard, value: banner)
+        .sensoryFeedback(.warning, trigger: banner?.kind) { old, new in
+            new == .driftHard && old != .driftHard
+        }
         .onChange(of: conditions, initial: true) { _, new in
             reevaluate(new)
         }
@@ -96,34 +108,8 @@ struct CoachingLayer: View {
     private func reevaluate(_ c: Conditions) {
         // Priority ladder. Sticky banners drop out the moment their
         // condition clears.
-        if let warning = c.trackingWarning {
-            banner = CoachingBanner(
-                kind: .tracking,
-                text: warning,
-                systemImage: "eye.trianglebadge.exclamationmark",
-                tint: .yellow,
-                isSticky: true
-            )
-            return
-        }
-        if c.thermalWarming {
-            banner = CoachingBanner(
-                kind: .thermal,
-                text: "Phone is warming up — normal during capture",
-                systemImage: "thermometer.medium",
-                tint: .orange,
-                isSticky: true
-            )
-            return
-        }
-        if c.driftTier == 2 {
-            banner = CoachingBanner(
-                kind: .driftHard,
-                text: "Hold the phone at your chest and turn around it",
-                systemImage: "figure.walk.motion",
-                tint: .orange,
-                isSticky: true
-            )
+        if let sticky = Self.stickyBanner(for: c) {
+            banner = sticky
             return
         }
         if c.driftTier == 1 {
@@ -131,9 +117,9 @@ struct CoachingLayer: View {
             if Date() >= softDriftCooldownUntil {
                 banner = CoachingBanner(
                     kind: .driftSoft,
-                    text: "Turn around the phone, not your body",
+                    text: "Keep the phone over the same spot",
                     systemImage: "arrow.trianglehead.2.clockwise.rotate.90",
-                    tint: .cyan,
+                    tint: Theme.accent,
                     isSticky: false
                 )
             } else if banner?.isSticky == true {
@@ -145,7 +131,7 @@ struct CoachingLayer: View {
             exposureNoticeConsumed = true
             banner = CoachingBanner(
                 kind: .exposure,
-                text: "Couldn't lock exposure — lighting may vary between shots",
+                text: "Lighting may change between photos. Avoid switching lights on or off.",
                 systemImage: "sun.max.trianglebadge.exclamationmark",
                 tint: .yellow,
                 isSticky: false
@@ -157,5 +143,22 @@ struct CoachingLayer: View {
         if banner?.isSticky == true {
             banner = nil
         }
+    }
+
+    /// The top four rungs: banners that stay up while their condition holds.
+    private static func stickyBanner(for c: Conditions) -> CoachingBanner? {
+        let rung: (CoachingBanner.Kind, String, String, Color)
+        if let warning = c.trackingWarning {
+            rung = (.tracking, warning, "eye.trianglebadge.exclamationmark", .yellow)
+        } else if c.thermalWarming {
+            rung = (.thermal, "Your phone is getting warm. That's normal.", "thermometer.medium", .orange)
+        } else if c.driftTier == 2 {
+            rung = (.driftHard, "You've moved. Step back to where you started.", "figure.walk.motion", .orange)
+        } else if let tip = c.coachTip {
+            rung = (.coach, tip, "hand.point.up.left", Theme.accent)
+        } else {
+            return nil
+        }
+        return CoachingBanner(kind: rung.0, text: rung.1, systemImage: rung.2, tint: rung.3, isSticky: true)
     }
 }
