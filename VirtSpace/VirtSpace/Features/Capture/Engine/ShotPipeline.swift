@@ -106,10 +106,8 @@ nonisolated final class ShotPipeline: @unchecked Sendable {
         let still: CapturedStill
         switch result {
         case .failure(let error):
-            return .failed(
-                index: index,
-                message: "Shot failed — hold on the target again (\(error.localizedDescription))"
-            )
+            AppLog.capture.error("Shot \(index + 1) failed: \(error.localizedDescription, privacy: .public)")
+            return .failed(index: index, message: Self.photoNotSavedMessage)
         case .success(let value):
             still = value
         }
@@ -128,10 +126,8 @@ nonisolated final class ShotPipeline: @unchecked Sendable {
         do {
             try store.saveFrame(still.jpegData, depthPNG: still.depth?.png, pose: pose, in: session)
         } catch {
-            return .saveFailed(
-                index: index,
-                message: "Couldn't save frame \(index + 1): \(error.localizedDescription)"
-            )
+            AppLog.capture.error("Couldn't save frame \(index + 1): \(error.localizedDescription, privacy: .public)")
+            return .saveFailed(index: index, message: Self.photoNotSavedMessage)
         }
         AppLog.capture.log("Shot \(index + 1)/\(totalTargets) saved")
 
@@ -183,6 +179,9 @@ nonisolated final class ShotPipeline: @unchecked Sendable {
         guard let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
         return UIImage(cgImage: cg)
     }
+
+    /// User copy for a shot that didn't land (ui-spec 6); detail goes to the log.
+    static let photoNotSavedMessage = "That photo didn't save. Hold still to try again."
 
     // MARK: - Haptics (feedback generators are main-actor only)
 

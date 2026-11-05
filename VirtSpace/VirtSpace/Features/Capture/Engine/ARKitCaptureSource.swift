@@ -307,17 +307,17 @@ nonisolated final class ARKitCaptureSource: NSObject, CaptureSource, ARSessionDe
         case .normal:
             return nil
         case .notAvailable:
-            return "Tracking unavailable"
+            return "Can't see the room. Point at something with detail."
         case .limited(.initializing):
             return "Getting ready…"
         case .limited(.excessiveMotion):
-            return "Slow down"
+            return "Turn more slowly"
         case .limited(.insufficientFeatures):
-            return "Too dark or too plain — try more light"
+            return "Too dark or too plain. Try more light."
         case .limited(.relocalizing):
-            return "Re-finding your space…"
+            return "Finding your place again…"
         case .limited:
-            return "Tracking limited"
+            return "Turn more slowly"
         }
     }
 }
