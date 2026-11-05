@@ -23,16 +23,26 @@ struct ContentView: View {
     @State private var tabRestored = false
 
     var body: some View {
-        Group {
-            if tabRestored {
-                tabs
-            } else {
-                Theme.bg.ignoresSafeArea().onAppear(perform: restoreTab)
+        ZStack {
+            Group {
+                if tabRestored {
+                    tabs
+                } else {
+                    Theme.bg.ignoresSafeArea().onAppear(perform: restoreTab)
+                }
+            }
+            .accessibilityHidden(!onboarding.hasCurrentConsent)
+            // A full-screen layer rather than a fullScreenCover: a cover
+            // cannot present while Settings (a sheet) is up, and Replay
+            // onboarding or Delete account flip consent from that sheet.
+            // The layer is simply there once the sheet closes.
+            if !onboarding.hasCurrentConsent {
+                OnboardingView(store: onboarding)
+                    .transition(.opacity)
             }
         }
-        .fullScreenCover(isPresented: .constant(!onboarding.hasCurrentConsent)) {
-            OnboardingView(store: onboarding)
-        }
+        // Opacity only, so it is already the Reduce Motion form.
+        .animation(Theme.Motion.standard, value: onboarding.hasCurrentConsent)
     }
 
     private var tabs: some View {
