@@ -340,7 +340,7 @@ Gate: `UserDefaults` `onboarding.termsVersion` (Int) and `onboarding.termsAccept
    • Your photos are uploaded to VirtSpace and to World Labs,
      which builds your 3D space.
    • Your spaces are private to you.
-   • The original photos are deleted after processing.
+   • Your original photos are kept until you delete the space.
    • You can delete any space, or your data, at any time.
    Read the terms of use                (link, opens a sheet)
    ( Agree and continue )
