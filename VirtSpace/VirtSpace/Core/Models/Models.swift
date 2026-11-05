@@ -149,16 +149,31 @@ struct WorldAssets: Decodable, Hashable {
         case colliderGLBURL = "collider_glb_url"
     }
 
+    /// UserDefaults key for the Settings "Maximum detail" opt-in.
+    static let maximumDetailKey = "viewer.maximumDetail"
+
+    /// 7 GiB admits every 8 GB iPhone (they report ~7.5 GiB) and up, and keeps
+    /// 6 GB and smaller devices on 500k.
+    static let fullResMinMemory: UInt64 = 7 * 1024 * 1024 * 1024
+
+    /// Whether this device can load full_res at all (Settings hides the
+    /// toggle otherwise).
+    static var deviceSupportsFullRes: Bool {
+        ProcessInfo.processInfo.physicalMemory >= fullResMinMemory
+    }
+
     /// The splat the 3D explorer loads, plus its tier tag (the cache key part
     /// that keeps a cached 500k file from ever being served as full_res).
-    /// full_res is about 4x the splats of 500k (sharp lettering up close) and
-    /// needs the headroom: 7 GiB admits every 8 GB iPhone (they report ~7.5 GiB)
-    /// and up, and keeps 6 GB and smaller devices on 500k.
+    /// full_res is about 4x the splats of 500k (sharp lettering up close), but
+    /// Spark's sort and raster scale with splat count, so moving gets choppy.
+    /// 500k is the default; full_res only when the user opted in and the
+    /// device has the headroom.
     static func explorerSplat(
         assets: WorldAssets?,
+        maximumDetail: Bool,
         physicalMemory: UInt64 = ProcessInfo.processInfo.physicalMemory
     ) -> (url: String, tier: String)? {
-        if physicalMemory >= 7 * 1024 * 1024 * 1024,
+        if maximumDetail, physicalMemory >= fullResMinMemory,
            let full = assets?.spzFullURL, !full.isEmpty {
             return (full, "full")
         }

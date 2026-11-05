@@ -3,6 +3,7 @@
 //  VirtSpace
 //
 //  Settings (ui-spec 8), a sheet from the Library toolbar gear: How to scan,
+//  3D viewer (Maximum detail, 8 GB+ devices only),
 //  Storage (downloaded copies, with real sizes and Clear downloads), About
 //  (Terms, Privacy, Acknowledgements, Version), Developer (DEBUG only) and
 //  Account. Account is hidden under dev auth (SettingsRows), because there
@@ -24,6 +25,7 @@ struct SettingsView: View {
     @State private var isClearing = false
     @State private var showDeleteConfirm = false
     @State private var isDeleting = false
+    @AppStorage(WorldAssets.maximumDetailKey) private var maximumDetail = false
 
     private let rows = SettingsRows.current
 
@@ -33,6 +35,7 @@ struct SettingsView: View {
                 Section("How to scan") {
                     NavigationLink("How to scan") { HowToScanView().navigationTitle("How to scan") }
                 }
+                if WorldAssets.deviceSupportsFullRes { viewerSection }
                 storageSection
                 aboutSection
                 #if DEBUG
@@ -49,6 +52,18 @@ struct SettingsView: View {
             }
         }
         .task { await measure() }
+    }
+
+    // MARK: - 3D viewer (8 GB+ devices only)
+
+    private var viewerSection: some View {
+        Section {
+            Toggle("Maximum detail", isOn: $maximumDetail)
+        } header: {
+            Text("3D viewer")
+        } footer: {
+            Text("Sharper close up, but moving around can feel less smooth. Takes effect the next time you open a space.")
+        }
     }
 
     // MARK: - Storage

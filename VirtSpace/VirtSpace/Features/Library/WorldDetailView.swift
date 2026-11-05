@@ -34,6 +34,7 @@ struct WorldDetailView: View {
     @State private var acceptedCount = 0
     @State private var captionExpanded = false
     @AppStorage("detail.exploreTipSeen") private var exploreTipSeen = false
+    @AppStorage(WorldAssets.maximumDetailKey) private var maximumDetail = false
 
     enum ImproveMode: Identifiable {
         case enhance, retry
@@ -138,7 +139,7 @@ struct WorldDetailView: View {
 
     @ViewBuilder private func actionButtons(_ world: World) -> some View {
         VStack(alignment: .leading, spacing: Theme.Space.s) {
-            if let splat = WorldAssets.explorerSplat(assets: assets), let url = URL(string: splat.url) {
+            if let splat = WorldAssets.explorerSplat(assets: assets, maximumDetail: maximumDetail), let url = URL(string: splat.url) {
                 Button {
                     exploreTipSeen = true
                     explorer = ExplorerPresentation(
