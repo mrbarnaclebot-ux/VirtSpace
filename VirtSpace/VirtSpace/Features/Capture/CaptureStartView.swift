@@ -29,6 +29,7 @@ struct CaptureStartView: View {
             VStack(alignment: .leading, spacing: Theme.Space.l) {
                 header
                 stepList
+                howToScanLink
                 ForEach(model.banners) { banner in
                     bannerView(banner)
                 }
@@ -85,6 +86,19 @@ struct CaptureStartView: View {
                 }
                 .accessibilityLabel("Step \(index + 1): \(step.text)")
             }
+        }
+    }
+
+    /// The full how-to pages from onboarding (ui-spec 4.2, 5).
+    private var howToScanLink: some View {
+        NavigationLink {
+            HowToScanView().navigationTitle("How to scan")
+        } label: {
+            Label("How to scan", systemImage: "chevron.right")
+                .labelStyle(TrailingIconLabelStyle())
+                .font(.body)
+                .foregroundStyle(Theme.accent)
+                .frame(minHeight: Theme.minTarget)
         }
     }
 
@@ -202,5 +216,17 @@ private struct CameraPrimingView: View {
         }
         .padding(Theme.Space.l)
         .presentationDetents([.medium])
+    }
+}
+
+/// Title first, then a small icon: "How to scan >".
+private struct TrailingIconLabelStyle: LabelStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        HStack(spacing: Theme.Space.xxs) {
+            configuration.title
+            configuration.icon
+                .imageScale(.small)
+                .accessibilityHidden(true)
+        }
     }
 }
