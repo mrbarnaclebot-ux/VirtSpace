@@ -52,7 +52,7 @@ struct ContentView: View {
                 .tabItem { Label("Library", systemImage: "square.grid.2x2") }
                 .tag(AppRouter.Tab.library)
 
-            CaptureView(api: api, toasts: toasts, switchToLibrary: { router.selectedTab = .library })
+            CaptureView(api: api, toasts: toasts)
                 .environment(\.colorScheme, .dark)
                 .toolbarColorScheme(.dark, for: .tabBar)
                 .tabItem { Label("Scan", systemImage: "viewfinder") }

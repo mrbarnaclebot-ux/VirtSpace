@@ -47,7 +47,7 @@ enum SettingsOnboardingLinks {
     /// WP4's first-scan coaching flag (ui-spec 5.7), plus the Explorer's own
     /// one-time coach.
     static func resetFirstScanCoaching() {
-        UserDefaults.standard.removeObject(forKey: "onboarding.firstScanCoached")
+        UserDefaults.standard.removeObject(forKey: FirstScanCoach.defaultsKey)
         UserDefaults.standard.removeObject(forKey: ExplorerView.coachKey)
     }
 }

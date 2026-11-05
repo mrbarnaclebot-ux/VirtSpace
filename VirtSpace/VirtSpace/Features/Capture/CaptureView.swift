@@ -20,10 +20,8 @@ struct CaptureView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     private var hud: CaptureHUDState { model.hud }
 
-    /// `switchToLibrary` is ignored: a finished upload routes through
-    /// AppRouter to the new space's Detail. The parameter stays only until
-    /// the app shell stops passing it.
-    init(api: APIClient, toasts: ToastCenter, switchToLibrary: @escaping () -> Void = {}) {
+    /// A finished upload routes through AppRouter to the new space's Detail.
+    init(api: APIClient, toasts: ToastCenter) {
         _model = State(initialValue: CaptureScreenModel(api: api, toasts: toasts))
     }
 
