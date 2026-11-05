@@ -8,7 +8,7 @@ Everything is on `main` (`1bb34ff`+) and the backend is **deployed** (api + work
 
 ## Owner's next steps (device)
 
-1. Fresh-launch walkthrough of the redesign: onboarding (Welcome, 3 how-to pages, Terms with Agree), Library (states, cards, Retry on a failed space, Improve quality sheet, delete), Scan (camera priming, start banners, first-scan coaching, direction prompts, upload overlay "Finishing up...", landing on the new space), Explorer (one loading screen, full-res splat on this phone), 360 photo (Save to Photos), Settings (storage sizes, Clear downloads, How to scan, Terms, Privacy).
+1. Fresh-launch walkthrough of the redesign: onboarding (Welcome, 3 how-to pages, Terms with Agree), Library (states, cards, Retry on a failed space, Improve quality sheet, delete), Scan (camera priming, start banners, first-scan coaching, direction prompts, upload overlay "Finishing up...", landing on the new space), Explorer (one loading screen, smooth 500k splat by default; Settings > 3D viewer > Maximum detail loads full-res), 360 photo (Save to Photos), Settings (storage sizes, Clear downloads, How to scan, Terms, Privacy).
 2. One capture to confirm background uploads (lock the phone mid-upload) and the end-to-end flow on the new UI (150 credits).
 3. Re-check world `b936c74a` in 3D now that its full-res splat is backfilled.
 4. Crash logs: `xcrun devicectl device info files --device <udid> --domain-type systemCrashLogs`, then `device copy from ... --source <name>.ips`.
@@ -53,7 +53,7 @@ Upload worked: 28 frames + 28 LiDAR depth maps (~22 KB each) in R2, stitch v2 ra
 
 - **Device walkthrough of the redesign** (see Owner's next steps); several WP acceptance items were unit-tested only (simulator tap automation is broken under Xcode 27): haptics, VoiceOver order, camera priming + Open Settings, Reduce Motion, replay onboarding from Settings, explorer WebGL kill/reload, Library pagination on device.
 - **R24 real auth** (deferred by the owner until the main features work). Until then every install shares one library and the Account section is hidden under dev auth.
-- **Quality:** walking away from the capture spot blurs lettering and distorts unseen areas (single-pano limit). Levers: full-res splats (done), viewer walk-radius limit (pending decision), multi-station capture (research option A, experiment pending), splat reconstruction (option C, L effort).
+- **Quality:** walking away from the capture spot blurs lettering and distorts unseen areas (single-pano limit). Levers: full-res splats (done, opt-in via Settings "Maximum detail" since full-res made movement choppy on iPhone 17 Pro), viewer walk-radius limit (pending decision), multi-station capture (research option A, experiment pending), splat reconstruction (option C, L effort).
 - **Stitcher residuals:** faint doubling on objects within about 0.5 m without LiDAR; a hard seam where content changed between shots.
 - **Backend follow-ups:** structured logging (pino) for the worker; `statement_timeout` on the DB role (not via the pooler); R27 leftovers (finalize ignores `deleted_at`, `locked_by` missing from completion WHERE); raw-frame retention decision; Postgres integration suites need `TEST_DATABASE_URL` on a Neon branch (never prod).
 - **R35 modernisation:** Spark 2.4 / three r187, `worker.ts` size, `PanoPreviewView` on SceneKit; `viewer.html` still has its own hidden "Couldn't render" text.
