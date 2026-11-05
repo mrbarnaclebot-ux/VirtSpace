@@ -40,28 +40,12 @@ struct SettingsRows: Equatable {
     }
 }
 
-/// Settings entry points owned by onboarding (WP3). PLACEHOLDERS until merge:
-/// the orchestrator points these at WP3's views and store.
+/// Settings reset for one-time coaching. Onboarding's pages and its replay
+/// come straight from WP3 (`HowToScanView`, `TermsView`, `TermsOfUseView`,
+/// `OnboardingStore.replay()`).
 enum SettingsOnboardingLinks {
-    /// WIRE AT MERGE: onboarding pages 2-4 ("How to scan").
-    static func howToScan() -> SettingsPlaceholderPage {
-        SettingsPlaceholderPage(title: "How to scan")
-    }
-
-    /// WIRE AT MERGE: onboarding page 5, read-only once accepted.
-    static func termsOfUse() -> SettingsPlaceholderPage {
-        SettingsPlaceholderPage(title: "Terms of use")
-    }
-
-    /// WIRE AT MERGE: reset consent so onboarding shows again. Until then it
-    /// clears the ui-spec 5 keys, read on the next launch.
-    static func replayOnboarding() {
-        UserDefaults.standard.removeObject(forKey: "onboarding.termsVersion")
-        UserDefaults.standard.removeObject(forKey: "onboarding.termsAcceptedAt")
-    }
-
-    /// WIRE AT MERGE: WP4's first-scan coaching flag (ui-spec 5.7), plus the
-    /// Explorer's own one-time coach.
+    /// WP4's first-scan coaching flag (ui-spec 5.7), plus the Explorer's own
+    /// one-time coach.
     static func resetFirstScanCoaching() {
         UserDefaults.standard.removeObject(forKey: "onboarding.firstScanCoached")
         UserDefaults.standard.removeObject(forKey: ExplorerView.coachKey)

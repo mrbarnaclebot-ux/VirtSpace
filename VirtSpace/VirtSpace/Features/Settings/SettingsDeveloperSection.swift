@@ -12,6 +12,8 @@ import SwiftUI
 
 struct SettingsDeveloperSection: View {
     @Environment(ToastCenter.self) private var toasts
+    @Environment(OnboardingStore.self) private var onboarding
+    @Environment(\.dismiss) private var dismiss
     @State private var fixture: Fixture?
     @State private var showLogs = false
 
@@ -32,8 +34,9 @@ struct SettingsDeveloperSection: View {
             Button("Debug logs", systemImage: "ladybug") { showLogs = true }
                 .sheet(isPresented: $showLogs) { DebugLogView() }
             Button("Replay onboarding", systemImage: "arrow.counterclockwise") {
-                SettingsOnboardingLinks.replayOnboarding()
-                toasts.show("Onboarding shows again on next launch.", style: .success)
+                // Takes effect at once: closing Settings reveals onboarding.
+                onboarding.replay()
+                dismiss()
             }
             Button("Reset first-scan coaching", systemImage: "arrow.counterclockwise") {
                 SettingsOnboardingLinks.resetFirstScanCoaching()

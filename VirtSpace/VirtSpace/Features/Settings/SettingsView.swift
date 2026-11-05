@@ -15,6 +15,7 @@ struct SettingsView: View {
     @Environment(APIClient.self) private var api
     @Environment(WorldStore.self) private var store
     @Environment(ToastCenter.self) private var toasts
+    @Environment(OnboardingStore.self) private var onboarding
     @Environment(\.dismiss) private var dismiss
 
     /// Cache sizes; nil while measuring.
@@ -30,7 +31,7 @@ struct SettingsView: View {
         NavigationStack {
             Form {
                 Section("How to scan") {
-                    NavigationLink("How to scan") { SettingsOnboardingLinks.howToScan() }
+                    NavigationLink("How to scan") { HowToScanView().navigationTitle("How to scan") }
                 }
                 storageSection
                 aboutSection
@@ -87,8 +88,8 @@ struct SettingsView: View {
 
     private var aboutSection: some View {
         Section("About") {
-            NavigationLink("Terms of use") { SettingsOnboardingLinks.termsOfUse() }
-            NavigationLink("Privacy") { PrivacyPage() }
+            NavigationLink("Terms of use") { TermsView().navigationTitle("Terms of use") }
+            NavigationLink("Privacy") { TermsOfUseView().navigationTitle("Privacy") }
             NavigationLink {
                 AcknowledgementsPage()
             } label: {
@@ -152,7 +153,7 @@ struct SettingsView: View {
             await SplatCache.shared.clear()
             await PanoCache.shared.clear()
             for world in store.worlds { store.remove(id: world.id) }
-            SettingsOnboardingLinks.replayOnboarding()
+            onboarding.replay()
             dismiss()
         } catch {
             toasts.show(error)
