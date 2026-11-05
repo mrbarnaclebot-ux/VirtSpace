@@ -5,7 +5,8 @@
 //  DEBUG-only capture-screen tooling, kept from Stage A: a one-frame test scan
 //  that exercises createWorld → presigned frame upload → frames:done against
 //  the configured backend, and the bundled-fixture explorer (no backend).
-//  Compiled out of Release entirely.
+//  Sits in a collapsed "Developer" disclosure at the bottom of the start
+//  screen. Compiled out of Release entirely.
 //
 
 #if DEBUG
@@ -20,11 +21,16 @@ struct CaptureDebugToolsView: View {
     @State private var showFixtureExplorer = false
 
     var body: some View {
-        VStack(spacing: 12) {
-            testScanButton
-            fixtureExplorerButton
+        // Collapsed by default so it never competes with Start (ui-spec 4.10).
+        DisclosureGroup("Developer") {
+            VStack(alignment: .leading, spacing: 12) {
+                testScanButton
+                fixtureExplorerButton
+            }
+            .padding(.top, 12)
         }
-        .padding(.bottom, 24)
+        .font(.subheadline)
+        .tint(.secondary)
         .fullScreenCover(isPresented: $showFixtureExplorer) {
             if let url = ViewerSchemeHandler.bundledURL("fixture.spz") {
                 ExplorerView(source: .file(url), title: "Fixture World")
@@ -103,7 +109,7 @@ struct CaptureDebugToolsView: View {
             }
             try await FrameUploader().upload(frame, to: slot)
             try await api.framesDone(worldId: world.id)
-            await model.announceUploadedAndSwitch("Test scan started — watch it in Library.")
+            model.routeToNewSpace(world)
         } catch {
             model.toasts.show(error)
         }

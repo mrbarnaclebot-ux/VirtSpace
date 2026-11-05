@@ -2,10 +2,11 @@
 //  CaptureScreenModel.swift
 //  VirtSpace
 //
-//  Everything the capture screen decides, none of what it draws: reacting to
-//  engine state, kicking app-scoped upload flows, the daily-quota gate, the
-//  pending/parked-upload affordances, and keeping the screen awake for the
-//  capture + upload arc. `CaptureView` and its subviews only lay this out.
+//  Everything the scan screen decides, none of what it draws: reacting to
+//  engine state, first-scan coaching, kicking app-scoped upload flows, and
+//  keeping the screen awake for the capture + upload arc. The start screen's
+//  gates (quota, camera access, banners) live in CaptureScreenModel+Start.
+//  `CaptureView` and its subviews only lay this out.
 //
 
 import AVFoundation
@@ -20,34 +21,50 @@ final class CaptureScreenModel {
     let engine: CaptureEngine
     var hud: CaptureHUDState { engine.hud }
 
-    /// Non-nil while an upload is in flight (frames done so far) — drives the
+    /// Non-nil while an upload is in flight (frames done so far): drives the
     /// full-screen upload overlay.
     private(set) var uploadedFrames: Int? {
         didSet { updateScreenAwake() }
     }
     /// Finished sessions stranded on disk after a failed upload, and how many
     /// have exhausted their automatic retries (parked, spec §10 R4) and so need
-    /// an explicit Retry / Discard from the user.
+    /// an explicit Try again / Delete from the user.
     private(set) var pendingUpload = PendingUploadSummary()
+    /// Banner copy after an upload or a manual retry failed, with the cause.
+    /// Cleared when an upload succeeds or the scan is deleted.
+    var uploadFailureMessage: String?
     /// Scans left in today's window, from GET /v1/me/quota. nil = unknown (not
-    /// yet fetched, or the check failed — in which case we fail open and let
+    /// yet fetched, or the check failed, in which case we fail open and let
     /// capture proceed). 0 = daily limit reached; capture is blocked up front.
-    private(set) var scansRemaining: Int?
+    var scansRemaining: Int?
     /// When today's quota window frees up (only meaningful once exhausted).
-    private(set) var quotaResetsAt: Date?
+    var quotaResetsAt: Date?
+    /// Camera permission as last read (simulator: always authorized).
+    var cameraAccess = CameraAccess.current
+    /// The just-in-time camera explanation sheet (ui-spec 5.6).
+    var showsCameraPriming = false
+    /// First-scan coaching for the scan in progress (ui-spec 5.7).
+    private(set) var coach = FirstScanCoach()
+    /// Bumped when the server confirmed an upload: the view's success haptic.
+    private(set) var uploadSuccessCount = 0
 
-    @ObservationIgnored private let api: APIClient
+    @ObservationIgnored let api: APIClient
     @ObservationIgnored let toasts: ToastCenter
-    @ObservationIgnored let switchToLibrary: () -> Void
+    @ObservationIgnored let defaults: UserDefaults
+    /// App-scoped store and router, injected by CaptureView from the
+    /// environment (the model is built before the environment exists).
+    @ObservationIgnored var worldStore: WorldStore?
+    @ObservationIgnored var router: AppRouter?
     @ObservationIgnored private var didResumePending = false
+    @ObservationIgnored private var tipTask: Task<Void, Never>?
 
-    init(api: APIClient, toasts: ToastCenter, switchToLibrary: @escaping () -> Void = {}) {
+    init(api: APIClient, toasts: ToastCenter, defaults: UserDefaults = .standard) {
         self.api = api
         self.toasts = toasts
-        self.switchToLibrary = switchToLibrary
+        self.defaults = defaults
         // Orphan-world prevention: abandoning a scan whose session already
         // minted a backend world (confirm-abandon in the HUD, thermal-overlay
-        // abandon — both land in engine.cancel()) best-effort deletes that
+        // abandon: both land in engine.cancel()) best-effort deletes that
         // world server-side before the local purge. The worker's 24 h
         // uploading reaper is the backstop when this can't land (offline).
         engine = CaptureEngine(onSessionDiscarded: { worldId in
@@ -59,9 +76,16 @@ final class CaptureScreenModel {
 
     func engineStateChanged(to state: CaptureEngineState) {
         if case .finished(let result) = state {
+            if coach.isActive { defaults.set(true, forKey: FirstScanCoach.defaultsKey) }
             Task { await upload(result) }
         }
         updateScreenAwake()
+    }
+
+    /// Start the engine with coaching set up for this scan.
+    func startEngine() {
+        coach.begin(firstScan: !defaults.bool(forKey: FirstScanCoach.defaultsKey))
+        engine.start()
     }
 
     /// Keep the screen awake for the full capture + upload arc (belt-and-braces
@@ -84,86 +108,45 @@ final class CaptureScreenModel {
         UIApplication.shared.isIdleTimerDisabled = false
     }
 
-    // MARK: - Quota
+    // MARK: - First-scan coaching
 
-    /// True once we know the daily scan limit is spent (0 remaining). nil/unknown
-    /// (quota not fetched or the check failed) is NOT exhausted — we fail open.
-    var isQuotaExhausted: Bool { scansRemaining == 0 }
-
-    /// Subtle heads-up as the day's allowance runs low; nil when unknown or
-    /// exhausted (the full-width notice covers that case).
-    var lowQuotaHint: String? {
-        guard !isQuotaExhausted, let left = scansRemaining, left < 5 else { return nil }
-        return "\(left) scan\(left == 1 ? "" : "s") left today"
+    func capturedCountChanged(to count: Int) {
+        let before = coach.tip
+        coach.shotsChanged(captured: count, total: hud.targets.count)
+        expireTipLater(ifChangedFrom: before)
     }
 
-    /// " — resets in about 5 hours" when a reset time is known; empty otherwise.
-    var quotaResetLabel: String {
-        guard let resetsAt = quotaResetsAt else { return "" }
-        return " — resets \(resetsAt.formatted(.relative(presentation: .named)))"
+    func driftChanged(pastSoftGate: Bool) {
+        let before = coach.tip
+        coach.driftChanged(pastSoftGate: pastSoftGate)
+        expireTipLater(ifChangedFrom: before)
     }
 
-    /// nil (a failed check) deliberately clears to "unknown" rather than
-    /// blocking: capture is offline-safe (frames persist, upload retries), so
-    /// a flaky quota check must never stop someone from capturing.
-    func applyQuota(_ quota: QuotaStatus?) {
-        scansRemaining = quota?.scansRemaining
-        quotaResetsAt = quota?.quotaResetsAt
+    func dismissCoachTip(_ tip: FirstScanCoach.Tip) {
+        coach.dismiss(tip)
     }
 
-    private func refreshQuota() async {
-        // No backend calls from a hosted test run (TestEnvironment).
-        guard !TestEnvironment.isRunningUnderXCTest else { return }
-        applyQuota(try? await api.quota())
-    }
-
-    /// Refresh the allowance and pending uploads each time the start screen
-    /// appears, so its hints are current before a capture.
-    func startScreenAppeared() async {
-        await refreshPendingUpload()
-        await refreshQuota()
-    }
-
-    // MARK: - Starting a capture
-
-    func startCapture() async {
-        // Check quota BEFORE starting the engine. A real device test had a user
-        // shoot a full 28-shot session only to be rejected with 429 at
-        // POST /v1/worlds; enforcing up front means they learn the limit first.
-        await refreshQuota()
-        guard !isQuotaExhausted else { return }
-
-        #if targetEnvironment(simulator)
-        engine.start()
-        #else
-        // Never crash on a missing usage string: the OS kills the app on
-        // camera access without NSCameraUsageDescription in the Info.plist.
-        guard Bundle.main.object(forInfoDictionaryKey: "NSCameraUsageDescription") != nil else {
-            toasts.show("Camera permission text is missing from the build — capture is disabled.", style: .error)
-            return
+    /// Timed tips (the banners) clear themselves after `tipDuration`.
+    private func expireTipLater(ifChangedFrom before: FirstScanCoach.Tip?) {
+        guard let tip = coach.tip, tip != before, tip.bannerText != nil else { return }
+        tipTask?.cancel()
+        tipTask = Task { [weak self] in
+            try? await Task.sleep(for: FirstScanCoach.tipDuration)
+            guard !Task.isCancelled else { return }
+            self?.coach.dismiss(tip)
         }
-        switch AVCaptureDevice.authorizationStatus(for: .video) {
-        case .authorized:
-            engine.start()
-        case .notDetermined:
-            if await AVCaptureDevice.requestAccess(for: .video) {
-                engine.start()
-            } else {
-                toasts.show("Camera access is needed to capture your space.", style: .error)
-            }
-        default:
-            toasts.show("Camera access is denied. Enable it in Settings → VirtSpace.", style: .error)
-        }
-        #endif
     }
 
     // MARK: - Uploading
 
     private func upload(_ result: CaptureResult) async {
         uploadedFrames = 0
-        defer { uploadedFrames = nil }
+        defer {
+            uploadedFrames = nil
+            coach.dismiss(.finished)
+        }
         // App-scoped flow (UploadManager owns the task): navigating tabs or
-        // dismissing the view can no longer cancel the upload — awaiting the
+        // dismissing the view can no longer cancel the upload; awaiting the
         // handle below is UI-only, the flow survives the screen.
         let handle = UploadManager.shared.kickUpload(result: result, api: api) { [weak self] done in
             Task { @MainActor in self?.uploadedFrames = done }
@@ -172,16 +155,17 @@ final class CaptureScreenModel {
         engine.reset()
         await refreshPendingUpload()
         switch outcome {
-        case .success:
-            await announceUploadedAndSwitch()
+        case .success(let world):
+            routeToNewSpace(world)
         case .failure(let error):
-            toasts.show("Upload failed — your scan is saved. Retry from here or relaunch. (\((error as? LocalizedError)?.errorDescription ?? error.localizedDescription))", style: .error)
+            uploadFailureMessage = "Upload didn't finish. Your scan is saved on this phone. " + Self.cause(of: error)
         }
     }
 
     /// Manual retry of a stranded session (app-scoped via UploadManager). A
     /// user-initiated retry clears the attempt counter, so a parked session
-    /// gets a full fresh automatic budget again.
+    /// gets a full fresh automatic budget again. "Nothing to do" and
+    /// "already uploading" get no toast: the banner shows the state.
     func retryPendingUpload() async {
         uploadedFrames = 0
         defer { uploadedFrames = nil }
@@ -191,16 +175,21 @@ final class CaptureScreenModel {
         let outcome = await handle.value
         await refreshPendingUpload()
         switch outcome {
-        case .succeeded:
-            await announceUploadedAndSwitch()
-        case .nothingToResume:
-            toasts.show("Nothing left to upload.", style: .success)
+        case .succeeded(let worlds):
+            worlds.dropFirst().forEach { worldStore?.insert($0) }
+            if let first = worlds.first {
+                routeToNewSpace(first)
+            } else {
+                // A stranded session finished by frames:done: no world copy.
+                uploadFailureMessage = nil
+                uploadSuccessCount += 1
+                router?.selectedTab = .library
+                await worldStore?.refresh()
+            }
         case .failed(let reason):
-            // Report what ACTUALLY went wrong — resumePending used to swallow
-            // every error, so this always read "check your connection".
-            toasts.show("Upload failed again — \(reason)", style: .error)
-        case .deferred(let reason):
-            toasts.show("Upload not retried — \(reason).", style: .error)
+            uploadFailureMessage = "Still couldn't upload. \(reason)"
+        case .nothingToResume, .deferred:
+            break
         }
     }
 
@@ -209,32 +198,49 @@ final class CaptureScreenModel {
         let discarded = await UploadManager.shared.kickDiscardPending(api: api).value
         await refreshPendingUpload()
         if discarded > 0 {
-            toasts.show("Scan discarded.", style: .success)
+            uploadFailureMessage = nil
+            toasts.show("Scan deleted.", style: .success)
         }
     }
 
     /// Retry any capture sessions stranded on disk by a crash or failed upload,
     /// once per screen. The flow itself is app-scoped; this await is UI-only.
+    /// No toast: the new card simply appears in the Library.
     func resumePendingOnce() async {
         // A hosted test run launches this app; resuming would upload for real.
         guard !TestEnvironment.isRunningUnderXCTest, !didResumePending else { return }
         didResumePending = true
         let outcome = await UploadManager.shared.kickResume(api: api).value
         await refreshPendingUpload()
-        if case .succeeded(let worlds) = outcome, !worlds.isEmpty {
-            toasts.show("Resumed \(worlds.count) pending scan upload\(worlds.count == 1 ? "" : "s").", style: .success)
+        if case .succeeded(let worlds) = outcome {
+            worlds.forEach { worldStore?.insert($0) }
         }
     }
 
-    /// Shared tail of a successful upload: confirm, let the toast land, then
-    /// route to the Library where the world builds.
-    func announceUploadedAndSwitch(_ message: String = "Scan uploaded — watch it build in Library.") async {
-        toasts.show(message, style: .success)
-        try? await Task.sleep(for: .milliseconds(700))
-        switchToLibrary()
+    /// The server confirmed an upload: show the space in the Library and open
+    /// its Detail, where it builds (ui-spec 3). No toast: Detail says it.
+    func routeToNewSpace(_ world: World) {
+        uploadFailureMessage = nil
+        uploadSuccessCount += 1
+        worldStore?.insert(world)
+        router?.open(worldId: world.id)
     }
 
-    private func refreshPendingUpload() async {
+    func refreshPendingUpload() async {
         pendingUpload = await UploadManager.shared.pendingSummary(api: api)
+    }
+
+    /// User copy for why an upload failed (ui-spec 6 Errors). Never raw text:
+    /// anything that isn't a typed APIError or a URL error gets the generic line.
+    static func cause(of error: Error) -> String {
+        let apiError: APIError
+        if let typed = error as? APIError {
+            apiError = typed
+        } else if (error as NSError).domain == NSURLErrorDomain {
+            apiError = .network(error)
+        } else {
+            apiError = .invalidResponse
+        }
+        return apiError.userMessage(includeDeveloperHints: false)
     }
 }

@@ -42,7 +42,8 @@ struct CaptureScreenModelTests {
 
         #expect(model.isQuotaExhausted)
         #expect(model.lowQuotaHint == nil)
-        #expect(model.quotaResetLabel.hasPrefix(" — resets "))
+        #expect(model.startButton == StartButtonState(title: "Scan unavailable today", isEnabled: false))
+        #expect(model.banners.contains { $0.id == "quota" })
 
         await model.startCapture()
         // `start()` flips to .starting synchronously, so this would catch it.
@@ -58,7 +59,7 @@ struct CaptureScreenModelTests {
         #expect(model.scansRemaining == nil)
         #expect(!model.isQuotaExhausted)
         #expect(model.lowQuotaHint == nil)
-        #expect(model.quotaResetLabel.isEmpty)
+        #expect(!model.banners.contains { $0.id == "quota" })
     }
 
     @Test("Low-allowance hint below five scans only")

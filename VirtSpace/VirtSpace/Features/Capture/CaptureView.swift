@@ -2,64 +2,84 @@
 //  CaptureView.swift
 //  VirtSpace
 //
-//  Stage B2: the polished guided-capture experience (spec §6.1). Start →
-//  camera permission → live camera feed (ARSCNView on device, animated
-//  stand-in in the simulator) under CaptureHUDView's world-locked dots,
-//  snapping reticle, filling-sphere progress and coaching banners → on
-//  finish, a full-screen upload overlay, then route to Library.
+//  The Scan tab (spec §6.1, ui-spec 4.2-4.4): start screen, then the live
+//  camera feed (ARSCNView on device, animated stand-in in the simulator)
+//  under CaptureHUDView, then a full-screen upload overlay, then the new
+//  space's Detail via AppRouter. Always dark.
 //
-//  Layout only: CaptureScreenModel owns the state machine, uploads, quota
-//  and idle timer; CaptureStartView draws the idle / failed screen.
+//  Layout only: CaptureScreenModel owns the state machine, uploads, quota,
+//  coaching and idle timer; CaptureStartView draws the idle / failed screen.
 //
 
 import SwiftUI
 
 struct CaptureView: View {
     @State private var model: CaptureScreenModel
+    @Environment(AppRouter.self) private var router
+    @Environment(WorldStore.self) private var worldStore
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     private var hud: CaptureHUDState { model.hud }
 
-    /// `switchToLibrary` is set by the app shell so finished scans can route
-    /// to the Library tab.
+    /// `switchToLibrary` is ignored: a finished upload routes through
+    /// AppRouter to the new space's Detail. The parameter stays only until
+    /// the app shell stops passing it.
     init(api: APIClient, toasts: ToastCenter, switchToLibrary: @escaping () -> Void = {}) {
-        _model = State(initialValue: CaptureScreenModel(api: api, toasts: toasts, switchToLibrary: switchToLibrary))
+        _model = State(initialValue: CaptureScreenModel(api: api, toasts: toasts))
     }
 
     var body: some View {
         NavigationStack {
             ZStack {
-                backdrop
+                Color.black.ignoresSafeArea()
                 content
                 if hud.isThermallyPaused {
                     thermalPauseOverlay
                 }
                 if let uploadedFrames = model.uploadedFrames {
-                    UploadOverlayView(uploaded: uploadedFrames, total: hud.targets.count)
+                    UploadOverlayView(
+                        uploaded: uploadedFrames,
+                        total: hud.targets.count,
+                        lead: model.coach.tip == .finished ? FirstScanCoach.finishedText : nil
+                    )
                 }
             }
-            .animation(.easeOut(duration: 0.25), value: model.uploadedFrames == nil)
-            .animation(.easeOut(duration: 0.25), value: hud.isThermallyPaused)
+            .animation(Theme.Motion.standard, value: model.uploadedFrames == nil)
+            .animation(Theme.Motion.standard, value: hud.isThermallyPaused)
             .navigationBarHidden(true)
             .onChange(of: hud.state) { _, newState in
                 model.engineStateChanged(to: newState)
             }
+            .onChange(of: hud.capturedCount) { _, count in
+                model.capturedCountChanged(to: count)
+            }
+            .onChange(of: hud.driftMeters > AlignmentMath.driftWarnMeters) { _, past in
+                model.driftChanged(pastSoftGate: past)
+            }
+            .sensoryFeedback(.success, trigger: model.uploadSuccessCount)
             .onDisappear { model.screenDisappeared() }
-            .task { await model.resumePendingOnce() }
+            .task {
+                model.worldStore = worldStore
+                model.router = router
+                await model.resumePendingOnce()
+            }
         }
+        .environment(\.colorScheme, .dark)
+        .toolbarColorScheme(.dark, for: .tabBar)
     }
 
     @ViewBuilder
     private var content: some View {
         switch hud.state {
-        case .idle:
-            CaptureStartView(model: model, failure: nil)
-        case .failed(let message):
-            CaptureStartView(model: model, failure: message)
+        case .idle, .failed:
+            CaptureStartView(model: model)
         case .starting:
             VStack(spacing: 14) {
-                ProgressView().tint(.cyan)
+                if !reduceMotion {
+                    ProgressView().tint(Theme.accent)
+                }
                 Text("Starting camera…")
                     .font(.subheadline)
-                    .foregroundStyle(.white.opacity(0.7))
+                    .foregroundStyle(Theme.textSecondary)
             }
         case .ready, .capturing, .advancing, .finished:
             // ONE structural identity for the camera layer across all four
@@ -76,9 +96,11 @@ struct CaptureView: View {
                 if !hud.state.isFinished {
                     CaptureHUDView(
                         hud: hud,
+                        coach: model.coach,
                         onCancel: { model.engine.cancel() },
                         onContinueInLowLight: { model.engine.continueInLowLight() },
-                        onRestart: { model.engine.restart() }
+                        onRestart: { model.engine.restart() },
+                        onDismissCoachTip: { model.dismissCoachTip($0) }
                     )
                 }
             }
@@ -122,60 +144,52 @@ struct CaptureView: View {
 
     /// Full-screen cool-down UI shown when the device hits `.critical` and the
     /// engine has paused the session (Stage B3 deliverable 2e). Capture resumes
-    /// only when the user taps — giving the phone a chance to cool.
+    /// only when the user taps, giving the phone a chance to cool.
     private var thermalPauseOverlay: some View {
         ZStack {
             Color.black.opacity(0.82).ignoresSafeArea()
             VStack(spacing: 18) {
                 Image(systemName: "thermometer.high")
-                    .font(.system(size: 52, weight: .light))
-                    .foregroundStyle(.orange)
+                    .font(.largeTitle)
+                    .symbolRenderingMode(.hierarchical)
+                    .foregroundStyle(Theme.warning)
+                    .accessibilityHidden(true)
                 Text("Paused to cool down")
-                    .font(.title2.weight(.bold))
+                    .font(.title2.bold())
                     .foregroundStyle(.white)
-                Text("Your iPhone got too warm, so capture paused to protect it. Give it a moment, then resume — your progress is saved.")
+                    .accessibilityAddTraits(.isHeader)
+                Text("Your iPhone got too warm. Give it a minute. Your photos so far are saved.")
                     .font(.subheadline)
-                    .foregroundStyle(.white.opacity(0.7))
+                    .foregroundStyle(Theme.textSecondary)
                     .multilineTextAlignment(.center)
                     .padding(.horizontal, 40)
                 Button {
                     model.engine.resumeFromThermal()
                 } label: {
-                    Label("Resume capture", systemImage: "play.fill")
+                    Text("Continue scan")
                         .font(.headline)
                         .padding(.horizontal, 28)
-                        .padding(.vertical, 14)
-                        .background(Color.orange, in: Capsule())
+                        .frame(minHeight: 50)
+                        .background(Theme.warning, in: Capsule())
                         .foregroundStyle(.black)
                 }
-                Button("Abandon scan", role: .destructive) {
+                .buttonStyle(.plain)
+                Button("Stop and delete", role: .destructive) {
                     model.engine.cancel()
                 }
                 .font(.subheadline.weight(.semibold))
-                .tint(.red)
+                .frame(minHeight: Theme.minTarget)
+                .tint(Theme.danger)
             }
         }
         .transition(.opacity)
     }
-
-    // MARK: - Visuals
-
-    private var backdrop: some View {
-        ZStack {
-            Color.black
-            RadialGradient(
-                colors: [Color.indigo.opacity(0.35), .clear],
-                center: .init(x: 0.5, y: 0.38),
-                startRadius: 20,
-                endRadius: 340
-            )
-        }
-        .ignoresSafeArea()
-    }
 }
 
 #Preview {
-    CaptureView(api: APIClient(), toasts: ToastCenter())
-        .environment(APIClient())
-        .preferredColorScheme(.dark)
+    let api = APIClient()
+    CaptureView(api: api, toasts: ToastCenter())
+        .environment(api)
+        .environment(AppRouter())
+        .environment(WorldStore(api: api))
 }
