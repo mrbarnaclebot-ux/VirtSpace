@@ -428,7 +428,7 @@ Everything else scales cheaply: Neon scale-to-zero, serverless workers (jobs are
 - **Notification permission timing:** ask at the *first generation* ("we'll tell you when your world is ready"), never at first launch.
 - **Account deletion (Apple requirement):** in-app `DELETE /v1/account` → cascade Neon rows, R2 assets, APNs tokens, and provider-side worlds (pending §10 check on World Labs deletion support; if unsupported, the privacy policy must say so honestly).
 - **Third-party disclosure:** user photos leave the device to our backend **and to World Labs**. Privacy policy + App Store privacy labels must disclose this; confirm from the ToS/DPA whether API inputs are used for model training (§10).
-- **Data minimization:** raw frames purged from R2 after successful stitch (§7); location optional; worlds private by default (matches provider default).
+- **Data minimization:** raw frames purged from R2 after successful stitch (§7) — **NOT IMPLEMENTED as of 2026-11-05**: frames are purged only on world delete or stale upload (`purge` job, `framesOnly` reaper); after a stitch they are kept (useful for re-stitching with an improved stitcher). Owner decision pending: purge after N days vs keep until delete; the in-app terms state the current behaviour; location optional; worlds private by default (matches provider default).
 - **Attribution:** "Generated using World Labs" string in world detail/share pages (ToS requires on request — cheap to do proactively).
 - **Share links (Phase 4):** unguessable slugs, revocable; full UGC moderation (report/block) only becomes an App Store duty when public Explore ships (Phase 5).
 
