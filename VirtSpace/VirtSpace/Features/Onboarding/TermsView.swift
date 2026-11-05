@@ -8,8 +8,8 @@
 //
 //  Settings (WP5) embeds it read-only, without the agree button:
 //    NavigationLink("Terms of use") { TermsView() }
-//  and can show the full text on its own:
-//    NavigationLink("Privacy") { TermsOfUseView() }
+//  and shows the full text as its Privacy page:
+//    NavigationLink("Privacy") { TermsOfUseView().navigationTitle("Privacy") }
 //
 //  The full text is DRAFT copy for the owner to review. Bump
 //  `OnboardingStore.currentTermsVersion` when it changes in substance.
@@ -26,7 +26,7 @@ struct TermsView: View {
     private let points: [(symbol: String, text: String)] = [
         ("icloud.and.arrow.up", "Your photos are uploaded to VirtSpace and to World Labs, which builds your 3D space."),
         ("lock", "Your spaces are private to you."),
-        ("photo", "The original photos are deleted after processing."),
+        ("photo", "Your original photos are kept until you delete the space."),
         ("trash", "You can delete any space, or your data, at any time."),
     ]
 
@@ -62,6 +62,7 @@ struct TermsView: View {
         .sheet(isPresented: $showsFullTerms) {
             NavigationStack {
                 TermsOfUseView()
+                    .navigationTitle("Terms of use")
                     .toolbar {
                         ToolbarItem(placement: .confirmationAction) {
                             Button("Done") { showsFullTerms = false }
@@ -107,7 +108,7 @@ struct TermsOfUseView: View {
         ("Your spaces are private",
          "Only you can see your spaces. We never sell your data, show ads, or share your spaces with anyone."),
         ("Keeping and deleting",
-         "The original photos are deleted from our server after processing. The finished 3D space and its 360° photo stay until you delete them. Delete any space from its page in the Library. To have all your data removed, ask the person who shared the app with you."),
+         "Your original photos stay on our server so your space can be rebuilt or improved, and are deleted when you delete the space. The finished 3D space and its 360° photo also stay until you delete the space. Delete any space from its page in the Library. To have all your data removed, ask the person who shared the app with you."),
         ("Be considerate",
          "Only scan places you are allowed to, and do not scan people without their permission."),
         ("Changes",
@@ -133,7 +134,6 @@ struct TermsOfUseView: View {
             .padding(Theme.Space.m)
         }
         .background(Theme.bg)
-        .navigationTitle("Terms of use")
         .navigationBarTitleDisplayMode(.inline)
     }
 }
