@@ -2,150 +2,202 @@
 //  LibraryView.swift
 //  VirtSpace
 //
-//  The user's private gallery of scans (spec §6.3). Cards show title, status
-//  chip, relative time, and thumbnail. Pull-to-refresh; while any world has an
-//  active job the list polls every 3 s (Task-based, cancelled on disappear).
+//  The user's spaces (ui-spec 4.5). Reads everything from the app-scoped
+//  WorldStore (one list, one poll loop), so a space created on Scan or
+//  deleted on Detail shows up here without a pull to refresh. The stack is
+//  bound to `router.libraryPath` so other screens can open a space.
+//
+//  States: placeholder cards on first load; "No spaces yet" only after a
+//  successful empty load; "Can't load your library" when a load failed with
+//  nothing cached; cards plus an offline banner after 2 failed polls.
 //
 
 import SwiftUI
 
 struct LibraryView: View {
     @Environment(APIClient.self) private var api
-
-    @State private var worlds: [World] = []
-    @State private var isLoading = false
-    @State private var hasLoadedOnce = false
+    @Environment(WorldStore.self) private var store
     @Environment(ToastCenter.self) private var toasts
-    @State private var pollTask: Task<Void, Never>?
+    @Environment(AppRouter.self) private var router
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    /// Client-truth "Uploading i/N" per world id, read from pending capture
-    /// session manifests on each refresh tick (the server only knows the
-    /// world is `uploading`; the manifest knows how many frames landed).
-    @State private var uploadProgressByWorld: [String: UploadProgress] = [:]
-    private let pendingSessions = PendingSessionStore()
-
-    struct UploadProgress: Equatable {
-        let uploaded: Int
-        let total: Int
-    }
-
+    @State private var uploads: [String: UploadProgress] = [:]
+    @State private var pendingDelete: World?
+    @State private var improveTarget: World?
+    @State private var acceptedCount = 0
     @State private var showSettings = false
-
-    // Debug log viewer entry (Stage B3 deliverable 3c).
     @State private var showDebugLog = false
     @State private var titleTapCount = 0
     @State private var firstTitleTapAt = Date.distantPast
 
-    private var anyActive: Bool { worlds.contains { $0.status.isActive } }
-
-    var body: some View {
-        NavigationStack {
-            Group {
-                if worlds.isEmpty {
-                    emptyState
-                } else {
-                    worldList
-                }
-            }
-            .navigationBarTitleDisplayMode(.inline)
-            .background(Color(.systemBackground))
-            .toolbar {
-                // A tappable title stands in for the nav title so the secret
-                // gesture has a reliable hit target.
-                ToolbarItem(placement: .principal) {
-                    Text("Library")
-                        .font(.headline)
-                        .onTapGesture { registerTitleTap() }
-                }
-                ToolbarItem(placement: .topBarLeading) {
-                    Button {
-                        showSettings = true
-                    } label: {
-                        Image(systemName: "gearshape")
-                    }
-                    .accessibilityLabel("Settings")
-                }
-                // Wrench/ladybug shortcut — DEBUG builds only. TestFlight
-                // (release) builds strip this, so the 5-tap-on-title gesture
-                // below is the ALWAYS-available path to reach the log viewer.
-                #if DEBUG
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        showDebugLog = true
-                    } label: {
-                        Image(systemName: "ladybug")
-                    }
-                    .accessibilityLabel("Debug logs")
-                }
-                #endif
-            }
-            .sheet(isPresented: $showDebugLog) {
-                DebugLogView()
-            }
-            .sheet(isPresented: $showSettings) {
-                SettingsView()
-            }
-        }
-        .task {
-            if !hasLoadedOnce {
-                await refresh(showErrors: true)
-                hasLoadedOnce = true
-            }
-            startPollingIfNeeded()
-        }
-        .onDisappear {
-            pollTask?.cancel()
-            pollTask = nil
-        }
-        .onChange(of: anyActive) {
-            startPollingIfNeeded()
-        }
+    private var actions: SpaceActions {
+        SpaceActions(api: api, store: store, toasts: toasts, router: router)
     }
 
-    // MARK: - Subviews
+    private var listState: LibraryListState {
+        LibraryListState(isEmpty: store.worlds.isEmpty, hasLoaded: store.hasLoaded, lastError: store.lastError)
+    }
 
-    private var worldList: some View {
-        ScrollView {
-            LazyVStack(spacing: 14) {
-                ForEach(worlds) { world in
-                    NavigationLink(value: world.id) {
-                        WorldCard(world: world, uploadProgress: uploadProgressByWorld[world.id])
-                    }
-                    .buttonStyle(.plain)
+    private var uploadingIDs: [String] {
+        store.worlds.filter { $0.status == .uploading }.map(\.id)
+    }
+
+    var body: some View {
+        @Bindable var router = router
+        NavigationStack(path: $router.libraryPath) {
+            content
+                .navigationTitle("Library")
+                .navigationBarTitleDisplayMode(.large)
+                .background(Theme.bg)
+                .toolbar { toolbar }
+                .navigationDestination(for: String.self) { WorldDetailView(worldId: $0) }
+        }
+        .task {
+            // No backend calls from a hosted test run (TestEnvironment).
+            guard !TestEnvironment.isRunningUnderXCTest, !store.hasLoaded else { return }
+            await store.refresh()
+        }
+        .readingUploadProgress(for: uploadingIDs, into: $uploads)
+        .sensoryFeedback(.impact(weight: .light), trigger: acceptedCount)
+        .deleteSpaceDialog(for: $pendingDelete, actions: actions)
+        .sheet(item: $improveTarget) { world in
+            ImproveQualitySheet { await retry(world) }
+        }
+        .sheet(isPresented: $showSettings) { SettingsView() }
+        .sheet(isPresented: $showDebugLog) { DebugLogView() }
+    }
+
+    // MARK: - States
+
+    private var content: some View {
+        let state = listState
+        return ScrollView {
+            Group {
+                switch state {
+                case .loading: placeholders
+                case .empty: emptyState
+                case .failed(let cause): errorState(cause)
+                case .content: cards
                 }
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 8)
+            .transition(.opacity)
         }
-        .refreshable { await refresh(showErrors: true) }
-        .navigationDestination(for: String.self) { worldId in
-            WorldDetailView(worldId: worldId, initialWorld: worlds.first { $0.id == worldId })
+        .refreshable { await store.refresh() }
+        .animation(Theme.Motion.standard, value: state)
+    }
+
+    private var placeholders: some View {
+        VStack(spacing: Theme.Space.m) {
+            PlaceholderCard()
+            PlaceholderCard()
         }
+        .padding(.horizontal, Theme.Space.m)
     }
 
     private var emptyState: some View {
-        ScrollView {
-            VStack(spacing: 14) {
-                Spacer(minLength: 120)
-                Image(systemName: "square.grid.2x2")
-                    .font(.system(size: 44, weight: .light))
-                    .foregroundStyle(.secondary)
-                Text(hasLoadedOnce && !isLoading ? "No worlds yet" : "Loading…")
-                    .font(.title3.weight(.semibold))
-                Text("Capture a space and it will appear here.")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-            }
-            .frame(maxWidth: .infinity)
+        ContentUnavailableView {
+            Label("No spaces yet", systemImage: "cube.transparent")
+        } description: {
+            Text("Scan a room and it will show up here.")
+        } actions: {
+            Button("Scan a room") { router.selectedTab = .scan }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
         }
-        .refreshable { await refresh(showErrors: true) }
+        .containerRelativeFrame(.vertical)
     }
 
-    // MARK: - Debug log gesture
+    private func errorState(_ cause: String) -> some View {
+        ContentUnavailableView {
+            Label("Can't load your library", systemImage: "wifi.exclamationmark")
+        } description: {
+            Text(cause)
+        } actions: {
+            Button { Task { await store.refresh() } } label: {
+                BusyLabel(title: "Try again", busyTitle: "Try again", isBusy: store.isLoading)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.large)
+            .disabled(store.isLoading)
+        }
+        .containerRelativeFrame(.vertical)
+    }
+
+    private var cards: some View {
+        LazyVStack(spacing: Theme.Space.m) {
+            if LibraryListState.showsOfflineBanner(listState, consecutiveFailures: store.consecutiveFailures) {
+                OfflineBanner()
+                    .transition(.opacity)
+            }
+            ForEach(store.worlds) { world in
+                NavigationLink(value: world.id) {
+                    SpaceCard(world: world, upload: uploads[world.id], pollsFailing: store.consecutiveFailures > 0)
+                }
+                .buttonStyle(.plain)
+                .contextMenu { menu(for: world) }
+                .transition(reduceMotion ? .opacity : .opacity.combined(with: .scale(scale: 0.97)))
+            }
+            if store.hasMore {
+                ProgressView()
+                    .frame(maxWidth: .infinity, minHeight: Theme.minTarget)
+                    .onAppear { Task { await store.loadMore() } }
+            }
+        }
+        .padding(.horizontal, Theme.Space.m)
+        .padding(.bottom, Theme.Space.m)
+        .animation(Theme.Motion.standard, value: store.worlds.map(\.id))
+        .animation(Theme.Motion.standard, value: store.consecutiveFailures >= 2)
+    }
+
+    // MARK: - Context menu
+
+    @ViewBuilder private func menu(for world: World) -> some View {
+        if let cost = world.status.presentation().retry {
+            Button {
+                if cost == .needsConfirmation {
+                    improveTarget = world
+                } else {
+                    Task { await retry(world) }
+                }
+            } label: {
+                Label("Try again", systemImage: "arrow.clockwise")
+                if cost == .usesScan { Text("Uses 1 of today's scans") }
+            }
+        }
+        Button(role: .destructive) { pendingDelete = world } label: {
+            Label("Delete", systemImage: "trash")
+        }
+    }
+
+    private func retry(_ world: World) async {
+        switch await actions.run(.retry, on: world) {
+        case .accepted: acceptedCount += 1
+        case .scanQuota(let resetAt): toasts.show(APIError.scanQuota(resetAt: resetAt))
+        default: break
+        }
+    }
+
+    // MARK: - Toolbar
+
+    @ToolbarContentBuilder private var toolbar: some ToolbarContent {
+        // The 5-tap debug gesture lives on the title; it keeps its header trait.
+        ToolbarItem(placement: .largeTitle) {
+            Text("Library")
+                .font(.largeTitle.bold())
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .accessibilityAddTraits(.isHeader)
+                .onTapGesture { registerTitleTap() }
+        }
+        ToolbarItemGroup(placement: .topBarTrailing) {
+            #if DEBUG
+            Button("Debug logs", systemImage: "ladybug") { showDebugLog = true }
+            #endif
+            Button("Settings", systemImage: "gearshape") { showSettings = true }
+        }
+    }
 
     /// Five taps on the title within 2 s opens the debug log viewer. This is
-    /// the release/TestFlight-safe entry point (no #if DEBUG), so the owner can
-    /// pull logs from a build that has no debug toolbar button.
+    /// the release/TestFlight-safe entry point (no #if DEBUG).
     private func registerTitleTap() {
         let now = Date()
         if now.timeIntervalSince(firstTitleTapAt) > 2 {
@@ -158,235 +210,30 @@ struct LibraryView: View {
             showDebugLog = true
         }
     }
-
-    // MARK: - Data
-
-    private func refresh(showErrors: Bool) async {
-        // No backend calls from a hosted test run (TestEnvironment).
-        guard !TestEnvironment.isRunningUnderXCTest else { return }
-        if isLoading { return }
-        isLoading = true
-        defer { isLoading = false }
-        do {
-            worlds = try await api.listWorlds().worlds
-            await refreshUploadProgress()
-        } catch {
-            if showErrors, !Task.isCancelled {
-                toasts.show(error)
-            }
-        }
-    }
-
-    /// Consult pending capture-session manifests for every world the server
-    /// still reports as `uploading` — client truth for "Uploading i/N".
-    private func refreshUploadProgress() async {
-        var byWorld: [String: UploadProgress] = [:]
-        for world in worlds where world.status == .uploading {
-            if let (uploaded, total) = await pendingSessions.pendingSessionProgress(worldId: world.id) {
-                byWorld[world.id] = UploadProgress(uploaded: uploaded, total: total)
-            }
-        }
-        uploadProgressByWorld = byWorld
-    }
-
-    /// Polls listWorlds every 3 s while any world is in an active status.
-    private func startPollingIfNeeded() {
-        pollTask?.cancel()
-        pollTask = nil
-        guard anyActive else { return }
-        pollTask = Task {
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(3))
-                if Task.isCancelled { return }
-                await refresh(showErrors: false)
-                if !anyActive { return }
-            }
-        }
-    }
 }
 
-// MARK: - WorldCard
-
-struct WorldCard: View {
-    let world: World
-    /// Client-truth "Uploading i/N" from the pending session manifest, when
-    /// this world is still uploading and its session is on this device.
-    var uploadProgress: LibraryView.UploadProgress?
-
+/// "Offline. Showing your last update." (ui-spec 4.5): an ongoing condition,
+/// so an inline banner, not a toast.
+struct OfflineBanner: View {
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            thumbnail
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(alignment: .center, spacing: 10) {
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(world.title)
-                            .font(.headline)
-                            .foregroundStyle(.primary)
-                            .lineLimit(1)
-                        HStack(spacing: 6) {
-                            if let place = world.placeName, !place.isEmpty {
-                                Text(place)
-                                    .lineLimit(1)
-                                Text("·")
-                            }
-                            Text(relativeTime)
-                        }
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    StatusChip(status: world.status)
-                }
-                if world.status == .uploading, let up = uploadProgress {
-                    HStack(spacing: 8) {
-                        ProgressView(value: Double(up.uploaded), total: Double(max(up.total, 1)))
-                            .tint(world.status.presentation(hasLocalUpload: true).tone.color)
-                        Text("Uploading \(up.uploaded)/\(up.total)")
-                            .font(.caption2.monospacedDigit())
-                            .foregroundStyle(.secondary)
-                            .fixedSize()
-                    }
-                } else {
-                    PipelineActivityView(
-                        status: world.status,
-                        progress: world.progress,
-                        heartbeatAt: world.heartbeatAt
-                    )
-                }
-            }
-            .padding(12)
+        Label {
+            Text("Offline. Showing your last update.").foregroundStyle(Theme.textPrimary)
+        } icon: {
+            Image(systemName: "wifi.slash").foregroundStyle(Theme.warning)
         }
-        .background(Color(.secondarySystemBackground))
-        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-    }
-
-    private var thumbnail: some View {
-        ZStack {
-            Rectangle()
-                .fill(
-                    LinearGradient(
-                        colors: [Color(.tertiarySystemBackground), Color(.secondarySystemBackground)],
-                        startPoint: .topLeading, endPoint: .bottomTrailing
-                    )
-                )
-            // List items carry a thumbnail-only `assets` object from the API.
-            if let url = world.assets?.thumbnailAsURL {
-                AsyncImage(url: url) { phase in
-                    switch phase {
-                    case .success(let image):
-                        image.resizable().scaledToFill()
-                    case .failure:
-                        placeholderIcon
-                    default:
-                        ProgressView()
-                    }
-                }
-            } else {
-                placeholderIcon
-            }
-        }
-        .frame(height: 150)
-        .frame(maxWidth: .infinity)
-        .clipped()
-    }
-
-    private var placeholderIcon: some View {
-        Image(systemName: world.status.isActive ? "hourglass" : "cube.transparent")
-            .font(.system(size: 30, weight: .light))
-            .foregroundStyle(.tertiary)
-    }
-
-    private var relativeTime: String {
-        guard let created = world.createdAt else { return "Just now" }
-        return created.formatted(.relative(presentation: .named))
-    }
-}
-
-// MARK: - PipelineActivityView
-
-/// Server-truth activity readout for a world in an active pipeline phase
-/// (stitching / generating): a determinate progress bar when the backend
-/// reports within-phase `progress`, plus a heartbeat-staleness caption —
-/// fresh (<~90 s since the pipeline last touched the row) reads as a subtle
-/// "working · updated Xs ago"; older turns amber "taking longer than usual".
-/// The Library/Detail 3 s polling keeps both current. Renders nothing for
-/// inactive statuses (and for uploading, whose truth is client-side).
-struct PipelineActivityView: View {
-    let status: WorldStatus
-    let progress: Int?
-    let heartbeatAt: Date?
-
-    /// Heartbeat age (seconds) past which the pipeline reads as stalled.
-    private static let staleAfterSeconds: TimeInterval = 90
-
-    private var isActivePipelinePhase: Bool {
-        switch status {
-        case .stitching, .generatingDraft, .generatingHq: return true
-        default: return false
-        }
-    }
-
-    var body: some View {
-        if isActivePipelinePhase, progress != nil || heartbeatCaption != nil {
-            VStack(alignment: .leading, spacing: 4) {
-                if let progress {
-                    HStack(spacing: 8) {
-                        ProgressView(value: Double(min(max(progress, 0), 100)), total: 100)
-                            .tint(status.presentation().tone.color)
-                        Text("\(progress)%")
-                            .font(.caption2.monospacedDigit())
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                if let caption = heartbeatCaption {
-                    Text(caption.text)
-                        .font(.caption2)
-                        .foregroundStyle(caption.isStale ? Color.orange : Color.secondary)
-                }
-            }
-        }
-    }
-
-    private var heartbeatCaption: (text: String, isStale: Bool)? {
-        guard let heartbeatAt else { return nil }
-        let age = Date().timeIntervalSince(heartbeatAt)
-        if age > Self.staleAfterSeconds {
-            return ("Taking longer than usual — still trying", true)
-        }
-        return ("working · updated \(max(0, Int(age)))s ago", false)
-    }
-}
-
-// MARK: - StatusChip
-
-struct StatusChip: View {
-    let status: WorldStatus
-
-    var body: some View {
-        let presentation = status.presentation()
-        let tint = presentation.tone.color
-        HStack(spacing: 5) {
-            if status.isActive {
-                ProgressView()
-                    .controlSize(.mini)
-                    .tint(tint)
-            } else {
-                Image(systemName: presentation.symbol)
-                    .font(.caption2)
-            }
-            Text(presentation.pill)
-                .font(.caption.weight(.medium))
-        }
-        .foregroundStyle(tint)
-        .padding(.horizontal, 9)
-        .padding(.vertical, 5)
-        .background(tint.opacity(0.14), in: Capsule())
+        .font(.subheadline)
+        .padding(Theme.Space.s)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Theme.surface, in: RoundedRectangle(cornerRadius: Theme.Radius.small, style: .continuous))
+        .accessibilityElement(children: .combine)
     }
 }
 
 #Preview {
+    let api = APIClient()
     LibraryView()
-        .environment(APIClient())
+        .environment(api)
+        .environment(WorldStore(api: api))
         .environment(ToastCenter())
-        .preferredColorScheme(.dark)
+        .environment(AppRouter())
 }
