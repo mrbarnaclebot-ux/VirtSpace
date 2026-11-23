@@ -102,7 +102,7 @@ struct WorldDetailView: View {
     // MARK: - Layout
 
     private func loaded(_ world: World) -> some View {
-        let p = world.status.presentation(hasLocalUpload: uploads[worldId] != nil)
+        let p = world.status.presentation(hasLocalUpload: uploads[worldId] != nil, roomScan: world.isRoomScan)
         let isBuilding = world.status.isActive && p.step != nil
         return VStack(alignment: .leading, spacing: Theme.Space.l) {
             if loadError != nil || store.consecutiveFailures >= 2 {

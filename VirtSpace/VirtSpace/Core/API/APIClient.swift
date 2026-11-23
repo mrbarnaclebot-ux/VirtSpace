@@ -160,6 +160,28 @@ final class APIClient {
         return (world, resp.uploads, depthUploads)
     }
 
+    /// Mint a room-scan world (spec §5.3): one presigned PUT for the bundle
+    /// plus the server's frame ceiling. Same Idempotency-Key, quota and rate
+    /// limit as a spot-scan create.
+    func createRoomScan(
+        frameCount: Int,
+        bundleBytes: Int,
+        title: String,
+        idempotencyKey: UUID
+    ) async throws -> (world: World, upload: FrameUpload, maxFrames: Int?) {
+        let body = try encoder.encode(CreateRoomScanRequest(frameCount: frameCount, bundleBytes: bundleBytes, title: title))
+        var req = request("POST", "v1/worlds", body: body)
+        req?.setValue(idempotencyKey.uuidString, forHTTPHeaderField: "Idempotency-Key")
+        let resp: CreateRoomScanResponse = try decode(try await send(req))
+        return (resp.world, resp.bundleUpload.slot, resp.maxFrames)
+    }
+
+    /// Re-sign a room scan's bundle PUT (expired presign, resume).
+    func refreshBundleUpload(worldId: String) async throws -> FrameUpload {
+        let resp: RefreshBundleResponse = try decode(try await send(request("POST", "v1/worlds/\(worldId)/uploads:refresh")))
+        return resp.bundleUpload.slot
+    }
+
     /// Signal all frames uploaded. `poses` (when present) is included in the
     /// body so the backend can persist per-frame ARKit attitude for
     /// pose-assisted stitching; the field is optional on the contract.

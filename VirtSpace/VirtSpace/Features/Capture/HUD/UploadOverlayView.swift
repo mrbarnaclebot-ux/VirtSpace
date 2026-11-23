@@ -16,6 +16,8 @@ struct UploadOverlayView: View {
     let total: Int
     /// First-scan finale ("That's everything."), shown above the ring.
     var lead: String?
+    /// A room scan has no photo count: its stage line under a spinner.
+    var message: String?
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -58,7 +60,7 @@ struct UploadOverlayView: View {
                 }
                 ring
                 VStack(spacing: Theme.Space.xs) {
-                    Text(phase.title)
+                    Text(message ?? phase.title)
                         .font(.headline)
                         .foregroundStyle(.white)
                         .contentTransition(.opacity)
@@ -82,7 +84,7 @@ struct UploadOverlayView: View {
     private var ring: some View {
         ZStack {
             Circle().stroke(Color.white.opacity(0.12), lineWidth: 6)
-            if let counter = phase.counter {
+            if message == nil, let counter = phase.counter {
                 Circle()
                     .trim(from: 0, to: fraction)
                     .stroke(Theme.accent, style: StrokeStyle(lineWidth: 6, lineCap: .round))

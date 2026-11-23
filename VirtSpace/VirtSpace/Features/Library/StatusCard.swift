@@ -21,13 +21,13 @@ struct StepList: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        let p = world.status.presentation(hasLocalUpload: upload != nil)
+        let p = world.status.presentation(hasLocalUpload: upload != nil, roomScan: world.isRoomScan)
         let current = p.step ?? 1
         VStack(alignment: .leading, spacing: Theme.Space.s) {
-            ForEach(Array(StatusPresentation.steps.enumerated()), id: \.offset) { index, label in
+            ForEach(Array(p.steps.enumerated()), id: \.offset) { index, label in
                 row(label, step: index + 1, current: current, p: p)
             }
-            Text("Usually 1 to 2 minutes. You can leave this screen.")
+            Text(p.buildEstimate)
                 .font(.footnote)
                 .foregroundStyle(Theme.textSecondary)
             if world.status.isSlow(heartbeatAt: world.heartbeatAt, pollsFailing: pollsFailing) {

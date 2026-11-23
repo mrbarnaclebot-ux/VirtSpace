@@ -33,14 +33,19 @@ struct StatusPresentation: Equatable {
     var isProgressMeasured = false
     /// Non-nil when a `:retry` is offered, with what it costs.
     var retry: RetryCost?
+    /// The build steps this space goes through, and how long they take.
+    var steps = Self.spotSteps
+    var buildEstimate = "Usually 1 to 2 minutes. You can leave this screen."
 
     /// The build step list, in order (ui-spec 4.6).
-    static let steps = ["Uploading photos", "Combining photos", "Building your space"]
+    static let spotSteps = ["Uploading photos", "Combining photos", "Building your space"]
+    /// A room scan has no combine step (spec §5.3).
+    static let roomSteps = ["Uploading photos", "Building your space"]
 
     /// "Step 2 of 3 · Combining photos", or nil outside the build.
     var stepLine: String? {
-        guard let step else { return nil }
-        return "Step \(step) of \(Self.steps.count) · \(Self.steps[step - 1])"
+        guard let step, steps.indices.contains(step - 1) else { return nil }
+        return "Step \(step) of \(steps.count) · \(steps[step - 1])"
     }
 
     /// True while work is running: shows the in-progress dot.
@@ -61,8 +66,18 @@ enum RetryCost: Equatable {
 
 extension WorldStatus {
     /// `hasLocalUpload`: the capture session for this world is still on this
-    /// phone (only changes the `uploading` copy).
-    func presentation(hasLocalUpload: Bool = false) -> StatusPresentation {
+    /// phone (only changes the `uploading` copy). `roomScan`: a walked room
+    /// (spec §5.3), two steps and a long build.
+    func presentation(hasLocalUpload: Bool = false, roomScan: Bool = false) -> StatusPresentation {
+        var p = basePresentation(hasLocalUpload: hasLocalUpload)
+        if roomScan, p.step != nil {
+            p.steps = StatusPresentation.roomSteps
+            p.buildEstimate = "Usually 30 minutes to 2 hours. You can leave the app."
+        }
+        return p
+    }
+
+    private func basePresentation(hasLocalUpload: Bool) -> StatusPresentation {
         switch self {
         case .capturing:
             return StatusPresentation(pill: "Scanning", symbol: "viewfinder", tone: .progress)
@@ -77,6 +92,9 @@ extension WorldStatus {
         case .generatingDraft:
             return StatusPresentation(pill: "Building", symbol: "cube.transparent", tone: .progress, step: 3,
                                       detail: "Usually under a minute.")
+        case .reconstructing:
+            return StatusPresentation(pill: "Building", symbol: "cube.transparent", tone: .progress, step: 2,
+                                      detail: "Usually 30 minutes to 2 hours.", isProgressMeasured: true)
         case .draftReady:
             return Self.ready
         case .generatingHq:
@@ -108,6 +126,10 @@ extension WorldStatus {
             return StatusPresentation(pill: attention.pill, symbol: attention.symbol, tone: .danger,
                                       detail: "Couldn't build your space. This is usually temporary. Try again.",
                                       retry: .usesScan)
+        case "failed_reconstructing":
+            return StatusPresentation(pill: attention.pill, symbol: attention.symbol, tone: .danger,
+                                      detail: "Couldn't build your space. This is usually temporary. Try again.",
+                                      retry: .usesScan)
         case "failed_generating_hq":
             var ready = Self.ready
             ready.note = "Quality upgrade failed"
@@ -121,12 +143,14 @@ extension WorldStatus {
         }
     }
 
-    /// The server's `progress` (0-100) as a 0...1 fraction, only when it is
-    /// measured: stitching. nil for everything else, including the
+    /// The server's `progress` (0-100) as a 0...1 fraction, for stitching and
+    /// for a room scan's build (provider progress when it reports one, else
+    /// pseudo-progress over the 30 min–2 h quote: a bar beats a spinner for
+    /// hours, spec §5.3 item 4). nil for everything else, including the
     /// elapsed-time pseudo-progress of `generating_*`. Upload progress comes
     /// from the local manifest, not from here.
     func measuredFraction(serverProgress: Int?) -> Double? {
-        guard self == .stitching, let serverProgress else { return nil }
+        guard self == .stitching || self == .reconstructing, let serverProgress else { return nil }
         return Double(min(max(serverProgress, 0), 100)) / 100
     }
 

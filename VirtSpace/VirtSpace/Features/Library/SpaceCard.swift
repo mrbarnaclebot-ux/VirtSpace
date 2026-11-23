@@ -18,7 +18,7 @@ struct SpaceCard: View {
     private static let inset = Theme.Space.xs
 
     var body: some View {
-        let p = world.status.presentation(hasLocalUpload: upload != nil)
+        let p = world.status.presentation(hasLocalUpload: upload != nil, roomScan: world.isRoomScan)
         VStack(alignment: .leading, spacing: 0) {
             SpaceThumbnail(url: world.assets?.thumbnailAsURL, isBuilding: world.status.isActive)
                 .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.card - Self.inset, style: .continuous))

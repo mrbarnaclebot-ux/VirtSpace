@@ -39,13 +39,19 @@ struct CaptureView: View {
                         total: hud.targets.count,
                         lead: model.coach.tip == .finished ? FirstScanCoach.finishedText : nil
                     )
+                } else if let stage = model.roomUploadStage {
+                    UploadOverlayView(uploaded: 0, total: 0, message: stage.message)
                 }
             }
             .animation(Theme.Motion.standard, value: model.uploadedFrames == nil)
+            .animation(Theme.Motion.standard, value: model.roomUploadStage == nil)
             .animation(Theme.Motion.standard, value: hud.isThermallyPaused)
             .navigationBarHidden(true)
             .onChange(of: hud.state) { _, newState in
                 model.engineStateChanged(to: newState)
+            }
+            .onChange(of: model.roomHUD.state) { _, newState in
+                model.roomStateChanged(to: newState)
             }
             .onChange(of: hud.capturedCount) { _, count in
                 model.capturedCountChanged(to: count)
@@ -59,6 +65,9 @@ struct CaptureView: View {
                 model.worldStore = worldStore
                 model.router = router
                 await model.resumePendingOnce()
+                #if DEBUG && targetEnvironment(simulator)
+                await model.debugAutoRoomScan()
+                #endif
             }
         }
         .environment(\.colorScheme, .dark)
@@ -67,6 +76,34 @@ struct CaptureView: View {
 
     @ViewBuilder
     private var content: some View {
+        if model.roomHUD.isLive {
+            roomScanContent
+        } else {
+            spotScanContent
+        }
+    }
+
+    /// Room scan (spec §5.3): one structural identity for the camera layer
+    /// from start to finish, for the same ARSCNView reason as below.
+    private var roomScanContent: some View {
+        ZStack {
+            #if targetEnvironment(simulator)
+            SimulatedCameraBackdrop()
+            #else
+            CameraPreviewView(session: model.roomEngine.arSession).ignoresSafeArea()
+            #endif
+            if model.roomHUD.state == .scanning {
+                RoomScanHUDView(
+                    hud: model.roomHUD,
+                    onFinish: { model.roomEngine.finish() },
+                    onCancel: { model.roomEngine.cancel() }
+                )
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var spotScanContent: some View {
         switch hud.state {
         case .idle, .failed:
             CaptureStartView(model: model)

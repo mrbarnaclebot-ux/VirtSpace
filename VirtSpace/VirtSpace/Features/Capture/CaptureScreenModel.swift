@@ -14,12 +14,26 @@ import Foundation
 import Observation
 import UIKit
 
+/// Spot scan (stand still, follow the dots → Marble) or room scan (walk
+/// the room → Echo-3 reconstruction, spec §5.3).
+enum ScanMode: String, Hashable {
+    case spot, room
+}
+
 @MainActor
 @Observable
 final class CaptureScreenModel {
     /// Actions (start / cancel / reset / thermal resume). Views render `hud`.
     let engine: CaptureEngine
     var hud: CaptureHUDState { engine.hud }
+    /// The room-scan capture; its HUD drives the screen while it is live.
+    let roomEngine = RoomScanEngine()
+    var roomHUD: RoomScanHUD { roomEngine.hud }
+    var scanMode = ScanMode.spot
+    /// Non-nil while a room scan uploads: the overlay's line.
+    private(set) var roomUploadStage: RoomScanUploader.Stage? {
+        didSet { updateScreenAwake() }
+    }
 
     /// Non-nil while an upload is in flight (frames done so far): drives the
     /// full-screen upload overlay.
@@ -84,8 +98,65 @@ final class CaptureScreenModel {
 
     /// Start the engine with coaching set up for this scan.
     func startEngine() {
+        if scanMode == .room {
+            Task { await roomEngine.start(maxFrames: RoomScanUploader.maxFrames) }
+            return
+        }
         coach.begin(firstScan: !defaults.bool(forKey: FirstScanCoach.defaultsKey))
         engine.start()
+    }
+
+    // MARK: - Room scan
+
+    #if DEBUG && targetEnvironment(simulator)
+    /// Simulator-only autopilot (no tap automation under Xcode 27):
+    /// `VIRTSPACE_DEBUG_ROOM_SCAN_SECONDS=N` starts one room scan at launch
+    /// and taps Finish after N seconds. Pair with `VIRTSPACE_API_BASE_URL`.
+    static let debugRoomScanSeconds = ProcessInfo.processInfo.environment["VIRTSPACE_DEBUG_ROOM_SCAN_SECONDS"].flatMap(Double.init)
+    private static var debugRoomScanStarted = false
+
+    func debugAutoRoomScan() async {
+        guard let seconds = Self.debugRoomScanSeconds, !Self.debugRoomScanStarted else { return }
+        Self.debugRoomScanStarted = true
+        scanMode = .room
+        startEngine()
+        try? await Task.sleep(for: .seconds(seconds))
+        roomEngine.finish()
+    }
+    #endif
+
+    func roomStateChanged(to state: RoomScanHUD.State) {
+        switch state {
+        case .finished(let id):
+            Task { await uploadRoomScan(id) }
+        case .failed(let message):
+            toasts.show(message, style: .error)
+            roomEngine.reset()
+        default:
+            break
+        }
+        updateScreenAwake()
+    }
+
+    private func uploadRoomScan(_ id: UUID) async {
+        roomUploadStage = .preparing
+        defer { roomUploadStage = nil }
+        let handle = UploadManager.shared.kickRoomScanUpload(sessionID: id, api: api) { [weak self] stage in
+            self?.roomUploadStage = stage
+        }
+        let outcome = await handle.value
+        roomEngine.reset()
+        await refreshPendingUpload()
+        switch outcome {
+        case .success(let world?):
+            routeToNewSpace(world)
+        case .success(nil):
+            uploadFailureMessage = nil
+            router?.selectedTab = .library
+            await worldStore?.refresh()
+        case .failure(let error):
+            uploadFailureMessage = "Upload didn't finish. Your scan is saved on this phone. " + Self.cause(of: error)
+        }
     }
 
     /// Keep the screen awake for the full capture + upload arc (belt-and-braces
@@ -100,7 +171,8 @@ final class CaptureScreenModel {
 
     private func updateScreenAwake() {
         UIApplication.shared.isIdleTimerDisabled =
-            Self.keepsScreenAwake(state: hud.state, isUploading: uploadedFrames != nil)
+            Self.keepsScreenAwake(state: hud.state, isUploading: uploadedFrames != nil || roomUploadStage != nil)
+            || roomHUD.isLive
     }
 
     /// Belt-and-braces: always hand the screen back when the view goes away.

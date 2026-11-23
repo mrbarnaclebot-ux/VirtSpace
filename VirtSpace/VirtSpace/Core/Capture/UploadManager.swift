@@ -81,6 +81,27 @@ final class UploadManager {
         }
     }
 
+    /// Upload a room scan the engine just finished (spec §5.3). `stage`
+    /// drives the overlay. `.success(nil)`: the server already had it.
+    @discardableResult
+    func kickRoomScanUpload(
+        sessionID: UUID,
+        api: APIClient,
+        stage: @escaping (RoomScanUploader.Stage) -> Void
+    ) -> Task<Result<World?, Error>, Never> {
+        if consentMissing("room scan upload") {
+            return Task { .failure(APIError.localState(Self.consentMissingMessage)) }
+        }
+        return enqueue {
+            do {
+                return .success(try await RoomScanUploader(api: api).uploadFinished(sessionID: sessionID, stage: stage))
+            } catch {
+                AppLog.upload.error("UploadManager: room scan upload failed: \(error.localizedDescription, privacy: .public)")
+                return .failure(error)
+            }
+        }
+    }
+
     /// Retry the sessions left on disk (stranded-completion first, then full
     /// resume). `userInitiated` marks the user's explicit Retry: it clears the
     /// attempt counter, ignores backoff and un-parks the session.
@@ -98,12 +119,13 @@ final class UploadManager {
             let uploader = CaptureUploader(api: api)
             // Cheap idempotent recovery for the exact stranded state first.
             let stranded = await uploader.completeStrandedSessions(userInitiated: userInitiated)
-            let outcome = await uploader.resumePending(userInitiated: userInitiated, progress: progress)
+            var outcome = await uploader.resumePending(userInitiated: userInitiated, progress: progress)
             AppLog.upload.log("UploadManager: resume flow finished (\(stranded) stranded completed, outcome: \(String(describing: outcome), privacy: .public))")
             // A stranded session finished by frames:done IS a success even when
             // the sweep itself had nothing left to upload.
-            if stranded > 0, case .nothingToResume = outcome { return .succeeded([]) }
-            return outcome
+            if stranded > 0, case .nothingToResume = outcome { outcome = .succeeded([]) }
+            let rooms = await RoomScanUploader(api: api).resumePending(userInitiated: userInitiated)
+            return outcome.merged(with: rooms)
         }
     }
 
@@ -112,13 +134,17 @@ final class UploadManager {
     @discardableResult
     func kickDiscardPending(api: APIClient) -> Task<Int, Never> {
         enqueue {
-            await CaptureUploader(api: api).discardPending()
+            let rooms = await RoomScanUploader(api: api).discardPending()
+            return await CaptureUploader(api: api).discardPending() + rooms
         }
     }
 
     /// What's waiting on disk, for the capture screen's affordances.
     func pendingSummary(api: APIClient) async -> PendingUploadSummary {
-        await CaptureUploader(api: api).pendingSummary()
+        let spot = await CaptureUploader(api: api).pendingSummary()
+        let rooms = await RoomScanUploader(api: api).pendingSummary()
+        return PendingUploadSummary(pendingCount: spot.pendingCount + rooms.pendingCount,
+                                    parkedCount: spot.parkedCount + rooms.parkedCount)
     }
 
     /// Completion kick (launch + every scenePhase → .active): any pending
@@ -129,7 +155,10 @@ final class UploadManager {
     func kickStrandedRecovery(api: APIClient) -> Task<Int, Never> {
         if consentMissing("stranded recovery") { return Task { 0 } }
         return enqueue {
-            await CaptureUploader(api: api).completeStrandedSessions()
+            // Room scans: the automatic sweep (backoff and parking apply)
+            // finishes a stranded bundle or resumes its PUT.
+            _ = await RoomScanUploader(api: api).resumePending(userInitiated: false)
+            return await CaptureUploader(api: api).completeStrandedSessions()
         }
     }
 
@@ -152,5 +181,20 @@ final class UploadManager {
     /// reader assuming otherwise — and stops anyone silently moving it.
     private func enqueue<T>(_ op: @escaping @MainActor () async -> T) -> Task<T, Never> {
         Task { await op() }
+    }
+}
+
+extension ResumeOutcome {
+    /// Two sweeps (spot and room scans) as one answer: any success wins,
+    /// then any failure, then any deferral.
+    func merged(with other: ResumeOutcome) -> ResumeOutcome {
+        switch (self, other) {
+        case let (.succeeded(a), .succeeded(b)): .succeeded(a + b)
+        case (.succeeded, _), (.failed, .deferred), (.failed, .nothingToResume),
+             (.deferred, .nothingToResume), (_, .nothingToResume):
+            self
+        default:
+            other
+        }
     }
 }

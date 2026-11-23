@@ -23,6 +23,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         // Reconnect to the background session at launch so tasks that completed
         // out-of-process (app was suspended/killed mid-upload) are reclaimed.
         BackgroundUploadCoordinator.shared.activate()
+        BackgroundUploadCoordinator.bundles.activate()
         return true
     }
 
@@ -34,11 +35,12 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         // Hand the stored completion handler to the coordinator; it fires once
         // urlSessionDidFinishEvents reports all background events delivered, so
         // UIKit can snapshot and re-suspend the app.
-        guard identifier == BackgroundUploadCoordinator.sessionIdentifier else {
+        let coordinator = [BackgroundUploadCoordinator.shared, .bundles].first { $0.sessionIdentifier == identifier }
+        guard let coordinator else {
             completionHandler()
             return
         }
-        BackgroundUploadCoordinator.shared.setBackgroundEventsCompletion(completionHandler)
+        coordinator.setBackgroundEventsCompletion(completionHandler)
     }
 }
 

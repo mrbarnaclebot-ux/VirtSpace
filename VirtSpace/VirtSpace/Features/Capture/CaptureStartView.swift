@@ -24,12 +24,26 @@ struct CaptureStartView: View {
         ("lightbulb.max", "Turn on the lights"),
     ]
 
+    private static let roomSteps: [(symbol: String, text: String)] = [
+        ("figure.walk", "Walk slowly around the room"),
+        ("camera.viewfinder", "Point at every wall, the floor and the ceiling"),
+        ("iphone", "Keep the phone the same way up"),
+        ("clock", "Scan for 2 minutes or more"),
+    ]
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: Theme.Space.l) {
+                Picker("Scan type", selection: $model.scanMode) {
+                    Text("Spot scan").tag(ScanMode.spot)
+                    Text("Room scan").tag(ScanMode.room)
+                }
+                .pickerStyle(.segmented)
                 header
                 stepList
-                howToScanLink
+                if model.scanMode == .spot {
+                    howToScanLink
+                }
                 ForEach(model.banners) { banner in
                     bannerView(banner)
                 }
@@ -64,11 +78,13 @@ struct CaptureStartView: View {
 
     private var header: some View {
         VStack(alignment: .leading, spacing: Theme.Space.xs) {
-            Text("Scan a room")
+            Text(model.scanMode == .room ? "Walk the room" : "Scan a room")
                 .font(.title2.bold())
                 .foregroundStyle(Theme.textPrimary)
                 .accessibilityAddTraits(.isHeader)
-            Text("Stand in the middle, then follow the dots around you.")
+            Text(model.scanMode == .room
+                 ? "Walk around while the camera takes photos. Your space takes 30 minutes to 2 hours to build."
+                 : "Stand in the middle, then follow the dots around you.")
                 .font(.body)
                 .foregroundStyle(Theme.textSecondary)
         }
@@ -76,7 +92,7 @@ struct CaptureStartView: View {
 
     private var stepList: some View {
         VStack(alignment: .leading, spacing: Theme.Space.s) {
-            ForEach(Array(Self.steps.enumerated()), id: \.offset) { index, step in
+            ForEach(Array((model.scanMode == .room ? Self.roomSteps : Self.steps).enumerated()), id: \.offset) { index, step in
                 Label {
                     Text(step.text).font(.body)
                 } icon: {

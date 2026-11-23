@@ -302,7 +302,7 @@ nonisolated final class ARKitCaptureSource: NSObject, CaptureSource, ARSessionDe
         true
     }
 
-    private static func warning(for state: ARCamera.TrackingState) -> String? {
+    static func warning(for state: ARCamera.TrackingState) -> String? {
         switch state {
         case .normal:
             return nil

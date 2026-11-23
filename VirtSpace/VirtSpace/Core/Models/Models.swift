@@ -21,6 +21,8 @@ enum WorldStatus: Hashable, Codable {
     case generatingDraft
     case draftReady
     case generatingHq
+    /// Room scan (spec §5.3): Echo-3 is building the splat, 30 min to 2 h.
+    case reconstructing
     case complete
     case failed(String)
 
@@ -32,6 +34,7 @@ enum WorldStatus: Hashable, Codable {
         case "generating_draft": self = .generatingDraft
         case "draft_ready": self = .draftReady
         case "generating_hq": self = .generatingHq
+        case "reconstructing": self = .reconstructing
         case "complete": self = .complete
         default: self = .failed(raw) // handles failed_* and any unknown value
         }
@@ -45,6 +48,7 @@ enum WorldStatus: Hashable, Codable {
         case .generatingDraft: return "generating_draft"
         case .draftReady: return "draft_ready"
         case .generatingHq: return "generating_hq"
+        case .reconstructing: return "reconstructing"
         case .complete: return "complete"
         case .failed(let raw): return raw
         }
@@ -66,7 +70,7 @@ enum WorldStatus: Hashable, Codable {
     /// True while a background job is running and the library should keep polling.
     var isActive: Bool {
         switch self {
-        case .uploading, .stitching, .generatingDraft, .generatingHq: return true
+        case .uploading, .stitching, .generatingDraft, .generatingHq, .reconstructing: return true
         default: return false
         }
     }
@@ -102,6 +106,8 @@ struct World: Identifiable, Decodable, Hashable {
     var provider: String?
     var creditsSpent: Int?
     var createdAt: Date?
+    /// "room_scan" for a walked room (spec §5.3); nil or "pano" for a spot scan.
+    var captureType: String?
 
     /// Present on `GET /v1/worlds` list items (thumbnail-only assets object).
     var assets: WorldAssets?
@@ -122,10 +128,14 @@ struct World: Identifiable, Decodable, Hashable {
         case provider
         case creditsSpent = "credits_spent"
         case createdAt = "created_at"
+        case captureType = "capture_type"
         case assets
     }
 
-    var canEnhance: Bool { status == .draftReady }
+    var isRoomScan: Bool { captureType == "room_scan" }
+
+    /// `:enhance` is 409 `not_enhanceable` for room scans (spec §5.3 item 4).
+    var canEnhance: Bool { status == .draftReady && !isRoomScan }
 }
 
 // MARK: - WorldAssets
@@ -287,6 +297,57 @@ struct RefreshUploadsResponse: Decodable {
     enum CodingKeys: String, CodingKey {
         case world, uploads
         case depthUploads = "depth_uploads"
+    }
+}
+
+// MARK: - Room scan (spec §5.3)
+
+/// `POST /v1/worlds` body for a room scan. No depth, no poses: the bundle
+/// carries everything.
+struct CreateRoomScanRequest: Encodable {
+    let captureType = "room_scan"
+    let frameCount: Int
+    let bundleBytes: Int
+    let title: String
+
+    enum CodingKeys: String, CodingKey {
+        case title
+        case captureType = "capture_type"
+        case frameCount = "frame_count"
+        case bundleBytes = "bundle_bytes"
+    }
+}
+
+/// The one presigned PUT for `bundle.zip` (Content-Length is signed).
+struct BundleUpload: Decodable {
+    let url: String
+    let method: String?
+    let headers: [String: String]?
+    let key: String
+
+    /// The shape `FrameUploader` PUTs; `key` names the background task.
+    var slot: FrameUpload { FrameUpload(index: 0, key: key, url: url, method: method, headers: headers) }
+}
+
+/// `201 {world, capture_id, bundle_upload, max_frames}`.
+struct CreateRoomScanResponse: Decodable {
+    let world: World
+    let bundleUpload: BundleUpload
+    let maxFrames: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case world
+        case bundleUpload = "bundle_upload"
+        case maxFrames = "max_frames"
+    }
+}
+
+/// `uploads:refresh` for a room scan re-signs only `bundle_upload`.
+struct RefreshBundleResponse: Decodable {
+    let bundleUpload: BundleUpload
+
+    enum CodingKeys: String, CodingKey {
+        case bundleUpload = "bundle_upload"
     }
 }
 

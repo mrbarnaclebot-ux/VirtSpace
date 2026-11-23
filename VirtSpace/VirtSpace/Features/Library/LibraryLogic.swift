@@ -100,6 +100,8 @@ enum ProgressKind: Equatable {
             self = upload.map { .measured($0.fraction) } ?? .indeterminate
         case .stitching:
             self = world.status.measuredFraction(serverProgress: world.progress).map { .measured($0) } ?? .none
+        case .reconstructing:
+            self = world.status.measuredFraction(serverProgress: world.progress).map { .measured($0) } ?? .indeterminate
         case let status where status.isActive:
             self = .indeterminate
         default:

@@ -64,6 +64,9 @@ struct ContentView: View {
 
     private func restoreTab() {
         router.selectedTab = storedTab ?? (onboarding.gate == .full ? .scan : .library)
+        #if DEBUG && targetEnvironment(simulator)
+        if CaptureScreenModel.debugRoomScanSeconds != nil { router.selectedTab = .scan }
+        #endif
         tabRestored = true
     }
 }

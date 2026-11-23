@@ -29,11 +29,15 @@ import OSLog
 /// main actor. Every mutable member (`continuations`, `storedSession`,
 /// `backgroundEventsCompletion`) is guarded by `lock`.
 nonisolated final class BackgroundUploadCoordinator: NSObject, URLSessionDataDelegate, @unchecked Sendable {
-    static let shared = BackgroundUploadCoordinator()
+    static let shared = BackgroundUploadCoordinator(identifier: "com.virtspace.frame-upload", resourceTimeout: 600)
+
+    /// Room-scan bundles (spec §5.3, R44): one 300 MB–1 GB PUT, which the
+    /// frame session's 10-minute ceiling would kill on a slow uplink.
+    static let bundles = BackgroundUploadCoordinator(identifier: "com.virtspace.bundle-upload", resourceTimeout: 6 * 3600)
 
     /// Stable across launches so the OS can hand back tasks that finished while
     /// the app was suspended/terminated.
-    static let sessionIdentifier = "com.virtspace.frame-upload"
+    let sessionIdentifier: String
 
     /// Stored by the App/scene `handleEventsForBackgroundURLSession` hook and
     /// invoked from `urlSessionDidFinishEvents` once all background events have
@@ -46,7 +50,7 @@ nonisolated final class BackgroundUploadCoordinator: NSObject, URLSessionDataDel
     /// upload flow (spec §10 R12). 10 minutes is far beyond a legitimate
     /// multi-megabyte JPEG PUT on any usable connection, so hitting it means
     /// the transfer is dead: fail, let the session stay on disk, and retry.
-    static let resourceTimeout: TimeInterval = 600
+    let resourceTimeout: TimeInterval
 
     private let lock = NSLock()
     private var continuations: [Int: CheckedContinuation<HTTPURLResponse, Error>] = [:]
@@ -67,7 +71,7 @@ nonisolated final class BackgroundUploadCoordinator: NSObject, URLSessionDataDel
         defer { lock.unlock() }
         if let storedSession { return storedSession }
 
-        let config = URLSessionConfiguration.background(withIdentifier: Self.sessionIdentifier)
+        let config = URLSessionConfiguration.background(withIdentifier: sessionIdentifier)
         // Relaunch the app in the background to finish/deliver events even after
         // it's been suspended or terminated.
         config.sessionSendsLaunchEvents = true
@@ -76,7 +80,7 @@ nonisolated final class BackgroundUploadCoordinator: NSObject, URLSessionDataDel
         config.allowsCellularAccess = true
         config.waitsForConnectivity = true
         // Bounded wait: without this the pair above can block indefinitely.
-        config.timeoutIntervalForResource = Self.resourceTimeout
+        config.timeoutIntervalForResource = resourceTimeout
         let queue = OperationQueue()
         queue.maxConcurrentOperationCount = 1
         let created = URLSession(configuration: config, delegate: self, delegateQueue: queue)
@@ -84,7 +88,11 @@ nonisolated final class BackgroundUploadCoordinator: NSObject, URLSessionDataDel
         return created
     }
 
-    private override init() { super.init() }
+    private init(identifier: String, resourceTimeout: TimeInterval) {
+        sessionIdentifier = identifier
+        self.resourceTimeout = resourceTimeout
+        super.init()
+    }
 
     /// Instantiate the background session (idempotent). Called at launch so the
     /// session reconnects to any tasks that completed out-of-process.
