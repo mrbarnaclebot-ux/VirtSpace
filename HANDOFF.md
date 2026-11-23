@@ -73,6 +73,7 @@ Everything is on `main` (`2f3ddf2`+) and the backend is **deployed** (api + work
 | iOS robustness: R25 background uploads, R31 WebGL reload + Caches, R32 privacy manifest + fixture.spz out of Release, CaptureEngine split | on phone |
 | UI redesign WP1-WP5 (172 iOS tests): Theme tokens, ToastCenter, typed APIError, WorldStore + AppRouter, Library/Detail, onboarding + versioned consent gate, scan flow, viewers, Settings | on phone |
 | Docs: `docs/design/ui-spec.md`, `docs/research/live-mapping.md`, `docs/research/reconstruction-vs-generation.md` | - |
+| Room scan backend (spec §5.3, R43-R48): migration 0005, room_scan create/refresh/frames:done, `reconstruct` worker job (Echo-3 money path), PLY→GLB collider. Deployed 2026-11-23 at `0fc65fb` with **`SPAITIAL_MODE` unset = mock** (no SpAItial key on Railway); going live needs `SPAITIAL_MODE=live`, `SPAITIAL_API_KEY`, `SPAITIAL_ASSET_HOSTS` on the worker | **yes (mock)** |
 | Full-res splats made opt-in (Settings > 3D viewer > Maximum detail, off by default): full-res made movement choppy on the iPhone 17 Pro | on phone |
 
 **Pending owner decisions:** (1) whether a draft `:retry` charges a scan (currently yes); (2) viewer walk-radius limit; (3) the ~550-credit multi-station experiment (live-mapping research, option A); (4) raw-frame retention: keep until delete (current, stated in the terms) vs purge after N days (spec §13 promised purge-after-stitch, never implemented); (5) review the draft terms text in `Features/Onboarding/TermsView.swift` (`TermsOfUseView`); "only you can see your spaces" becomes true only with R24.
@@ -117,7 +118,7 @@ Upload worked: 28 frames + 28 LiDAR depth maps (~22 KB each) in R2, stitch v2 ra
 - **Config is IaC:** `.railway/railway.ts` declares both services; **a resource omitted there is deleted on apply**. Change with `railway config plan` then `railway config apply`; the SDK lives in `.railway/` (`cd .railway && npm ci`). Variables are unmanaged (secrets never in the file). api has healthcheck `/healthz`.
 - **Migrations run on every api deploy** (`preDeploy: node dist/migrate.js`, applied 2026-11-05) using `MIGRATE_DATABASE_URL` (direct, non-`-pooler` Neon host) set on api. A failed migration fails the deploy and the old one keeps running. Manual fallback: `cd backend && MIGRATE_DATABASE_URL=… AUTH_MODE=dev DEV_AUTH_TOKEN=x npx tsx src/migrate.ts`.
 - `ALLOW_DEV_AUTH=1` on api + worker (production still runs dev auth). Worker: `PROVIDER_MODE=live`, `DAILY_CREDIT_BUDGET=2000`. Base image must stay `node:24-trixie-slim` (numpy needs Python ≥3.12).
-- Post-deploy checks: api log `[migrate] up to date`, `/healthz`; worker log shows `started; kinds=stitch,generate_draft,generate_hq,purge` and no `claim error`. The pg `sslmode` warning is gone (R33 deployed).
+- Post-deploy checks: api log `[migrate] up to date`, `/healthz`; worker log shows `started; kinds=stitch,generate_draft,generate_hq,reconstruct,purge` and no `claim error`. The pg `sslmode` warning is gone (R33 deployed).
 - Optional env vars (all defaulted) are listed in `backend/.env.example`.
 
 ## Standing rules learned the hard way
