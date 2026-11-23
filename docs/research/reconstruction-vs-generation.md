@@ -73,3 +73,16 @@ Sources are in the 2026-11-05 research agent reports. Key ones:
   - exports: `mesh` and `mesh-simplified` (collision), plus `floorplan` (a visual top-down render, automatic for capture worlds);
   - the result also includes a `viewer_url`.
 - Webhooks are signed with HMAC-SHA256 (`whsec_` secret, in local `.env`).
+
+## Update 2026-11-23: Echo-3 API is open to developer accounts
+
+- **Access:** per radiancefields (2026-11-11) and the live OpenAPI spec, `echo-3` now works on every Developer API plan. It is no longer Enterprise-only.
+- **Our key:** replaced 2026-11-23 and verified with free GETs: `echo-3` is listed (`input_kind: perspective_capture`, max 5,000 frames), and a 720-frame quote is 1,620 credits, ~31 min, with 7,500 available.
+- **Price:** the API now bills `900 + frame_count` credits ($9 + $0.01 per frame), not per minute. A ~3 min room at 4 keyframes/s is ~720 frames, about **$16**. The default ceiling is 5,000 frames, so at most ~$59 per world. The free 800 credits are below the 900 base.
+- **Flow changed:** `POST /v1/worlds` with `model: "echo-3"` and `input: {type: "capture_bundle", zip: {type: "url", zip_url}}`. The old `/v1/captures` upload flow is gone from the spec. The URL must be HTTPS, readable without auth, support Range reads and stay valid for 2.5 h or more. Presigned R2 GET fits. `zips` merges 1-8 scans of one space, for multi-room or multi-floor.
+- **Bundle (now documented):** `images/Image_000001.jpg…` (same size for all, long edge ≤1920, EXIF orientation 1, strictly increasing `DateTimeOriginal`/`SubSec` timestamps, which means embedding `ARFrame.exifData`); `cameras/per_frame_intrinsics.json` (required arrays `fx_px/fy_px/cx_px/cy_px`); optional `camera_trajectory.json` (row-major 4×4 OpenCV `camera_from_world` = `diag(1,-1,-1,1) * arTransform.inverse`); `orientation.json`.
+- **Cadence:** about 3-5 keyframes/s while moving (≥0.12 s apart and ≥7 cm or 10°), none while standing still. Skip frames with predicted blur over 64 px.
+- **Runtime:** 30 min to 2 h. Outputs: splat (SPZ/SOG/PLY), collision meshes, a georeferenced floorplan and `cameras.json`.
+- **Reference client:** https://github.com/spaitial-ai/spaitial-capture-prototype (open-source iOS; check the licence before reuse).
+- **Gaps in our capture:** it shoots still-photo spins at stations (high-res stills, so a downscale and intrinsics scaling are needed), has no EXIF timestamps, and saves column-major camera-to-world poses. A walking "Room scan" mode is still required.
+- Docs: https://docs.spaitial.ai/api/capture-worlds.md
