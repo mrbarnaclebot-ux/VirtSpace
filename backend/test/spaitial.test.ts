@@ -103,13 +103,16 @@ describe('SpAItial live client', () => {
     await expect(live(g).findRequestByTitle('VirtSpace j1')).rejects.toBeInstanceOf(ProviderError);
   });
 
-  it('getStatus / getResult / getFloorplan parse the documented shapes', async () => {
+  it('getStatus / getResult / getExport parse the documented shapes', async () => {
     const { f, calls } = fakeFetch((c) => {
       if (c.url.endsWith('/status')) {
         return json({ request_id: 'req_1', status: 'FAILED', progress: null, estimated_duration_seconds: null, error: { code: 'IMAGES_MISSING', message: 'no images' } });
       }
       if (c.url.endsWith('/exports/floorplan')) {
         return json({ type: 'floorplan', status: 'READY', download_url: 'https://api.spaitial.ai/v1/worlds/requests/req_1/exports/floorplan?download=1' });
+      }
+      if (c.url.endsWith('/exports/mesh-simplified')) {
+        return json({ type: 'mesh-simplified', status: 'PROCESSING' }, 202);
       }
       return json({
         request_id: 'req_1', status: 'COMPLETED', completed_at: '2026-11-23T12:00:00Z',
@@ -125,11 +128,16 @@ describe('SpAItial live client', () => {
       thumbnailUrl: 'https://img.spaitial.ai/t.webp',
       completedAt: '2026-11-23T12:00:00Z',
     });
-    expect((await c.getFloorplan('req_1')).status).toBe('READY');
+    expect(await c.getExport('req_1', 'floorplan')).toEqual({
+      status: 'READY',
+      downloadUrl: 'https://api.spaitial.ai/v1/worlds/requests/req_1/exports/floorplan?download=1',
+    });
+    expect(await c.getExport('req_1', 'mesh-simplified')).toEqual({ status: 'PROCESSING' });
     expect(calls.map((x) => `${x.method} ${x.url}`)).toEqual([
       'GET https://api.spaitial.ai/v1/worlds/requests/req_1/status',
       'GET https://api.spaitial.ai/v1/worlds/requests/req_1',
       'POST https://api.spaitial.ai/v1/worlds/requests/req_1/exports/floorplan',
+      'POST https://api.spaitial.ai/v1/worlds/requests/req_1/exports/mesh-simplified',
     ]);
   });
 

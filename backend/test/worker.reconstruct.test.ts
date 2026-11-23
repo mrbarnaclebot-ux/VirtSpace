@@ -7,7 +7,7 @@ import {
   handleJobError,
   generationDisplayName,
   NonRetryableJobError,
-  FLOORPLAN_WAIT_MS,
+  EXPORT_WAIT_MS,
   type ReconstructIO,
   type WorkerDeps,
 } from '../src/worker.js';
@@ -41,7 +41,10 @@ function client(over: Partial<SpaitialClient> = {}): SpaitialClient {
       thumbnailUrl: 'https://img.spaitial.ai/t.webp',
       completedAt: new Date().toISOString(),
     })),
-    getFloorplan: vi.fn(async () => ({ status: 'READY', downloadUrl: 'https://api.spaitial.ai/fp?download=1' })),
+    getExport: vi.fn(async (_id: string, type: string) => ({
+      status: 'READY',
+      downloadUrl: `https://api.spaitial.ai/v1/worlds/requests/req_1/exports/${type}?download=1`,
+    })),
     download: vi.fn(async (url: string) => Buffer.from(`bytes:${url}`)),
     ...over,
   };
@@ -262,12 +265,21 @@ describe('reconstruct handler', () => {
 
     expect(sink.ledger).toEqual([{ amount: 0, worldId: 'w-1', provider: 'spaitial' }]);
     const keys = d.storage.putObject.mock.calls.map((c) => c[0]);
-    expect(keys).toEqual(['worlds/w-1/splat_full.spz', 'worlds/w-1/floorplan.png', 'worlds/w-1/thumbnail.jpg']);
+    expect(keys).toEqual([
+      'worlds/w-1/splat_full.spz',
+      'worlds/w-1/floorplan.png',
+      'worlds/w-1/collider.glb',
+      'worlds/w-1/thumbnail.jpg',
+    ]);
+    // The mock's PLY quad was converted, not copied: a GLB went into storage.
+    const glb = d.storage.putObject.mock.calls[2]![1] as Buffer;
+    expect(glb.toString('ascii', 0, 4)).toBe('glTF');
     const final = worldPatches(sink).find((p) => p['status'] === 'complete')!;
     expect(final).toMatchObject({
       spzFullUrl: 'worlds/w-1/splat_full.spz',
       spz500kUrl: 'worlds/w-1/splat_full.spz',
       floorplanUrl: 'worlds/w-1/floorplan.png',
+      colliderGlbUrl: 'worlds/w-1/collider.glb',
       thumbnailUrl: 'worlds/w-1/thumbnail.jpg',
       provider: 'mock',
       draftModel: 'echo-3',
@@ -333,29 +345,53 @@ describe('reconstruct handler', () => {
     expect(worldPatches(sink).at(-1)).toMatchObject({ status: 'failed_reconstructing' });
   });
 
-  it('completed but floorplan still rendering → waits (re-schedules) without downloading the splat', async () => {
+  it.each(['floorplan', 'mesh-simplified'])('completed but %s export still rendering → waits (re-schedules) without downloading the splat', async (pending) => {
     const sink = newSink();
-    const c = client({ getFloorplan: vi.fn(async () => ({ status: 'PROCESSING' })) });
+    const c = client({
+      getExport: vi.fn(async (_id: string, type: string) =>
+        type === pending ? { status: 'PROCESSING' } : { status: 'READY', downloadUrl: `https://api.spaitial.ai/${type}` }),
+    });
     const d = deps(makeDb(sink), sink, c);
     await processJob(d, job({ providerOperationId: 'req_1' }));
     expect(c.download).not.toHaveBeenCalled();
     expect(sink.sql.filter((s) => s.includes('GREATEST(attempts - 1, 0)'))).toHaveLength(1);
   });
 
-  it('floorplan still not ready past the wait window → finalizes without it', async () => {
+  it('exports still not ready past the wait window → finalizes without them', async () => {
     const sink = newSink();
     const c = client({
-      getFloorplan: vi.fn(async () => ({ status: 'PROCESSING' })),
+      getExport: vi.fn(async () => ({ status: 'PROCESSING' })),
       getResult: vi.fn(async () => ({
         splatUrl: 'https://api.spaitial.ai/s',
-        completedAt: new Date(Date.now() - FLOORPLAN_WAIT_MS - 1000).toISOString(),
+        completedAt: new Date(Date.now() - EXPORT_WAIT_MS - 1000).toISOString(),
       })),
     });
     await processJob(deps(makeDb(sink), sink, c), job({ providerOperationId: 'req_1', payload: { credits: 1620 } }));
     const final = worldPatches(sink).find((p) => p['status'] === 'complete')!;
     expect(final).not.toHaveProperty('floorplanUrl');
+    expect(final).not.toHaveProperty('colliderGlbUrl');
     expect(final['spzFullUrl']).toBe('worlds/w-1/splat_full.spz');
     expect(final['provider']).toBe('spaitial');
+  });
+
+  it.each([
+    ['a malformed PLY', {}],
+    ['a failing mesh export', { getExport: vi.fn(async (_id: string, type: string) => {
+      if (type === 'mesh-simplified') throw new ProviderError('mesh 500', { status: 500 });
+      return { status: 'READY', downloadUrl: 'https://api.spaitial.ai/fp' };
+    }) }],
+  ])('collider best-effort: %s → world completes without collider_glb_url, no wait, no failure', async (_n, over) => {
+    const sink = newSink();
+    const c = client(over); // the default download returns non-PLY bytes for the mesh.
+    const d = deps(makeDb(sink), sink, c);
+    await processJob(d, job({ providerOperationId: 'req_1', payload: { credits: 1620 } }));
+    const final = worldPatches(sink).find((p) => p['status'] === 'complete')!;
+    expect(final).not.toHaveProperty('colliderGlbUrl');
+    expect(final['spzFullUrl']).toBe('worlds/w-1/splat_full.spz');
+    expect(d.storage.putObject.mock.calls.map((x) => x[0])).not.toContain('worlds/w-1/collider.glb');
+    expect(sink.sql.some((s) => s.includes("phase = 'done'"))).toBe(true);
+    expect(sink.sql.filter((s) => s.includes('GREATEST(attempts - 1, 0)'))).toHaveLength(0);
+    expect(c.createWorld).not.toHaveBeenCalled();
   });
 });
 

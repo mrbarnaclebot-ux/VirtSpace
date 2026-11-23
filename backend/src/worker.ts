@@ -31,8 +31,10 @@ import {
 import {
   createSpaitialClient,
   ECHO3_MODEL,
+  type ExportType,
   type SpaitialClient,
 } from './provider/spaitial.js';
+import { plyToGlb } from './ply-to-glb.js';
 import { sendPush, type SendPush } from './push.js';
 import { depthKeyName, stageDepthMaps } from './depth.js';
 
@@ -1110,8 +1112,8 @@ async function handleGenerate(
 export const RECONSTRUCT_POLL_SECONDS = 60;
 /** SpAItial must read the bundle for the whole run (≥2.5 h); spec asks ≥3 h. */
 export const BUNDLE_URL_TTL_SECONDS = 6 * 60 * 60;
-/** How long after completion to wait for the auto-started floorplan export. */
-export const FLOORPLAN_WAIT_MS = 15 * 60 * 1000;
+/** How long after completion to wait for the floorplan + collider exports. */
+export const EXPORT_WAIT_MS = 15 * 60 * 1000;
 const DEFAULT_RECONSTRUCT_ETA_SECONDS = 60 * 60;
 
 export interface ReconstructIO {
@@ -1221,7 +1223,8 @@ const RECONSTRUCT_TERMINAL = new Set(['COMPLETED', 'FAILED', 'CANCELLED']);
  * reconstruct (spec §5.3 item 5). Each run resolves the request id (above),
  * polls status once, and either re-schedules itself ~60 s out (rescheduleJob:
  * lease released, attempt given back) or, once COMPLETED, re-hosts the splat,
- * floorplan and thumbnail into our storage and finalizes the world.
+ * floorplan, collider (PLY → GLB) and thumbnail into our storage and finalizes
+ * the world.
  */
 async function handleReconstruct(deps: WorkerDeps, job: Job): Promise<void> {
   const { db, storage, config, spaitial } = deps;
@@ -1309,29 +1312,37 @@ async function handleReconstruct(deps: WorkerDeps, job: Job): Promise<void> {
   const result = await spaitial.getResult(requestId);
   if (!result.splatUrl) throw new ProviderError(`completed request ${requestId} has no splat_url`);
 
-  // Floorplan first (best-effort): Echo-3 auto-starts it on completion, so wait
-  // a bounded while for it before downloading anything big.
-  let floorplanUrl: string | undefined;
-  try {
-    const fp = await spaitial.getFloorplan(requestId);
-    if (fp.status === 'READY' && fp.downloadUrl) {
-      floorplanUrl = fp.downloadUrl;
-    } else if (fp.status !== 'FAILED' && result.completedAt) {
-      if (clock.now() - Date.parse(result.completedAt) < FLOORPLAN_WAIT_MS) return pollAgain();
+  // Exports first (best-effort, free): Echo-3 auto-starts the floorplan and the
+  // first POST starts the collider mesh, so both share one bounded wait after
+  // completion before anything big is downloaded. Neither can fail the job.
+  const exportOf = async (type: ExportType) => {
+    try {
+      const ex = await spaitial.getExport(requestId, type);
+      if (ex.status === 'READY' && ex.downloadUrl) return { url: ex.downloadUrl, pending: false };
+      return { pending: ex.status !== 'FAILED' };
+    } catch (err) {
+      console.warn(`[worker] job ${job.id}: ${type} export unavailable: ${String(err)}`);
+      return { pending: false };
     }
-  } catch (err) {
-    console.warn(`[worker] job ${job.id}: floorplan export unavailable: ${String(err)}`);
+  };
+  const [floorplan, mesh] = await Promise.all([exportOf('floorplan'), exportOf('mesh-simplified')]);
+  if (
+    (floorplan.pending || mesh.pending) &&
+    result.completedAt &&
+    clock.now() - Date.parse(result.completedAt) < EXPORT_WAIT_MS
+  ) {
+    return pollAgain();
   }
 
-  const store = async (name: string, url: string): Promise<string> => {
+  const store = async (name: string, url: string, convert = (b: Buffer) => b): Promise<string> => {
     const key = assetKeyFor(world.id, name);
-    await storage.putObject(key, await spaitial.download(url));
+    await storage.putObject(key, convert(await spaitial.download(url)));
     return key;
   };
-  const optional = async (name: string, url: string | undefined) => {
+  const optional = async (name: string, url: string | undefined, convert?: (b: Buffer) => Buffer) => {
     if (!url) return undefined;
     try {
-      return await store(name, url);
+      return await store(name, url, convert);
     } catch (err) {
       console.warn(`[worker] world ${world.id}: ${name} not stored: ${String(err)}`);
       return undefined;
@@ -1340,7 +1351,9 @@ async function handleReconstruct(deps: WorkerDeps, job: Job): Promise<void> {
 
   // One key in both columns until device performance says otherwise (R45).
   const splatKey = await store('splat_full.spz', result.splatUrl);
-  const floorplanKey = await optional('floorplan.png', floorplanUrl);
+  const floorplanKey = await optional('floorplan.png', floorplan.url);
+  // Same key as the Marble collider; frame = the stored splat's (ply-to-glb.ts).
+  const colliderKey = await optional('collider.glb', mesh.url, plyToGlb);
   // SpAItial thumbnails are WebP; the key keeps the shared name purge knows.
   const thumbnailKey = await optional('thumbnail.jpg', result.thumbnailUrl);
   if (!(await stillHoldsLease(deps, job.id))) {
@@ -1366,6 +1379,7 @@ async function handleReconstruct(deps: WorkerDeps, job: Job): Promise<void> {
       spz500kUrl: splatKey,
       ...(thumbnailKey ? { thumbnailUrl: thumbnailKey } : {}),
       ...(floorplanKey ? { floorplanUrl: floorplanKey } : {}),
+      ...(colliderKey ? { colliderGlbUrl: colliderKey } : {}),
     })
     .where(and(eq(worlds.id, world.id), sql`${worlds.draftWorldId} IS DISTINCT FROM ${requestId}`))
     .returning({ id: worlds.id });

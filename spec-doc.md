@@ -204,6 +204,12 @@ A second capture type next to the pano spot scan. The user walks the room; SpAIt
    - On completion, copy into our R2: the splat SPZ, the `mesh-simplified` export as the collider GLB, the floorplan, and a thumbnail if one is offered.
    - The splat goes in `spz_full_url` **and** `spz_500k_url`, until real-device performance says otherwise (R45). Its orientation is OpenCV RDF, the same flip as Marble.
    - Webhooks are deferred (R46); polling covers v1.
+   - **As built (2026-11-23):**
+     - The order is quote → marker → reserve → create, matching `runGeneration`, so a crash can't reserve twice.
+     - A marker left unresolved parks the job (it is never resubmitted).
+     - The floorplan is stored in a new `worlds.floorplan_url` column.
+     - The collider is the `mesh-simplified` PLY, converted to GLB on the server (`backend/src/ply-to-glb.ts`) and stored in the splat file's raw frame with no flip baked in. It is best-effort, like the floorplan (R47).
+     - `capture_type` is serialized only on room-scan worlds.
 6. **Mode.** `SPAITIAL_MODE=mock|live`, default `mock`, independent of `PROVIDER_MODE`. Mock spends nothing: it accepts any bundle, "completes" quickly with the fixture SPZ, and exercises the ledger with 0 credits. Live needs `SPAITIAL_API_KEY`. That key is server-side only, never in the app.
 
 ## 6. UI/UX redesign — where we beat the reference
@@ -391,6 +397,8 @@ Everything else scales cheaply: Neon scale-to-zero, serverless workers (jobs are
 | R44 | Single 300 MB–1 GB PUT is fragile on cellular | v1: background URLSession, Wi-Fi recommended copy; upgrade to R2 multipart if failures show up |
 | R45 | Echo-3 splat size vs iPhone viewer frame rate (full-res already made movement choppy) | Measure on device; consider SOG/LoD or a decimated splat |
 | R46 | SpAItial webhooks (HMAC `whsec_`) unused | Add only if 60 s polling proves too slow or costly |
+| R47 | Echo-3 `mesh-simplified` collider is PLY; `collider_glb_url` expects GLB | **Done 2026-11-23:** converted to GLB in the worker, in the splat's frame. The mesh's frame is undocumented, so on the first live run compare the mesh bounds with the floorplan's `scene_bounds` (+Y up) and negate y/z if the mesh is Y-up. Marble's collider shares its splat's OpenCV frame (World Labs export docs) |
+| R48 | Before the first live Echo-3 run: set `SPAITIAL_ASSET_HOSTS` to the real signed-download host (302 target, undocumented); bundle.zip kept until world delete (300 MB–1 GB each); no ceiling on reconstruction poll time | Measure on the first run; purge bundle after `complete`; add a max-poll age |
 | R36 | Ghosting: `reproject.py` ignores translation by design (~264) and averages every overlapping frame with a power-2 centre weight (~552-563); 52 cm drift at a 2.5 m wall is ~12° misregistration, which Marble rebuilds as doubled geometry | S: `INTER_AREA` prefilter before remap (source ~57 px/deg vs pano ~23), steeper blend weight. M: `cv.detail` graph-cut seams + block-gain compensation + multi-band blend; translation-aware proxy-sphere reprojection (centre on mean camera position, depth from a fixed ~2.5 m or ARKit `rawFeaturePoints`). L (only if ghosting survives): LiDAR `sceneDepth` forward-splat |
 | R37 | Drift is measured from shot 0's position (`CaptureEngine` ~315), never gates a shot, and the "step back to where you started" copy is likely wrong: turning the body with the phone held out orbits the camera ~50 cm without a step | Measure from the running centroid of shot positions; coach "phone at chest, shuffle around the phone" with a pivot indicator; soft-gate dwell beyond ~15-20 cm (threshold from a drift experiment) |
 | R38 | Focus, exposure, light: focus and AE/WB are locked at whatever target 0 sees (`ARKitCaptureSource` ~160-178): near focus blurs far walls, a window in shot 0 underexposes the room; ISO/duration not persisted so the stitcher cannot compensate; no low-light preflight (promised §6.1, light estimation off); steadiness threshold ignores exposure time | Leave AF on (per-frame `fx` already handles breathing) or lock far; meter during ARKit preroll and lock before target 0's dwell (also fixes R34); persist ISO + duration per `FramePose`; ISO-near-max preflight; scale the steady threshold by 1/exposure |

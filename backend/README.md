@@ -618,13 +618,14 @@ A failed create is non-retryable; a resumed marker reconciles via
 `GET /v1/worlds/requests` by title and never resubmits. Polling re-schedules the
 job ~60 s out (`rescheduleJob`: lease released, attempt given back), so a 2 h run
 never exhausts `MAX_ATTEMPTS`; transient status errors (network/429/5xx) poll
-again too. On `COMPLETED` the worker waits ≤15 min for the auto-started
-floorplan export, then copies splat → `splat_full.spz`, floorplan →
-`floorplan.png`, thumbnail → `thumbnail.jpg` (WebP bytes). Downloads send the
+again too. On `COMPLETED` the worker POSTs the free `floorplan` (auto-started)
+and `mesh-simplified` exports and waits ≤15 min (shared) for both, then copies
+splat → `splat_full.spz`, floorplan → `floorplan.png`, mesh PLY → converted
+in-process to `collider.glb` (`src/ply-to-glb.ts`, same raw RDF frame as the
+splat), thumbnail → `thumbnail.jpg` (WebP bytes). Exports are best-effort. Downloads send the
 Bearer key only to the API host; the 302 target must be in
 `SPAITIAL_ASSET_HOSTS`. Not done: provider-side deletion (the World Labs path
-has none either), the `mesh-simplified` collider (it is a `.ply`, not a GLB),
-webhooks (R46).
+has none either), webhooks (R46).
 
 ### Mock mode walkthrough (offline, zero credits)
 

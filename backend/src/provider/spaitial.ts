@@ -48,7 +48,10 @@ export interface RequestResult {
   completedAt?: string;
 }
 
-export interface FloorplanExport {
+/** The exports we re-host (docs.spaitial.ai/api/exports.md). Both are free. */
+export type ExportType = 'floorplan' | 'mesh-simplified';
+
+export interface ExportStatus {
   /** READY | PROCESSING | FAILED | NOT_REQUESTED … (open set). */
   status: string;
   downloadUrl?: string;
@@ -68,8 +71,11 @@ export interface SpaitialClient {
   findRequestByTitle(title: string): Promise<string | null>;
   getStatus(requestId: string): Promise<RequestStatus>;
   getResult(requestId: string): Promise<RequestResult>;
-  /** POST …/exports/floorplan: start-or-retrieve, free, auto-started for Echo-3. */
-  getFloorplan(requestId: string): Promise<FloorplanExport>;
+  /**
+   * POST …/exports/{type}: start-or-retrieve (202 PROCESSING / 200 READY), free.
+   * Echo-3 auto-starts the floorplan; the first call starts the mesh job.
+   */
+  getExport(requestId: string, type: ExportType): Promise<ExportStatus>;
   download(url: string): Promise<Buffer>;
 }
 
@@ -223,12 +229,9 @@ export function createSpaitialLiveClient(opts: SpaitialOptions): SpaitialClient 
       return out;
     },
 
-    async getFloorplan(requestId) {
-      const body = await call<Record<string, unknown>>(
-        'POST',
-        `${req(requestId)}/exports/floorplan`,
-      );
-      const out: FloorplanExport = { status: str(body['status']) ?? 'UNKNOWN' };
+    async getExport(requestId, type) {
+      const body = await call<Record<string, unknown>>('POST', `${req(requestId)}/exports/${type}`);
+      const out: ExportStatus = { status: str(body['status']) ?? 'UNKNOWN' };
       const url = str(body['download_url']);
       if (url) out.downloadUrl = url;
       return out;
@@ -255,6 +258,12 @@ export function createSpaitialLiveClient(opts: SpaitialOptions): SpaitialClient 
 }
 
 const MOCK_HOST = 'https://mock.spaitial.local';
+/** A unit quad (two triangles once fanned) so the collider path converts offline. */
+const MOCK_MESH_PLY = Buffer.from(
+  'ply\nformat ascii 1.0\nelement vertex 4\nproperty float x\nproperty float y\n' +
+    'property float z\nelement face 1\nproperty list uchar int vertex_indices\nend_header\n' +
+    '0 0 0\n1 0 0\n1 0 1\n0 0 1\n4 0 1 2 3\n',
+);
 
 /**
  * SPAITIAL_MODE=mock: accepts any bundle, quotes 0 credits (the ledger still
@@ -288,12 +297,13 @@ export function createSpaitialMockClient(): SpaitialClient {
         completedAt: new Date().toISOString(),
       };
     },
-    async getFloorplan(id) {
-      return { status: 'READY', downloadUrl: asset(id, 'floorplan.png') };
+    async getExport(id, type) {
+      const name = type === 'floorplan' ? 'floorplan.png' : 'mesh-simplified.ply';
+      return { status: 'READY', downloadUrl: asset(id, name) };
     },
     async download(url) {
       if (!url.startsWith(MOCK_HOST)) throw new ProviderError(`mock asset not found: ${url}`);
-      return fixtureFor(url);
+      return url.endsWith('.ply') ? MOCK_MESH_PLY : fixtureFor(url);
     },
   };
 }
