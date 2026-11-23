@@ -92,7 +92,10 @@ export function registerDevStorageRoutes(
     done(null, body);
   });
 
-  app.put<{ Params: { '*': string } }>('/dev-storage/*', async (req, reply) => {
+  // Fastify's default 1 MiB bodyLimit refused every real frame and bundle; the
+  // per-key limit announced at presign time (below) is the actual cap. Room-scan
+  // bundles are buffered whole — dev only.
+  app.put<{ Params: { '*': string } }>('/dev-storage/*', { bodyLimit: 4 * 1024 ** 3 }, async (req, reply) => {
     const key = req.params['*'];
     const body = req.body as Buffer;
     const max = local.maxBytesFor(key);
