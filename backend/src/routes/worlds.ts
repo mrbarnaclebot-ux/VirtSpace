@@ -2,7 +2,7 @@ import { and, desc, eq, inArray, isNull } from 'drizzle-orm';
 import { z } from 'zod';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { getDb } from '../db/client.js';
-import { captures, worlds, type JobKind, type World } from '../db/schema.js';
+import { captures, worlds, type Capture, type JobKind, type World } from '../db/schema.js';
 import { enqueue } from '../queue.js';
 import { chargeScanQuota, releaseScanQuota, type QuotaChargeResult } from '../quota.js';
 import { budgetFits } from '../budget.js';
@@ -10,6 +10,7 @@ import type { WorldModel } from '../provider/types.js';
 import { MAX_DEPTH_BYTES, MAX_FRAME_BYTES, type StorageDriver } from '../storage/index.js';
 import { depthKeyName } from '../depth.js';
 import type { RouteDeps } from './deps.js';
+import type { Config } from '../config.js';
 
 const DOWNLOAD_TTL_SECONDS = 3600;
 
@@ -67,6 +68,13 @@ const RETRY_PLANS: Record<
     model: 'marble-1.1',
     ready: (w) => w.panoUrl !== null && w.draftWorldId !== null,
   },
+  // Room scan (spec §5.3 item 4): a new reconstruct job, charged a scan like a
+  // draft retry; the bundle is still in storage (purged only on delete).
+  failed_reconstructing: {
+    to: 'reconstructing',
+    kind: 'reconstruct',
+    ready: (w) => w.captureType === 'room_scan',
+  },
 };
 
 /** Statuses a retry would produce: a retry that finds one is a replay. */
@@ -110,6 +118,7 @@ const ASSET_FIELDS = [
   ['spz500kUrl', 'spz_500k_url'],
   ['spzFullUrl', 'spz_full_url'],
   ['colliderGlbUrl', 'collider_glb_url'],
+  ['floorplanUrl', 'floorplan_url'],
 ] as const;
 
 /**
@@ -140,6 +149,7 @@ const depthFields = {
 };
 
 const createBody = z.object({
+  capture_type: z.literal('pano').optional(),
   title: z.string().max(200).optional(),
   lat: z.number().min(-90).max(90).optional(),
   lng: z.number().min(-180).max(180).optional(),
@@ -236,6 +246,9 @@ export function serializeWorld(w: World): Record<string, unknown> {
     lat: w.lat,
     lng: w.lng,
     place_name: w.placeName,
+    // Only room scans carry it, so a pano world serializes byte-identically
+    // to before (spec §5.3 item 3); absent means 'pano'.
+    ...(w.captureType === 'room_scan' ? { capture_type: w.captureType } : {}),
     is_public: w.isPublic,
     status: w.status,
     phase: w.phase,
@@ -276,6 +289,16 @@ export async function serializeWorldListItem(
 export function worldsRoutes(app: FastifyInstance, deps: RouteDeps): void {
   const { config, storage } = deps;
 
+  // Room scan create (spec §5.3 item 3): one bundle.zip, sized up front.
+  const roomScanBody = z.object({
+    capture_type: z.literal('room_scan'),
+    title: z.string().max(200).optional(),
+    lat: z.number().min(-90).max(90).optional(),
+    lng: z.number().min(-180).max(180).optional(),
+    frame_count: z.number().int().min(1).max(config.ROOM_SCAN_MAX_FRAMES),
+    bundle_bytes: z.number().int().min(1).max(config.ROOM_SCAN_MAX_BUNDLE_BYTES),
+  });
+
   // POST /v1/worlds — create world shell + capture, return presigned frame URLs.
   //
   // Carries its OWN rate-limit bucket (spec §10 R10), far tighter than the
@@ -295,13 +318,16 @@ export function worldsRoutes(app: FastifyInstance, deps: RouteDeps): void {
     const userId = requireUserId(req, reply);
     if (!userId) return;
 
-    const parsed = createBody.safeParse(req.body);
+    const isRoomScan =
+      (req.body as { capture_type?: unknown } | null)?.capture_type === 'room_scan';
+    const parsed = isRoomScan ? roomScanBody.safeParse(req.body) : createBody.safeParse(req.body);
     if (!parsed.success) {
       return reply.code(400).send({ error: 'invalid_body', issues: parsed.error.issues });
     }
     const body = parsed.data;
-    const sizes = frameSizeMap(body.frames);
-    const depth = depthRequest(body);
+    const bundleBytes = 'bundle_bytes' in body ? body.bundle_bytes : null;
+    const sizes = 'bundle_bytes' in body ? new Map<number, number>() : frameSizeMap(body.frames);
+    const depth = 'bundle_bytes' in body ? null : depthRequest(body);
     const db = getDb();
 
     // Idempotency-Key (spec §10 R4): the client's capture-session UUID. A retry
@@ -323,7 +349,7 @@ export function worldsRoutes(app: FastifyInstance, deps: RouteDeps): void {
 
       const existing = await findWorldByClientRequestId(db, userId, clientRequestId);
       if (existing) {
-        return replayCreate(reply, db, storage, existing, sizes, depth);
+        return replayCreate(reply, db, storage, config, existing, sizes, depth);
       }
     }
 
@@ -346,6 +372,7 @@ export function worldsRoutes(app: FastifyInstance, deps: RouteDeps): void {
           lng: body.lng ?? null,
           status: 'uploading',
           clientRequestId,
+          ...(bundleBytes !== null ? { captureType: 'room_scan' } : {}),
         })
         .returning();
       world = row!;
@@ -357,19 +384,31 @@ export function worldsRoutes(app: FastifyInstance, deps: RouteDeps): void {
       await releaseScanQuota(db, userId);
       const winner = await findWorldByClientRequestId(db, userId, clientRequestId);
       if (!winner) throw err; // not our constraint after all — surface it.
-      return replayCreate(reply, db, storage, winner, sizes, depth);
+      return replayCreate(reply, db, storage, config, winner, sizes, depth);
     }
 
     // Create the capture row and its frame-key prefix.
     const [capture] = await db
       .insert(captures)
-      .values({ worldId: world.id, frameCount: body.frame_count })
+      .values({
+        worldId: world.id,
+        frameCount: body.frame_count,
+        ...(bundleBytes !== null ? { bundleBytes } : {}),
+      })
       .returning();
     const prefix = `captures/${capture!.id}`;
     await db
       .update(captures)
       .set({ r2FramesPrefix: prefix })
       .where(eq(captures.id, capture!.id));
+
+    if (bundleBytes !== null) {
+      return reply.code(201).send({
+        world: serializeWorld(world),
+        capture_id: capture!.id,
+        ...(await presignBundleUpload(storage, config, prefix, bundleBytes)),
+      });
+    }
 
     // Presign one upload URL per frame, binding Content-Length for every frame
     // whose exact size the client declared (spec §10 R7).
@@ -416,6 +455,13 @@ export function worldsRoutes(app: FastifyInstance, deps: RouteDeps): void {
       if (!capture || !capture.r2FramesPrefix) {
         return reply.code(404).send({ error: 'capture_not_found' });
       }
+      if (world.captureType === 'room_scan') {
+        return reply.send({
+          world: serializeWorld(world),
+          capture_id: capture.id,
+          ...(await presignBundleUpload(storage, config, capture.r2FramesPrefix, capture.bundleBytes)),
+        });
+      }
 
       const uploads = await presignFrameUploads(
         storage,
@@ -461,6 +507,35 @@ export function worldsRoutes(app: FastifyInstance, deps: RouteDeps): void {
       const world = await findOwnedWorld(db, req.params.id, userId);
       if (!world) return reply.code(404).send({ error: 'world_not_found' });
 
+      // Room scan (spec §5.3 item 3): the bundle must be fully uploaded before
+      // a credit-spending reconstruction is queued. Checked only while still
+      // uploading — a replay after the flip just answers job_id null below.
+      const roomScan = world.captureType === 'room_scan';
+      if (roomScan && world.status === 'uploading') {
+        const [capture] = await db
+          .select()
+          .from(captures)
+          .where(eq(captures.worldId, world.id))
+          .orderBy(desc(captures.createdAt))
+          .limit(1);
+        if (!capture?.r2FramesPrefix || capture.bundleBytes == null) {
+          return reply.code(404).send({ error: 'capture_not_found' });
+        }
+        let size: number;
+        try {
+          size = await storage.objectSize(`${capture.r2FramesPrefix}/bundle.zip`);
+        } catch {
+          return reply.code(409).send({ error: 'bundle_not_uploaded' });
+        }
+        if (size !== capture.bundleBytes) {
+          return reply.code(409).send({
+            error: 'bundle_size_mismatch',
+            expected_bytes: capture.bundleBytes,
+            actual_bytes: size,
+          });
+        }
+      }
+
       // iOS stranded-session recovery REPLAYS frames:done when a response was
       // lost. An unconditional flip let a replay after draft_ready/complete
       // re-stitch → finalizeStitch enqueues a second generate_draft (a second
@@ -473,16 +548,21 @@ export function worldsRoutes(app: FastifyInstance, deps: RouteDeps): void {
         const [row] = await tx
           .update(worlds)
           // Entering a new status → progress resets; updated_at is the heartbeat.
-          .set({ status: 'stitching', progress: null, updatedAt: new Date() })
+          .set({
+            status: roomScan ? 'reconstructing' : 'stitching',
+            progress: null,
+            updatedAt: new Date(),
+          })
           .where(
             and(
               eq(worlds.id, world.id),
-              inArray(worlds.status, ['uploading', 'failed_stitch']),
+              inArray(worlds.status, roomScan ? ['uploading'] : ['uploading', 'failed_stitch']),
               isNull(worlds.deletedAt),
             ),
           )
           .returning();
         if (!row) return null;
+        if (roomScan) return { world: row, jobId: await enqueue(tx, 'reconstruct', world.id) };
 
         // Store poses on the world's (latest) capture row when provided.
         if (poses && poses.length > 0) {
@@ -600,7 +680,8 @@ export function worldsRoutes(app: FastifyInstance, deps: RouteDeps): void {
     const db = getDb();
     const world = await findOwnedWorld(db, req.params.id, userId);
     if (!world) return reply.code(404).send({ error: 'world_not_found' });
-    if (world.status !== 'draft_ready') {
+    // Room scans have no HQ pass (spec §5.3 item 4).
+    if (world.status !== 'draft_ready' || world.captureType === 'room_scan') {
       return reply
         .code(409)
         .send({ error: 'not_enhanceable', status: world.status });
@@ -721,7 +802,7 @@ export function worldsRoutes(app: FastifyInstance, deps: RouteDeps): void {
             )
             .returning();
           if (!row) return null;
-          if (plan.kind === 'generate_draft') {
+          if (plan.kind === 'generate_draft' || plan.kind === 'reconstruct') {
             // Inside the tx: a refusal rolls the flip back, and a double tap
             // that lost the flip above is never charged.
             const charge = await chargeScanQuota(tx, userId, config.DAILY_SCAN_QUOTA);
@@ -827,6 +908,27 @@ async function presignDepthUploads(
 }
 
 /**
+ * `{ bundle_upload, max_frames }` for a room scan (spec §5.3 item 3): ONE
+ * presigned PUT of `<prefix>/bundle.zip` with the declared size signed in as
+ * Content-Length. Shared by create, replay and uploads:refresh.
+ */
+async function presignBundleUpload(
+  storage: StorageDriver,
+  config: Config,
+  prefix: string,
+  bundleBytes: Capture['bundleBytes'],
+) {
+  const key = `${prefix}/bundle.zip`;
+  const presigned = await storage.presignUpload(
+    key,
+    'application/zip',
+    config.ROOM_SCAN_MAX_BUNDLE_BYTES,
+    bundleBytes ?? undefined,
+  );
+  return { bundle_upload: { ...presigned, key }, max_frames: config.ROOM_SCAN_MAX_FRAMES };
+}
+
+/**
  * True when an error is a Postgres unique-constraint violation (SQLSTATE 23505).
  * Drizzle may wrap the driver error, so the whole `cause` chain is inspected.
  */
@@ -895,6 +997,7 @@ async function replayCreate(
   reply: FastifyReply,
   db: ReturnType<typeof getDb>,
   storage: StorageDriver,
+  config: Config,
   world: World,
   sizes: Map<number, number>,
   depth: DepthRequest,
@@ -917,6 +1020,14 @@ async function replayCreate(
     return reply.code(409).send({
       error: 'idempotency_key_incomplete_world',
       world_id: world.id,
+    });
+  }
+  if (world.captureType === 'room_scan') {
+    return reply.code(200).send({
+      world: serializeWorld(world),
+      capture_id: capture.id,
+      ...(await presignBundleUpload(storage, config, capture.r2FramesPrefix, capture.bundleBytes)),
+      idempotent_replay: true,
     });
   }
   const uploads = await presignFrameUploads(

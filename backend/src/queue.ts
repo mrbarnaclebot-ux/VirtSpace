@@ -314,3 +314,36 @@ export async function setProviderOperationId(
     WHERE id = ${jobId}
   `);
 }
+
+/**
+ * Put a running job back in the queue to run again in `delaySeconds`, as a POLL
+ * rather than a failure (spec §5.3 item 5: Echo-3 runs 30 min–2 h, polled every
+ * ~60 s). Releases the lease instead of holding it for hours, and gives back
+ * the attempt the claim just took — `attempts` stays a count of FAILED runs, so
+ * a long reconstruction never exhausts MAX_ATTEMPTS or trips parkExhaustedJobs.
+ *
+ * Conditional on this worker still owning the lease (like heartbeatJob): false
+ * means another worker re-claimed the job and this one must leave it alone.
+ */
+export async function rescheduleJob(
+  db: Db,
+  jobId: string,
+  delaySeconds: number,
+  workerId?: string,
+): Promise<boolean> {
+  const ownerClause = workerId ? sql` AND locked_by = ${workerId}` : sql``;
+  const result = await db.execute<{ id: string }>(sql`
+    UPDATE jobs
+    SET phase = 'queued',
+        locked_at = NULL,
+        locked_by = NULL,
+        attempts = GREATEST(attempts - 1, 0),
+        run_after = now() + (${delaySeconds} * interval '1 second'),
+        updated_at = now()
+    WHERE id = ${jobId}
+      AND phase = 'running'${ownerClause}
+    RETURNING id
+  `);
+  const rows = (result as unknown as { rows: { id: string }[] }).rows;
+  return rows.length > 0;
+}

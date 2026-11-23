@@ -3,6 +3,7 @@ import {
   uuid,
   text,
   integer,
+  bigint,
   smallint,
   boolean,
   doublePrecision,
@@ -31,11 +32,14 @@ export const WORLD_STATUSES = [
   'failed_stitch',
   'failed_generating_draft',
   'failed_generating_hq',
+  // Room scan (spec §5.3): uploading → reconstructing → complete.
+  'reconstructing',
+  'failed_reconstructing',
 ] as const;
 export type WorldStatus = (typeof WORLD_STATUSES)[number];
 
 // Job queue kinds + phases (spec §7 / §14).
-export const JOB_KINDS = ['stitch', 'generate_draft', 'generate_hq', 'purge'] as const;
+export const JOB_KINDS = ['stitch', 'generate_draft', 'generate_hq', 'reconstruct', 'purge'] as const;
 export type JobKind = (typeof JOB_KINDS)[number];
 
 // A job's phase tracks lifecycle within the queue: queued → running → done,
@@ -74,6 +78,8 @@ export const worlds = pgTable(
     lat: doublePrecision('lat'),
     lng: doublePrecision('lng'),
     placeName: text('place_name'),
+    // 'pano' (spot scan → stitch → Marble) or 'room_scan' (bundle → Echo-3, §5.3).
+    captureType: text('capture_type').notNull().default('pano'),
     isPublic: boolean('is_public').notNull().default(false),
 
     // Status state machine + optional finer-grained phase label for UI.
@@ -91,6 +97,8 @@ export const worlds = pgTable(
     spz500kUrl: text('spz_500k_url'),
     spzFullUrl: text('spz_full_url'),
     colliderGlbUrl: text('collider_glb_url'),
+    // Room scans only: Echo-3 top-down floorplan PNG (spec §5.3 item 5).
+    floorplanUrl: text('floorplan_url'),
     assetVersion: integer('asset_version').notNull().default(1),
 
     // Provider columns — draft-first means up to two provider worlds each.
@@ -126,6 +134,9 @@ export const captures = pgTable(
     // Per-frame ARKit attitude/pose payload.
     posesJson: jsonb('poses_json'),
     r2FramesPrefix: text('r2_frames_prefix'),
+    // Room scans only: the declared size of `<prefix>/bundle.zip` (up to 4 GiB,
+    // past int4). frames:done checks the uploaded object against it.
+    bundleBytes: bigint('bundle_bytes', { mode: 'number' }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   // Every hot path looks a capture up BY WORLD, newest first — the stitch and
@@ -184,6 +195,9 @@ export const creditEvents = pgTable(
     id: uuid('id').primaryKey().defaultRandom(),
     amount: integer('amount').notNull(),
     worldId: uuid('world_id').references(() => worlds.id),
+    // Which provider's daily budget this entry counts against (World Labs and
+    // SpAItial have separate caps, spec §5.3 item 5).
+    provider: text('provider').notNull().default('worldlabs'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [index('credit_events_created_idx').on(t.createdAt)],

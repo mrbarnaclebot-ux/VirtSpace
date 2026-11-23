@@ -6,7 +6,7 @@ import { pathToFileURL, fileURLToPath } from 'node:url';
 import { and, desc, eq, inArray, lt, sql } from 'drizzle-orm';
 import { getConfig, type Config } from './config.js';
 import { getDb, closeDb, type Db } from './db/client.js';
-import { captures, worlds, type Job, type JobKind, type World } from './db/schema.js';
+import { captures, jobs, worlds, type Job, type JobKind, type World } from './db/schema.js';
 import {
   claimNextJob,
   clearProviderOperationId,
@@ -16,6 +16,7 @@ import {
   heartbeatJob,
   parkExhaustedJobs,
   parkJobDead,
+  rescheduleJob,
   setProviderOperationId,
 } from './queue.js';
 import { reserveCredits, releaseCredits, BudgetExceededError } from './budget.js';
@@ -27,6 +28,11 @@ import {
   type WorldGenProvider,
   type WorldModel,
 } from './provider/index.js';
+import {
+  createSpaitialClient,
+  ECHO3_MODEL,
+  type SpaitialClient,
+} from './provider/spaitial.js';
 import { sendPush, type SendPush } from './push.js';
 import { depthKeyName, stageDepthMaps } from './depth.js';
 
@@ -36,7 +42,7 @@ import { depthKeyName, stageDepthMaps } from './depth.js';
 // money path — a resumed job with a persisted provider_operation_id skips
 // straight to polling.
 
-const WORKER_KINDS: JobKind[] = ['stitch', 'generate_draft', 'generate_hq', 'purge'];
+const WORKER_KINDS: JobKind[] = ['stitch', 'generate_draft', 'generate_hq', 'reconstruct', 'purge'];
 
 const POLL_INTERVAL_MS = 5_000; // operation poll cadence.
 const GENERATE_TIMEOUT_MS = 15 * 60 * 1000; // overall in-process poll ceiling.
@@ -75,6 +81,7 @@ const WORLD_ASSET_NAMES = [
   'splat_full.spz',
   'thumbnail.jpg',
   'collider.glb',
+  'floorplan.png',
 ];
 
 /** Absolute path to the production Python stitcher, resolved relative to this
@@ -608,8 +615,8 @@ export async function runGeneration(
  * thing this code must never do is make a second generate look allowed.
  */
 async function unwindPendingGeneration(
-  io: GenerationIO,
-  input: GenerationInput,
+  io: Pick<GenerationIO, 'releaseCredits' | 'clearPendingMarker'>,
+  input: Pick<GenerationInput, 'jobId' | 'cost'>,
   reserved: boolean,
 ): Promise<void> {
   if (reserved) {
@@ -697,6 +704,8 @@ export interface WorkerDeps {
   db: Db;
   storage: StorageDriver;
   provider: WorldGenProvider;
+  /** SpAItial Echo-3 client for room-scan `reconstruct` jobs (spec §5.3). */
+  spaitial: SpaitialClient;
   config: Config;
   push: SendPush;
   clock?: GenerationClock;
@@ -1093,6 +1102,278 @@ async function handleGenerate(
   );
 }
 
+// =============================================================================
+// Room scan reconstruction (spec §5.3 item 5) — the SpAItial money path.
+// =============================================================================
+
+/** Poll cadence: the job is re-scheduled, never held under a lease for hours. */
+export const RECONSTRUCT_POLL_SECONDS = 60;
+/** SpAItial must read the bundle for the whole run (≥2.5 h); spec asks ≥3 h. */
+export const BUNDLE_URL_TTL_SECONDS = 6 * 60 * 60;
+/** How long after completion to wait for the auto-started floorplan export. */
+export const FLOORPLAN_WAIT_MS = 15 * 60 * 1000;
+const DEFAULT_RECONSTRUCT_ETA_SECONDS = 60 * 60;
+
+export interface ReconstructIO {
+  reserveCredits(amount: number): Promise<void>;
+  releaseCredits(amount: number): Promise<void>;
+  /** Persist the `pending:<jobId>` marker together with the quote it acts on. */
+  saveMarker(marker: string, quote: { credits: number; etaSeconds: number | null }): Promise<void>;
+  saveOperationId(requestId: string): Promise<void>;
+  clearPendingMarker(): Promise<void>;
+  /** Presigned GET of bundle.zip, TTL ≥ BUNDLE_URL_TTL_SECONDS. */
+  presignBundle(): Promise<string>;
+}
+
+export interface ReconstructInput {
+  jobId: string;
+  frameCount: number;
+  title: string;
+  /** Persisted provider_operation_id: request id, `pending:` marker, or null. */
+  existingOperationId: string | null;
+}
+
+/**
+ * Resolve this job's SpAItial request id, submitting POST /v1/worlds AT MOST
+ * ONCE per job (spec §14, §10 R1 — mirrors runGeneration):
+ *
+ * 1. real request id → return it (poll). Nothing is quoted, reserved or sent.
+ * 2. `pending:<jobId>` marker → a previous attempt may have submitted. Find the
+ *    request by its unique title; a lookup error propagates (retryable, "could
+ *    not determine", money untouched) and no match parks the job. Never resubmits.
+ * 3. null → quote (has_enough=false parks), persist marker, reserve against the
+ *    SpAItial ledger, presign, create once with Idempotency-Key = jobId, persist
+ *    the request id. A throw before create unwinds (release + clear marker) and
+ *    keeps its retryability; a throw FROM create is non-retryable, marker stays.
+ */
+export async function startReconstruction(
+  client: SpaitialClient,
+  io: ReconstructIO,
+  input: ReconstructInput,
+): Promise<string> {
+  const existing = input.existingOperationId;
+  if (existing && !isPendingOperationMarker(existing)) return existing;
+
+  if (existing) {
+    const found = await client.findRequestByTitle(input.title);
+    if (!found) {
+      throw new NonRetryableJobError(
+        `reconstruction state unresolved for job ${input.jobId}: POST /v1/worlds may have ` +
+          `been submitted as "${input.title}" but no matching request is listed. ` +
+          'Refusing to resubmit (would risk a double bill) — inspect the SpAItial account.',
+      );
+    }
+    await io.saveOperationId(found);
+    return found;
+  }
+
+  const quote = await client.quote(input.frameCount);
+  if (!quote.hasEnough) {
+    throw new NonRetryableJobError(
+      `SpAItial balance too low for job ${input.jobId}: ${quote.requiredCredits} credits ` +
+        `required for ${input.frameCount} frames`,
+    );
+  }
+  const cost = quote.requiredCredits;
+  await io.saveMarker(pendingOperationMarker(input.jobId), {
+    credits: cost,
+    etaSeconds: quote.estimatedDurationSeconds,
+  });
+
+  let zipUrl: string;
+  let reserved = false;
+  try {
+    await io.reserveCredits(cost);
+    reserved = true;
+    zipUrl = await io.presignBundle();
+  } catch (err) {
+    await unwindPendingGeneration(io, { jobId: input.jobId, cost }, reserved);
+    throw err;
+  }
+
+  let requestId: string;
+  try {
+    requestId = await client.createWorld({
+      zipUrl,
+      title: input.title,
+      idempotencyKey: input.jobId,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    throw new NonRetryableJobError(
+      `POST /v1/worlds failed for job ${input.jobId} and must NOT be retried ` +
+        `(it may have been billed): ${message}`,
+    );
+  }
+  await io.saveOperationId(requestId);
+  return requestId;
+}
+
+/** A poll failure worth simply polling again: network, timeout, 429, 5xx. */
+function isTransientPollError(err: unknown): boolean {
+  if (!(err instanceof ProviderError)) return false;
+  return err.status === undefined || err.status === 429 || err.status >= 500;
+}
+
+const RECONSTRUCT_TERMINAL = new Set(['COMPLETED', 'FAILED', 'CANCELLED']);
+
+/**
+ * reconstruct (spec §5.3 item 5). Each run resolves the request id (above),
+ * polls status once, and either re-schedules itself ~60 s out (rescheduleJob:
+ * lease released, attempt given back) or, once COMPLETED, re-hosts the splat,
+ * floorplan and thumbnail into our storage and finalizes the world.
+ */
+async function handleReconstruct(deps: WorkerDeps, job: Job): Promise<void> {
+  const { db, storage, config, spaitial } = deps;
+  const clock = deps.clock ?? realClock;
+  const world = await loadWorld(db, job.worldId);
+  if (world.deletedAt) {
+    // Deleted while queued or running: never spend on it, never re-host assets
+    // the purge job is removing. A submitted request is simply abandoned.
+    await completeJob(db, job.id);
+    return;
+  }
+  const [capture] = await db
+    .select()
+    .from(captures)
+    .where(eq(captures.worldId, job.worldId))
+    .orderBy(desc(captures.createdAt))
+    .limit(1);
+  if (!capture?.r2FramesPrefix) {
+    throw new NonRetryableJobError(`no capture row for room scan ${job.worldId}`);
+  }
+  const bundleKey = `${capture.r2FramesPrefix}/bundle.zip`;
+  const payload = (job.payload ?? {}) as { credits?: number; etaSeconds?: number | null };
+
+  const io: ReconstructIO = {
+    reserveCredits: (amount) =>
+      reserveCredits(db, amount, config.SPAITIAL_DAILY_CREDIT_BUDGET, world.id, 'spaitial'),
+    releaseCredits: (amount) => releaseCredits(db, amount, world.id, 'spaitial'),
+    saveMarker: async (marker, quote) => {
+      Object.assign(payload, quote);
+      await db
+        .update(jobs)
+        .set({ providerOperationId: marker, payload, updatedAt: sql`now()` })
+        .where(eq(jobs.id, job.id));
+    },
+    saveOperationId: (id) => setProviderOperationId(db, job.id, id),
+    clearPendingMarker: async () => {
+      await clearProviderOperationId(db, job.id, pendingOperationMarker(job.id));
+    },
+    presignBundle: () => storage.presignDownload(bundleKey, BUNDLE_URL_TTL_SECONDS),
+  };
+
+  const requestId = await startReconstruction(spaitial, io, {
+    jobId: job.id,
+    frameCount: capture.frameCount,
+    title: generationDisplayName(job.id),
+    existingOperationId: job.providerOperationId,
+  });
+
+  const pollAgain = async (): Promise<void> => {
+    if (!(await rescheduleJob(db, job.id, RECONSTRUCT_POLL_SECONDS, deps.workerId))) {
+      console.warn(`[worker] job ${job.id} lost its lease before re-scheduling; leaving it`);
+    }
+  };
+
+  let status;
+  try {
+    status = await spaitial.getStatus(requestId);
+  } catch (err) {
+    if (!isTransientPollError(err)) throw err;
+    console.warn(`[worker] job ${job.id}: status poll failed, polling again: ${String(err)}`);
+    return pollAgain();
+  }
+
+  if (!RECONSTRUCT_TERMINAL.has(status.status)) {
+    const etaMs =
+      (status.estimatedDurationSeconds ?? payload.etaSeconds ?? DEFAULT_RECONSTRUCT_ETA_SECONDS) *
+      1000;
+    const progress =
+      status.progress !== null
+        ? Math.min(95, Math.max(0, Math.round(status.progress * 100)))
+        : pseudoProgress(clock.now() - job.createdAt.getTime(), etaMs);
+    await db
+      .update(worlds)
+      .set({ progress, updatedAt: sql`now()` })
+      .where(eq(worlds.id, world.id))
+      .catch(() => undefined); // best-effort UI plumbing.
+    return pollAgain();
+  }
+  if (status.status !== 'COMPLETED') {
+    throw new NonRetryableJobError(
+      `reconstruction ${requestId} ended ${status.status}${status.error ? `: ${status.error}` : ''}`,
+    );
+  }
+
+  const result = await spaitial.getResult(requestId);
+  if (!result.splatUrl) throw new ProviderError(`completed request ${requestId} has no splat_url`);
+
+  // Floorplan first (best-effort): Echo-3 auto-starts it on completion, so wait
+  // a bounded while for it before downloading anything big.
+  let floorplanUrl: string | undefined;
+  try {
+    const fp = await spaitial.getFloorplan(requestId);
+    if (fp.status === 'READY' && fp.downloadUrl) {
+      floorplanUrl = fp.downloadUrl;
+    } else if (fp.status !== 'FAILED' && result.completedAt) {
+      if (clock.now() - Date.parse(result.completedAt) < FLOORPLAN_WAIT_MS) return pollAgain();
+    }
+  } catch (err) {
+    console.warn(`[worker] job ${job.id}: floorplan export unavailable: ${String(err)}`);
+  }
+
+  const store = async (name: string, url: string): Promise<string> => {
+    const key = assetKeyFor(world.id, name);
+    await storage.putObject(key, await spaitial.download(url));
+    return key;
+  };
+  const optional = async (name: string, url: string | undefined) => {
+    if (!url) return undefined;
+    try {
+      return await store(name, url);
+    } catch (err) {
+      console.warn(`[worker] world ${world.id}: ${name} not stored: ${String(err)}`);
+      return undefined;
+    }
+  };
+
+  // One key in both columns until device performance says otherwise (R45).
+  const splatKey = await store('splat_full.spz', result.splatUrl);
+  const floorplanKey = await optional('floorplan.png', floorplanUrl);
+  // SpAItial thumbnails are WebP; the key keeps the shared name purge knows.
+  const thumbnailKey = await optional('thumbnail.jpg', result.thumbnailUrl);
+  if (!(await stillHoldsLease(deps, job.id))) {
+    throw new LeaseLostError(
+      `job ${job.id} lost its lease while collecting room scan ${world.id}; not finalizing`,
+    );
+  }
+
+  // Idempotent like handleGenerate: a replay for the same request id cannot
+  // bump credits_spent twice or push twice.
+  const finalized = await db
+    .update(worlds)
+    .set({
+      status: 'complete',
+      phase: null,
+      progress: null,
+      updatedAt: sql`now()`,
+      provider: spaitial.mode === 'mock' ? 'mock' : 'spaitial',
+      creditsSpent: sql`${worlds.creditsSpent} + ${payload.credits ?? 0}`,
+      draftWorldId: requestId,
+      draftModel: ECHO3_MODEL,
+      spzFullUrl: splatKey,
+      spz500kUrl: splatKey,
+      ...(thumbnailKey ? { thumbnailUrl: thumbnailKey } : {}),
+      ...(floorplanKey ? { floorplanUrl: floorplanKey } : {}),
+    })
+    .where(and(eq(worlds.id, world.id), sql`${worlds.draftWorldId} IS DISTINCT FROM ${requestId}`))
+    .returning({ id: worlds.id });
+  await completeJob(db, job.id);
+  if (finalized.length === 0) return;
+  await deps.push(world.ownerId, 'Your room scan is ready', 'Tap to explore your room in 3D.');
+}
+
 /**
  * purge — delete storage objects under the world + its captures' frame
  * prefixes. The DB row is KEPT (soft-deleted) so history/analytics survive.
@@ -1116,6 +1397,12 @@ async function handlePurge(deps: WorkerDeps, job: Job): Promise<void> {
   const caps = await db.select().from(captures).where(eq(captures.worldId, worldId));
   for (const cap of caps) {
     const prefix = cap.r2FramesPrefix ?? `captures/${cap.id}`;
+    if (cap.bundleBytes != null) {
+      // Room scan (spec §5.3): one bundle.zip, no per-frame keys — skip the
+      // frame loop, which would issue thousands of no-op deletes.
+      await storage.deleteObject(`${prefix}/bundle.zip`).catch(() => undefined);
+      continue;
+    }
     for (let i = 0; i < cap.frameCount; i++) {
       await storage.deleteObject(`${prefix}/frame_${i}.heic`).catch(() => undefined);
       // Depth maps (spec §5.2) are per-key, not prefix-deleted, so name them
@@ -1146,6 +1433,8 @@ export async function processJob(deps: WorkerDeps, job: Job): Promise<void> {
       return handleGenerate(deps, job, 'marble-1.0-draft');
     case 'generate_hq':
       return handleGenerate(deps, job, 'marble-1.1');
+    case 'reconstruct':
+      return handleReconstruct(deps, job);
     case 'purge':
       return handlePurge(deps, job);
     default:
@@ -1162,6 +1451,8 @@ function failedStatusFor(kind: string): string | null {
       return 'failed_generating_draft';
     case 'generate_hq':
       return 'failed_generating_hq';
+    case 'reconstruct':
+      return 'failed_reconstructing';
     default:
       return null;
   }
@@ -1353,6 +1644,7 @@ async function main(): Promise<void> {
     db: getDb(),
     storage: createStorage(config),
     provider: createProvider(config),
+    spaitial: createSpaitialClient(config),
     config,
     push: sendPush,
   };

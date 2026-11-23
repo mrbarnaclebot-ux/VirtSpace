@@ -62,6 +62,7 @@ src/
     types.ts         WorldGenProvider interface + WorldModel/credits + typed errors
     worldlabs.ts     LIVE World Labs Marble client (ported from tools/spike/spike.py)
     mock.ts          offline zero-credit provider (PROVIDER_MODE=mock)
+    spaitial.ts      SpAItial Echo-3 room-scan client, live + mock (SPAITIAL_MODE)
     index.ts         createProvider(config) factory (mock | live)
   db/
     schema.ts        Drizzle tables — users, worlds, captures, jobs, devices, credit_events, share_slugs
@@ -133,6 +134,19 @@ test/                vitest: config, storage, auth, quota/backoff
   `failed_generating_draft`, `failed_generating_hq`) in one conditional
   transaction; route string `'/v1/worlds/:id(^[^:]+)::retry'`, own `retry:<user>`
   rate-limit key. Full contract in spec §7.1.
+- **Room scan** (spec §5.3) — `POST /v1/worlds` with
+  `{"capture_type":"room_scan","frame_count":N,"bundle_bytes":B,"title"?,"lat"?,"lng"?}`
+  (N ≤ `ROOM_SCAN_MAX_FRAMES`, B ≤ `ROOM_SCAN_MAX_BUNDLE_BYTES`; same
+  Idempotency-Key, quota and rate limit) answers
+  `201 {world, capture_id, bundle_upload: {url, method:"PUT", headers, key}, max_frames}`
+  — one presigned PUT of `<capture prefix>/bundle.zip` with Content-Length signed.
+  `uploads:refresh` re-signs it. `frames:done` checks the object exists at size B
+  (`409 bundle_not_uploaded` / `409 bundle_size_mismatch {expected_bytes, actual_bytes}`),
+  then flips `uploading → reconstructing` and enqueues `reconstruct`. Failure:
+  `failed_reconstructing`, retryable via `:retry` (charges a scan); `:enhance` is
+  409. `world.capture_type` is present only on room scans (absent = `pano`), so
+  pano responses are unchanged. Room-scan assets: `spz_full_url` = `spz_500k_url`
+  (one splat), `thumbnail_url`, `floorplan_url`.
 - `DELETE /v1/worlds/:id` — soft delete + enqueue `purge`.
 - `POST /v1/devices` — upsert an APNs token.
 - `DELETE /v1/account` — soft-delete the user's worlds (+ enqueue purges), delete
@@ -591,6 +605,26 @@ from the provider's own JSON, so `downloadAsset`:
   aborting the transfer rather than discovering the size after buffering it.
   `Content-Length` is a fast path only — it is attacker-controlled and absent
   under chunked encoding.
+
+### Room scan reconstruction (`reconstruct` job, spec §5.3 / §14)
+
+Same at-most-once rule as `runGeneration`, in `startReconstruction`:
+quote (`has_enough=false` parks) → persist `pending:<jobId>` (+ quoted credits
+in `jobs.payload`) → reserve against `SPAITIAL_DAILY_CREDIT_BUDGET`
+(`credit_events.provider = 'spaitial'`, a ledger separate from World Labs) →
+presign `bundle.zip` GET (6 h TTL) → **one** `POST /v1/worlds`
+(`Idempotency-Key` = job id, title `VirtSpace <jobId>`) → persist `request_id`.
+A failed create is non-retryable; a resumed marker reconciles via
+`GET /v1/worlds/requests` by title and never resubmits. Polling re-schedules the
+job ~60 s out (`rescheduleJob`: lease released, attempt given back), so a 2 h run
+never exhausts `MAX_ATTEMPTS`; transient status errors (network/429/5xx) poll
+again too. On `COMPLETED` the worker waits ≤15 min for the auto-started
+floorplan export, then copies splat → `splat_full.spz`, floorplan →
+`floorplan.png`, thumbnail → `thumbnail.jpg` (WebP bytes). Downloads send the
+Bearer key only to the API host; the 302 target must be in
+`SPAITIAL_ASSET_HOSTS`. Not done: provider-side deletion (the World Labs path
+has none either), the `mesh-simplified` collider (it is a `.ply`, not a GLB),
+webhooks (R46).
 
 ### Mock mode walkthrough (offline, zero credits)
 

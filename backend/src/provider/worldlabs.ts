@@ -203,6 +203,80 @@ async function readBodyCapped(
   return Buffer.concat(chunks, total);
 }
 
+/**
+ * Fetch a provider-named asset URL (untrusted input) with every hop checked:
+ * https + allowlisted host + non-routable refusal, redirects followed by hand
+ * (fetch's own following only checks the first URL), body capped while it
+ * streams, one timeout for the whole chain. `firstHopHeaders` ride ONLY the
+ * first request — a credential must never follow a redirect to another host.
+ */
+export async function downloadAllowlisted(
+  doFetch: FetchLike,
+  rawUrl: string,
+  opts: {
+    allowlist: string[];
+    maxBytes: number;
+    timeoutMs: number;
+    firstHopHeaders?: Record<string, string>;
+  },
+): Promise<Buffer> {
+  let url = assertDownloadableUrl(rawUrl, opts.allowlist);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), opts.timeoutMs);
+  try {
+    let res: Response;
+    for (let hop = 0; ; hop++) {
+      try {
+        res = await doFetch(url.toString(), {
+          method: 'GET',
+          signal: controller.signal,
+          redirect: 'manual',
+          ...(hop === 0 && opts.firstHopHeaders ? { headers: opts.firstHopHeaders } : {}),
+        });
+      } catch (err) {
+        if (err instanceof Error && err.name === 'AbortError') {
+          throw new ProviderTimeoutError(
+            `asset download timed out after ${opts.timeoutMs}ms`,
+            rawUrl,
+          );
+        }
+        throw new ProviderError(`network error: ${String(err)}`, {
+          endpoint: rawUrl,
+          cause: err,
+        });
+      }
+      const location = res.headers.get('location');
+      if (!REDIRECT_STATUSES.has(res.status) || !location) break;
+      await res.body?.cancel().catch(() => undefined);
+      if (hop >= MAX_ASSET_REDIRECTS) {
+        throw new ProviderError(
+          `asset download exceeded ${MAX_ASSET_REDIRECTS} redirects`,
+          { endpoint: rawUrl },
+        );
+      }
+      let next: string;
+      try {
+        next = new URL(location, url).toString();
+      } catch {
+        throw new ProviderError(`asset redirect has an invalid Location: ${location}`, {
+          endpoint: rawUrl,
+        });
+      }
+      url = assertDownloadableUrl(next, opts.allowlist);
+    }
+
+    if (!res.ok) {
+      throw new ProviderError(`asset download failed: ${res.status}`, {
+        status: res.status,
+        endpoint: rawUrl,
+      });
+    }
+    return await readBodyCapped(res, opts.maxBytes, rawUrl, controller);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 interface PrepareUploadResponse {
   media_asset?: { media_asset_id?: string; id?: string };
   upload_info?: {
@@ -439,69 +513,14 @@ export function createWorldLabsProvider(opts: WorldLabsOptions): WorldGenProvide
     },
 
     async downloadAsset(rawUrl): Promise<Buffer> {
-      // The URL comes from the PROVIDER's JSON, so it is untrusted input.
-      let url = assertDownloadableUrl(rawUrl, assetHosts);
-
       // Never send the API key here (spec §10 R29). Asset URLs are signed CDN
       // links — the live-verified spike downloads them with no credential — and
       // attaching it to a provider-chosen host is exactly how a key leaks.
-      //
-      // Redirects are followed by hand so EVERY hop is re-checked against the
-      // allowlist; fetch's own following checks only the first URL. One
-      // controller/timer covers the whole chain.
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), timeoutMs);
-      try {
-        let res: Response;
-        for (let hop = 0; ; hop++) {
-          try {
-            res = await doFetch(url.toString(), {
-              method: 'GET',
-              signal: controller.signal,
-              redirect: 'manual',
-            });
-          } catch (err) {
-            if (err instanceof Error && err.name === 'AbortError') {
-              throw new ProviderTimeoutError(
-                `asset download timed out after ${timeoutMs}ms`,
-                rawUrl,
-              );
-            }
-            throw new ProviderError(`network error: ${String(err)}`, {
-              endpoint: rawUrl,
-              cause: err,
-            });
-          }
-          const location = res.headers.get('location');
-          if (!REDIRECT_STATUSES.has(res.status) || !location) break;
-          await res.body?.cancel().catch(() => undefined);
-          if (hop >= MAX_ASSET_REDIRECTS) {
-            throw new ProviderError(
-              `asset download exceeded ${MAX_ASSET_REDIRECTS} redirects`,
-              { endpoint: rawUrl },
-            );
-          }
-          let next: string;
-          try {
-            next = new URL(location, url).toString();
-          } catch {
-            throw new ProviderError(`asset redirect has an invalid Location: ${location}`, {
-              endpoint: rawUrl,
-            });
-          }
-          url = assertDownloadableUrl(next, assetHosts);
-        }
-
-        if (!res.ok) {
-          throw new ProviderError(`asset download failed: ${res.status}`, {
-            status: res.status,
-            endpoint: rawUrl,
-          });
-        }
-        return await readBodyCapped(res, assetMaxBytes, rawUrl, controller);
-      } finally {
-        clearTimeout(timer);
-      }
+      return downloadAllowlisted(doFetch, rawUrl, {
+        allowlist: assetHosts,
+        maxBytes: assetMaxBytes,
+        timeoutMs,
+      });
     },
   };
 }

@@ -43,6 +43,13 @@ export function wouldExceedBudget(
 const BUDGET_LOCK_KEY = 0x7645_7370; // "VtSp"
 
 /**
+ * Ledger provider a credit_events row counts against. Each has its own daily
+ * cap (DAILY_CREDIT_BUDGET vs SPAITIAL_DAILY_CREDIT_BUDGET); omitted = the
+ * column default, 'worldlabs'.
+ */
+export type LedgerProvider = 'worldlabs' | 'spaitial';
+
+/**
  * Atomically reserve `amount` credits against today's budget. Inserts a
  * credit_events row iff today's sum + amount <= budget, else throws
  * BudgetExceededError. Runs in a transaction with a transaction-scoped advisory
@@ -53,11 +60,12 @@ export async function reserveCredits(
   amount: number,
   budget: number,
   worldId?: string,
+  provider?: LedgerProvider,
 ): Promise<void> {
   await db.transaction(async (tx) => {
     // Serialize budget checks across workers for the duration of this txn.
     await tx.execute(sql`SELECT pg_advisory_xact_lock(${BUDGET_LOCK_KEY})`);
-    const spentToday = await creditsSpentToday(tx);
+    const spentToday = await creditsSpentToday(tx, provider);
 
     if (wouldExceedBudget(spentToday, amount, budget)) {
       throw new BudgetExceededError(amount, spentToday, budget);
@@ -66,12 +74,16 @@ export async function reserveCredits(
     await tx.insert(creditEvents).values({
       amount,
       worldId: worldId ?? null,
+      ...(provider ? { provider } : {}),
     });
   });
 }
 
-/** Sum of today's (UTC) credit_events — reservations minus releases. */
-export async function creditsSpentToday(db: Pick<Db, 'execute'>): Promise<number> {
+/** Sum of today's (UTC) credit_events for one provider — reservations minus releases. */
+export async function creditsSpentToday(
+  db: Pick<Db, 'execute'>,
+  provider: LedgerProvider = 'worldlabs',
+): Promise<number> {
   // The day window is pinned to UTC. `date_trunc('day', now())` follows the
   // session's TimeZone, so the budget would reset at whatever local midnight
   // the connection happened to inherit — and two connections with different
@@ -86,6 +98,7 @@ export async function creditsSpentToday(db: Pick<Db, 'execute'>): Promise<number
     SELECT COALESCE(SUM(amount), 0) AS total
     FROM credit_events
     WHERE created_at >= (date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')
+      AND provider = ${provider}
   `);
   const rows = (res as unknown as { rows: { total: string | number | null }[] }).rows;
   return Number(rows[0]?.total ?? 0);
@@ -127,10 +140,12 @@ export async function releaseCredits(
   db: Db,
   amount: number,
   worldId?: string,
+  provider?: LedgerProvider,
 ): Promise<void> {
   if (amount <= 0) return; // mock mode reserves 0 — nothing to give back.
   await db.insert(creditEvents).values({
     amount: -amount,
     worldId: worldId ?? null,
+    ...(provider ? { provider } : {}),
   });
 }

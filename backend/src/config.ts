@@ -56,6 +56,21 @@ const baseSchema = z.object({
   DAILY_CREDIT_BUDGET: numberFromEnv(2000),
   DAILY_SCAN_QUOTA: numberFromEnv(10),
 
+  // --- Room scan / SpAItial Echo-3 (spec §5.3) --------------------------------
+  // Independent of PROVIDER_MODE: mock spends nothing; live needs the key.
+  SPAITIAL_MODE: z.enum(['mock', 'live']).default('mock'),
+  SPAITIAL_API_KEY: z.string().optional(),
+  // Separate ledger from DAILY_CREDIT_BUDGET (World Labs). Echo-3 bills
+  // 900 + frame_count credits, so 2000 fits one ~1,100-frame room a day.
+  SPAITIAL_DAILY_CREDIT_BUDGET: numberFromEnv(2000),
+  // Hosts the splat/export downloads may be fetched from after the API's 302
+  // (same rules as WORLDLABS_ASSET_HOSTS). Unset uses spaitial.ts defaults.
+  SPAITIAL_ASSET_HOSTS: z.string().optional(),
+  SPAITIAL_ASSET_MAX_BYTES: numberFromEnv(1024 * 1024 * 1024),
+  ROOM_SCAN_MAX_FRAMES: numberFromEnv(5000),
+  // Store-only ZIP without ZIP64 tops out at 4 GiB − 1.
+  ROOM_SCAN_MAX_BUNDLE_BYTES: numberFromEnv(4 * 1024 * 1024 * 1024 - 1),
+
   // Worker loop poll interval (ms) between empty claim attempts (Stage 2).
   WORKER_POLL_MS: numberFromEnv(2000),
 

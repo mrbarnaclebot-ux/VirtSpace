@@ -63,7 +63,7 @@ const GLB_FIXTURE = (() => {
 })();
 
 /** Pick the fixture matching an asset URL/filename extension. */
-function fixtureFor(url: string): Buffer {
+export function fixtureFor(url: string): Buffer {
   if (url.endsWith('.spz')) return SPZ_FIXTURE;
   if (url.endsWith('.glb')) return GLB_FIXTURE;
   // .jpg (thumbnail, pano) and anything else image-ish.
